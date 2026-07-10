@@ -1,0 +1,380 @@
+#include "tui.hpp"
+
+#include <sodium.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/component_options.hpp>
+#include <ftxui/component/event.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/dom/elements.hpp>
+#include <nlohmann/json.hpp>
+
+#include "paths.hpp"
+#include "protocol.hpp"
+#include "transport.hpp"
+
+// Secret hygiene ceiling: revealed values and the add-form value buffer are
+// zeroed (sodium_memzero) as soon as they are re-masked/submitted/cancelled.
+// FTXUI copies buffer contents into its own render structures each frame; those
+// copies are not zeroed. Best-effort — good enough for a local TUI, not a
+// hardened enclave. Upgrade path: a custom no-copy render element if it matters.
+
+namespace secretov {
+
+namespace {
+
+using nlohmann::json;
+
+// One persistent connection to the daemon, reconnected lazily after a failure.
+class Daemon {
+   public:
+    Daemon(std::string socket_path, std::string token)
+        : socket_path_(std::move(socket_path)), token_(std::move(token)) {}
+
+    // Sends one request and returns the ok response. Throws std::runtime_error
+    // on transport failure or a non-ok daemon reply; drops the connection so the
+    // next call reconnects.
+    json request(const std::string& op, const std::string& key,
+                 const std::optional<std::string>& value) {
+        if (!conn_) {
+            conn_ = connect_unix(socket_path_);
+            if (!conn_) {
+                throw std::runtime_error("daemon not running at " + socket_path_ + " ?");
+            }
+        }
+        json req{{"token", token_}, {"op", op}};
+        if (!key.empty()) req["key"] = key;
+        if (value) req["value"] = *value;
+
+        if (!conn_->write_line(req.dump())) {
+            conn_.reset();
+            throw std::runtime_error("lost connection to daemon");
+        }
+        std::optional<std::string> line = conn_->read_line();
+        if (!line) {
+            conn_.reset();
+            throw std::runtime_error("daemon closed connection");
+        }
+        json resp = json::parse(*line, nullptr, false);
+        if (resp.is_discarded()) {
+            throw std::runtime_error("malformed response from daemon");
+        }
+        if (!resp.value("ok", false)) {
+            throw std::runtime_error(resp.value("error", std::string("request failed")));
+        }
+        return resp;
+    }
+
+    const std::string& socket_path() const { return socket_path_; }
+
+   private:
+    std::string socket_path_;
+    std::string token_;
+    std::unique_ptr<Connection> conn_;
+};
+
+void zero(std::string& s) {
+    if (!s.empty()) sodium_memzero(s.data(), s.size());
+    s.clear();
+}
+
+enum class Mode { Normal, Add, ConfirmDelete, ConfirmRotate };
+
+std::string load_token(const Paths& paths) {
+    std::string token = rstrip(read_file_string(paths.token));
+    if (token.empty()) {
+        throw std::runtime_error("token file '" + paths.token + "' is empty");
+    }
+    return token;
+}
+
+int run_ui(Daemon& daemon) {
+    using namespace ftxui;
+
+    std::vector<std::string> keys;
+    int selected = 0;
+    std::optional<std::string> revealed;  // fetched value for the selected key
+    std::string add_name;
+    std::string add_value;
+    std::string status = "ready";
+    Mode mode = Mode::Normal;
+    int active_tab = 0;  // 0 = key list, 1 = add form
+
+    auto remask = [&] {
+        if (revealed) {
+            zero(*revealed);
+            revealed.reset();
+        }
+    };
+
+    auto refresh = [&](const std::string& select_key) {
+        remask();
+        try {
+            json resp = daemon.request("list", "", std::nullopt);
+            keys = resp.value("keys", std::vector<std::string>{});
+        } catch (const std::exception& e) {
+            status = e.what();
+            return;
+        }
+        std::sort(keys.begin(), keys.end());
+        if (!select_key.empty()) {
+            auto it = std::find(keys.begin(), keys.end(), select_key);
+            if (it != keys.end()) selected = static_cast<int>(it - keys.begin());
+        }
+        if (selected >= static_cast<int>(keys.size())) selected = static_cast<int>(keys.size()) - 1;
+        if (selected < 0) selected = 0;
+    };
+
+    auto reveal = [&] {
+        if (keys.empty()) {
+            status = "no secret to reveal";
+            return;
+        }
+        try {
+            json resp = daemon.request("get", keys[static_cast<std::size_t>(selected)],
+                                       std::nullopt);
+            remask();
+            revealed = resp.value("value", std::string{});
+            status = "revealed " + keys[static_cast<std::size_t>(selected)];
+        } catch (const std::exception& e) {
+            status = e.what();
+        }
+    };
+
+    auto start_add = [&] {
+        zero(add_name);
+        zero(add_value);
+        mode = Mode::Add;
+        active_tab = 1;
+        status = "adding secret";
+    };
+
+    auto cancel_add = [&] {
+        zero(add_name);
+        zero(add_value);
+        mode = Mode::Normal;
+        active_tab = 0;
+        status = "cancelled";
+    };
+
+    auto submit_add = [&] {
+        if (add_name.empty()) {
+            status = "name required";
+            return;
+        }
+        std::string name = add_name;
+        try {
+            daemon.request("set", name, add_value);
+            status = "added " + name;
+            zero(add_name);
+            zero(add_value);
+            mode = Mode::Normal;
+            active_tab = 0;
+            refresh(name);
+        } catch (const std::exception& e) {
+            status = e.what();
+        }
+    };
+
+    auto do_delete = [&] {
+        std::string key = keys[static_cast<std::size_t>(selected)];
+        try {
+            daemon.request("delete", key, std::nullopt);
+            status = "deleted " + key;
+            refresh("");
+        } catch (const std::exception& e) {
+            status = e.what();
+        }
+        mode = Mode::Normal;
+    };
+
+    auto do_rotate = [&] {
+        try {
+            daemon.request("rotate", "", std::nullopt);
+            status = "rotated encryption key";
+        } catch (const std::exception& e) {
+            status = e.what();
+        }
+        mode = Mode::Normal;
+    };
+
+    refresh("");
+
+    MenuOption menu_opt = MenuOption::Vertical();
+    menu_opt.on_change = remask;
+    Component menu = Menu(&keys, &selected, menu_opt);
+
+    Component name_input = Input(&add_name, "name");
+    InputOption value_opt;
+    value_opt.password = true;
+    Component value_input = Input(&add_value, "value", value_opt);
+    Component form = Container::Vertical({name_input, value_input});
+
+    Component tab = Container::Tab({menu, form}, &active_tab);
+
+    auto renderer = Renderer(tab, [&] {
+        Element list_pane = window(text(" secrets "),
+                                   keys.empty()
+                                       ? (text("(empty)") | dim | center)
+                                       : (menu->Render() | vscroll_indicator | frame)) |
+                            size(WIDTH, EQUAL, 30);
+
+        Element detail_body;
+        if (keys.empty()) {
+            detail_body = text("press 'a' to add a secret") | dim | center;
+        } else {
+            Element value_line = revealed ? text(*revealed) : text("••••••••");
+            detail_body = vbox({
+                hbox({text("name:  "), text(keys[static_cast<std::size_t>(selected)]) | bold}),
+                separator(),
+                hbox({text("value: "), value_line}),
+                text(revealed ? "" : "(press 'r' to reveal)") | dim,
+            });
+        }
+        Element detail_pane = window(text(" detail "), detail_body) | flex;
+
+        Element hints =
+            text(" a add   d delete   R rotate   r reveal   h hide   q quit ") | dim | center;
+        Element status_bar =
+            hbox({
+                text(" " + daemon.socket_path() + " "),
+                separator(),
+                text(" keys: " + std::to_string(keys.size()) + " "),
+                separator(),
+                text(" " + status + " ") | flex,
+            }) |
+            inverted;
+
+        Element root = vbox({
+            hbox({list_pane, detail_pane}) | flex,
+            hints,
+            status_bar,
+        });
+
+        if (mode == Mode::Add) {
+            Element overlay = window(text(" add secret "),
+                                     vbox({
+                                         hbox({text("name:  "), name_input->Render()}),
+                                         hbox({text("value: "), value_input->Render()}),
+                                         separator(),
+                                         text("Enter submit   Esc cancel") | dim,
+                                     })) |
+                              size(WIDTH, GREATER_THAN, 44) | clear_under | center;
+            root = dbox({root, overlay});
+        } else if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmRotate) {
+            std::string msg = mode == Mode::ConfirmDelete
+                                  ? "Delete '" + keys[static_cast<std::size_t>(selected)] + "'?"
+                                  : "Rotate the encryption key?";
+            Element overlay =
+                window(text(" confirm "), vbox({text(msg), separator(), text("y / n") | dim})) |
+                clear_under | center;
+            root = dbox({root, overlay});
+        }
+        return root;
+    });
+
+    ScreenInteractive screen = ScreenInteractive::Fullscreen();
+
+    Component app = CatchEvent(renderer, [&](Event event) -> bool {
+        if (mode == Mode::Normal) {
+            if (event == Event::Character('q')) {
+                screen.Exit();
+                return true;
+            }
+            if (event == Event::Character('a')) {
+                start_add();
+                return true;
+            }
+            if (event == Event::Character('r')) {
+                reveal();
+                return true;
+            }
+            if (event == Event::Character('h')) {
+                remask();
+                status = "hidden";
+                return true;
+            }
+            if (event == Event::Character('R')) {
+                mode = Mode::ConfirmRotate;
+                return true;
+            }
+            if (event == Event::Character('d')) {
+                if (keys.empty()) {
+                    status = "no secret to delete";
+                } else {
+                    mode = Mode::ConfirmDelete;
+                }
+                return true;
+            }
+            return false;  // arrows / navigation fall through to the menu
+        }
+        if (mode == Mode::Add) {
+            if (event == Event::Escape) {
+                cancel_add();
+                return true;
+            }
+            if (event == Event::Return) {
+                submit_add();
+                return true;
+            }
+            return false;  // typing falls through to the focused input
+        }
+        // Confirm modes: consume every key so nothing leaks to the menu.
+        if (event == Event::Character('y') || event == Event::Character('Y')) {
+            if (mode == Mode::ConfirmDelete) {
+                do_delete();
+            } else {
+                do_rotate();
+            }
+        } else {
+            mode = Mode::Normal;
+            status = "cancelled";
+        }
+        return true;
+    });
+
+    screen.Loop(app);
+
+    remask();
+    zero(add_name);
+    zero(add_value);
+    return 0;
+}
+
+}  // namespace
+
+int run_tui() {
+    if (!::isatty(STDIN_FILENO) || !::isatty(STDOUT_FILENO)) {
+        std::fputs("secretov tui: requires a terminal\n", stderr);
+        return 1;
+    }
+
+    Paths paths = resolve_paths();
+    std::string token;
+    try {
+        token = load_token(paths);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "secretov: %s\n", e.what());
+        return 1;
+    }
+
+    Daemon daemon(paths.socket, token);
+    try {
+        daemon.request("list", "", std::nullopt);  // fail fast if unreachable/unauthorized
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "secretov: %s\n", e.what());
+        return 1;
+    }
+
+    return run_ui(daemon);
+}
+
+}  // namespace secretov

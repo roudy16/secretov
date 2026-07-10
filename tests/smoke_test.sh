@@ -63,6 +63,10 @@ if "$BIN" get FOO >/dev/null 2>&1; then fail "get after delete should fail"; fi
 OUT="$("$BIN" exec --secret VIA_STDIN=INJECTED -- sh -c 'printf %s "$INJECTED"')"
 [ "$OUT" = "s3cr3t-value" ] || fail "exec injection got '$OUT'"
 
+# 5b. tui without a terminal exits 1 with a clear message
+TUI_ERR="$("$BIN" tui </dev/null 2>&1 1>/dev/null)" && fail "tui with no tty should exit 1"
+echo "$TUI_ERR" | grep -q "requires a terminal" || fail "tui no-tty message: got '$TUI_ERR'"
+
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
 printf 'deadbeefdeadbeef' > "$TOKEN"

@@ -4,6 +4,7 @@
 
 #include "client.hpp"
 #include "daemon.hpp"
+#include "tui.hpp"
 
 namespace {
 
@@ -17,6 +18,7 @@ void print_usage(std::ostream& out) {
         << "  list                       list secret names\n"
         << "  delete KEY                 remove a secret\n"
         << "  rotate                     re-encrypt the store with a fresh key\n"
+        << "  tui                        interactive terminal UI\n"
         << "  exec [--secret NAME[=ENVVAR]]... -- PROG [ARGS...]\n"
         << "                             inject secrets into env and run PROG\n";
 }
@@ -42,6 +44,7 @@ int main(int argc, char** argv) {
         if (cmd == "daemon") return run_daemon();
         if (cmd == "list") return cmd_list();
         if (cmd == "rotate") return cmd_rotate();
+        if (cmd == "tui") return run_tui();
 
         if (cmd == "get") {
             if (argc < 3) {

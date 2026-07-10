@@ -60,12 +60,14 @@ encryption; the store is one small file.
 ## CLI
 
 `secretov` binary: `init`, `daemon`, `get`, `set`, `list`, `delete`,
-`rotate`, `exec --secret NAME ... -- cmd` (fetch secrets, inject into child
+`rotate`, `tui` (interactive terminal UI over the daemon socket),
+`exec --secret NAME ... -- cmd` (fetch secrets, inject into child
 env, exec). `set KEY` reads the value from stdin only — never an argv
 argument, which would leak the secret via `/proc/<pid>/cmdline` to other UIDs.
 No client-side caching — the daemon is a local socket away.
 
 ## Dependencies
 
-libsodium (crypto), nlohmann/json (protocol + store serialization).
+libsodium (crypto), nlohmann/json (protocol + store serialization),
+FTXUI (TUI components for `secretov tui`; FetchContent, pinned tag).
 C++20, CMake. Nothing else without a fight.

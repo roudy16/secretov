@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.25)  # FetchContent SYSTEM keyword
 project(secretov CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -30,15 +30,34 @@ else()
     INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/third_party/sodium/include)
 endif()
 
+# FTXUI: TUI components. Downloaded at configure time (FetchContent), matching
+# this repo's vendored-deps approach. Linked into the secretov binary only, so
+# secretov_core and store_test stay free of it. SYSTEM so its headers don't trip
+# our -Wall -Wextra.
+include(FetchContent)
+FetchContent_Declare(ftxui
+  GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+  GIT_TAG v7.0.0
+  SYSTEM)
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(ftxui)
+
+# tui.cpp pulls FTXUI; keep it out of secretov_core so store_test never links it.
 file(GLOB SECRETOV_CORE_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
-list(REMOVE_ITEM SECRETOV_CORE_SRC ${CMAKE_SOURCE_DIR}/src/main.cpp)
+list(REMOVE_ITEM SECRETOV_CORE_SRC
+  ${CMAKE_SOURCE_DIR}/src/main.cpp
+  ${CMAKE_SOURCE_DIR}/src/tui.cpp)
 
 add_library(secretov_core STATIC ${SECRETOV_CORE_SRC})
 target_include_directories(secretov_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(secretov_core PUBLIC sodium nlohmann_json::nlohmann_json)
 
-add_executable(secretov src/main.cpp)
-target_link_libraries(secretov PRIVATE secretov_core)
+add_executable(secretov src/main.cpp src/tui.cpp)
+target_link_libraries(secretov PRIVATE secretov_core
+  ftxui::screen ftxui::dom ftxui::component)
 
 enable_testing()
 add_executable(store_test tests/store_test.cpp)

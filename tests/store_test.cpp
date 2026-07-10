@@ -1,5 +1,7 @@
 #include "store.hpp"
 
+// Tests must assert even in Release builds (FTXUI's CMake defaults to Release).
+#undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
