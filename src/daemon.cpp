@@ -23,11 +23,11 @@ namespace secretov {
 
 namespace {
 
-constexpr int kRotateAfterDays = 30;  // ponytail: fixed 30d, make a flag if anyone asks
+constexpr int kRotateAfterDays = 30;  // fixed 30d, make a flag if anyone asks
 
 // UnixSocketListener::accept() swallows EINTR, so a signal can't unwind the
 // accept loop. We unlink the socket and _exit from the handler instead.
-// ponytail: no clean stack unwind on shutdown; OS reclaims the mlock'd key.
+// No clean stack unwind on shutdown; OS reclaims the mlock'd key.
 char g_socket_path[512] = {};
 
 void on_signal(int) {
@@ -181,7 +181,7 @@ int run_daemon() {
         std::unique_ptr<Connection> conn = listener.accept();
         if (!conn) {
             ::poll(nullptr, 0, 100);  // back off; avoid busy-spin on persistent accept errors (EMFILE)
-            continue;  // ponytail: one connection at a time; threads when a real client blocks another
+            continue;  // one connection at a time; threads when a real client blocks another
         }
         try {
             serve_connection(*conn, store, expected_token);
