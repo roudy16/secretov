@@ -3,6 +3,7 @@ project(secretov CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # clangd; without this only FTXUI's subdir-scoped setting exports
 add_compile_options(-Wall -Wextra)
 
 # nlohmann/json: system package first, vendored header fallback.
@@ -58,6 +59,7 @@ target_link_libraries(secretov_core PUBLIC sodium nlohmann_json::nlohmann_json)
 add_executable(secretov src/main.cpp src/tui.cpp)
 target_link_libraries(secretov PRIVATE secretov_core
   ftxui::screen ftxui::dom ftxui::component)
+install(TARGETS secretov)
 
 enable_testing()
 add_executable(store_test tests/store_test.cpp)
