@@ -38,12 +38,16 @@ is swap. Cheapest real mitigation is machine-level: encrypted swap or zram.
 In-code zeroing of the persist buffer is possible; guarding the whole JSON map
 is not worth it.
 
-### 3. No passphrase change — `open`
+### 3. No passphrase change — `done` (2026-08-30)
 
-`rotate` re-derives from the SAME passphrase with a new salt. If the
-passphrase itself leaks, rotation does not help, and there is no
-`secretov passwd`. Workaround today: manual export / re-init / re-import.
-Most actionable gap in an actual incident — highest-priority fix.
+`rotate` re-derives from the SAME passphrase with a new salt; if the
+passphrase itself leaked, rotation did not help. Fixed: `secretov passwd`
+is a token-guarded daemon op that verifies the current passphrase against
+the daemon's retained copy (constant-time) before re-keying with a fresh
+salt. Routed through the daemon rather than rewriting the file offline so a
+running daemon can never clobber the new passphrase with its stale key.
+Residual: old ciphertext copies (backups) remain decryptable with the old
+passphrase.
 
 ### 4. Service-script passphrase handoff residue — `accepted`
 
@@ -88,6 +92,6 @@ TUI leaves values in terminal scrollback.
 
 ## Priority order for fixes
 
-1. `secretov passwd` (finding 3) — only gap with no workaround mid-incident.
+1. ~~`secretov passwd` (finding 3)~~ — done 2026-08-30.
 2. Checksums in get-deps.sh + FTXUI commit pin (finding 8).
 3. Encrypted swap / zram on the host (findings 2, 4) — machine config, not code.

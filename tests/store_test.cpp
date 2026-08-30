@@ -150,6 +150,29 @@ void test_implausible_kdf_params() {
                        "implausible KDF parameters"));
 }
 
+// 10. change_passphrase: reopen works only with the new passphrase; data
+// survives; retained-passphrase comparison follows the change.
+void test_change_passphrase() {
+    std::string path = store_path("s10");
+    {
+        Store s = Store::create(path, kPass, kNow1);
+        s.set("secret", "value");
+        assert(s.passphrase_matches(kPass));
+
+        s.change_passphrase("new pass", kNow2);
+        assert(s.key_created_at() == kNow2);
+        assert(s.passphrase_matches("new pass"));
+        assert(!s.passphrase_matches(kPass));
+        assert(s.get("secret").value() == "value");
+        s.set("post", "change");  // persists under the new key
+    }
+    assert(throws_with([&] { Store::open(path, kPass, kNow2); },
+                       "wrong passphrase or corrupted store"));
+    Store s = Store::open(path, "new pass", kNow2);
+    assert(s.get("secret").value() == "value");
+    assert(s.get("post").value() == "change");
+}
+
 // 8. create on existing path throws.
 void test_create_existing() {
     std::string path = store_path("s8");
@@ -174,6 +197,7 @@ int main() {
     test_garbage_file();
     test_bad_version();
     test_rotate();
+    test_change_passphrase();
     test_create_existing();
     test_implausible_kdf_params();
 

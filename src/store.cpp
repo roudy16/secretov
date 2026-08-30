@@ -283,11 +283,9 @@ std::vector<std::string> Store::list() const {
     return keys;
 }
 
-void Store::rotate(std::uint64_t now) {
-    if (!passphrase_) {
-        throw std::runtime_error("cannot rotate: passphrase not retained");
-    }
-
+// Fresh salt, key derived from `pass`, re-encrypt. Shared by rotate (same
+// passphrase) and change_passphrase (new one).
+void Store::rekey(const unsigned char* pass, std::size_t pass_len, std::uint64_t now) {
     // Derive the new key into locals first; touch no members until it succeeds,
     // so a throw here (OOM/mlock/Argon2) leaves the store fully intact.
     unsigned char new_salt[crypto_pwhash_SALTBYTES];
@@ -302,7 +300,7 @@ void Store::rotate(std::uint64_t now) {
         throw std::runtime_error("sodium_mlock failed: " + std::string(std::strerror(errno)));
     }
     if (crypto_pwhash(new_key, crypto_secretbox_KEYBYTES,
-                      reinterpret_cast<const char*>(passphrase_), passphrase_len_, new_salt,
+                      reinterpret_cast<const char*>(pass), pass_len, new_salt,
                       static_cast<unsigned long long>(opslimit_),
                       static_cast<std::size_t>(memlimit_),
                       crypto_pwhash_ALG_ARGON2ID13) != 0) {
@@ -323,6 +321,53 @@ void Store::rotate(std::uint64_t now) {
         std::free(old_key);
     }
     persist();
+}
+
+void Store::rotate(std::uint64_t now) {
+    if (!passphrase_) {
+        throw std::runtime_error("cannot rotate: passphrase not retained");
+    }
+    rekey(passphrase_, passphrase_len_, now);
+}
+
+void Store::change_passphrase(const std::string& new_passphrase, std::uint64_t now) {
+    if (new_passphrase.empty()) {
+        throw std::runtime_error("empty passphrase");
+    }
+    // Stage the new passphrase in guarded memory before rekeying, so the swap
+    // after a successful persist cannot fail.
+    std::size_t new_len = new_passphrase.size();
+    unsigned char* new_pass = static_cast<unsigned char*>(std::malloc(new_len));
+    if (!new_pass) {
+        throw std::runtime_error("out of memory allocating key material");
+    }
+    if (sodium_mlock(new_pass, new_len) != 0) {
+        std::free(new_pass);
+        throw std::runtime_error("sodium_mlock failed: " + std::string(std::strerror(errno)));
+    }
+    std::memcpy(new_pass, new_passphrase.data(), new_len);
+
+    try {
+        rekey(new_pass, new_len, now);
+    } catch (...) {
+        sodium_memzero(new_pass, new_len);
+        sodium_munlock(new_pass, new_len);
+        std::free(new_pass);
+        throw;
+    }
+
+    if (passphrase_) {
+        sodium_memzero(passphrase_, passphrase_len_);
+        sodium_munlock(passphrase_, passphrase_len_);
+        std::free(passphrase_);
+    }
+    passphrase_ = new_pass;
+    passphrase_len_ = new_len;
+}
+
+bool Store::passphrase_matches(const std::string& given) const {
+    if (!passphrase_ || given.size() != passphrase_len_) return false;
+    return sodium_memcmp(passphrase_, given.data(), passphrase_len_) == 0;
 }
 
 Store::Store(Store&& other) noexcept

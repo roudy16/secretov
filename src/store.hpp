@@ -46,12 +46,18 @@ class Store {
     std::vector<std::string> list() const;
 
     void rotate(std::uint64_t now);
+    // Re-key the store under a different passphrase (fresh salt, re-encrypt,
+    // retained passphrase replaced). Caller verifies the old passphrase first.
+    void change_passphrase(const std::string& new_passphrase, std::uint64_t now);
+    // Constant-time comparison against the retained passphrase.
+    bool passphrase_matches(const std::string& given) const;
     std::uint64_t key_created_at() const { return key_created_at_; }
 
    private:
     Store() = default;
 
     void derive_key(const std::string& passphrase);
+    void rekey(const unsigned char* pass, std::size_t pass_len, std::uint64_t now);
     void persist() const;
     void wipe();
 

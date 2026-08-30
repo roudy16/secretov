@@ -41,16 +41,11 @@ std::string load_token(const Paths& paths) {
 }
 
 // Connect, send one request, return the parsed response. Throws on I/O trouble.
-nlohmann::json send_request(const Paths& paths, const std::string& token, const std::string& op,
-                            const std::string& key, const std::optional<std::string>& value) {
+nlohmann::json send_request(const Paths& paths, const nlohmann::json& req) {
     std::unique_ptr<Connection> conn = connect_unix(paths.socket);
     if (!conn) {
         throw std::runtime_error("daemon not running at " + paths.socket + " ?");
     }
-    nlohmann::json req{{"token", token}, {"op", op}};
-    if (!key.empty()) req["key"] = key;
-    if (value) req["value"] = *value;
-
     if (!conn->write_line(req.dump())) {
         throw std::runtime_error("failed to send request to daemon");
     }
@@ -68,13 +63,20 @@ nlohmann::json send_request(const Paths& paths, const std::string& token, const 
 }
 
 // Send a request and, on a non-ok response, throw its error message.
-nlohmann::json request_or_throw(const Paths& paths, const std::string& token, const std::string& op,
-                                const std::string& key, const std::optional<std::string>& value) {
-    nlohmann::json resp = send_request(paths, token, op, key, value);
+nlohmann::json request_or_throw(const Paths& paths, const nlohmann::json& req) {
+    nlohmann::json resp = send_request(paths, req);
     if (!resp.value("ok", false)) {
         throw std::runtime_error(resp.value("error", std::string("request failed")));
     }
     return resp;
+}
+
+nlohmann::json request_or_throw(const Paths& paths, const std::string& token, const std::string& op,
+                                const std::string& key, const std::optional<std::string>& value) {
+    nlohmann::json req{{"token", token}, {"op", op}};
+    if (!key.empty()) req["key"] = key;
+    if (value) req["value"] = *value;
+    return request_or_throw(paths, req);
 }
 
 }  // namespace
@@ -166,6 +168,30 @@ int cmd_rotate() {
     Paths paths = resolve_paths();
     try {
         request_or_throw(paths, load_token(paths), "rotate", "", std::nullopt);
+    } catch (const std::exception& e) {
+        std::cerr << "secretov: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+int cmd_passwd() {
+    Paths paths = resolve_paths();
+    try {
+        std::string old_pass = read_passphrase("Current passphrase: ");
+        std::string new_pass = read_passphrase("New passphrase: ");
+        if (::isatty(STDIN_FILENO)) {
+            std::string confirm = read_passphrase("Confirm new passphrase: ");
+            if (new_pass != confirm) {
+                std::cerr << "secretov: passphrases do not match\n";
+                return 1;
+            }
+        }
+        request_or_throw(paths, nlohmann::json{{"token", load_token(paths)},
+                                               {"op", "passwd"},
+                                               {"old", old_pass},
+                                               {"new", new_pass}});
+        std::cout << "passphrase changed\n";
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;

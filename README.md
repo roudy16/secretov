@@ -28,7 +28,8 @@ just run tui                       # interactive terminal UI
 ```
 
 Commands: `init`, `daemon`, `get`, `set` (value via stdin only), `list`,
-`delete`, `rotate`, `exec`, `tui`.
+`delete`, `rotate`, `passwd` (change store passphrase; daemon must be
+running), `exec`, `tui`.
 
 ## Running as a service
 

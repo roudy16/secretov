@@ -29,11 +29,13 @@ wire (token stays a string field).
 
 Newline-delimited JSON over the socket.
 
-Request:  `{"token": "...", "op": "get|set|list|delete", "key": "...", "value": "..."}`
+Request:  `{"token": "...", "op": "get|set|list|delete|rotate|passwd", "key": "...", "value": "..."}`
 Response: `{"ok": true, "value"|"keys": ...}` or `{"ok": false, "error": "..."}`
 
-Verbs kept minimal: `get`, `set`, `list`, `delete`. Rotation gets a wire op
-when implemented (token-guarded admin op), not before.
+Verbs kept minimal. `rotate` and `passwd` are token-guarded admin ops;
+`passwd` additionally carries `"old"` and `"new"` fields, and the daemon
+verifies `"old"` against its retained passphrase (constant-time) before
+re-keying — the token alone cannot change the passphrase.
 
 ## Storage
 
@@ -57,10 +59,16 @@ Both triggers:
 Rotation = decrypt whole file, re-encrypt with new salt/nonce. No envelope
 encryption; the store is one small file.
 
+Rotation never changes the passphrase. For a leaked passphrase the response
+is `secretov passwd` (daemon op, requires the current passphrase): fresh salt,
+key re-derived from the new passphrase, store re-encrypted, retained
+passphrase replaced. Old ciphertext copies (backups) remain decryptable with
+the old passphrase — copy hygiene is on the user.
+
 ## CLI
 
 `secretov` binary: `init`, `daemon`, `get`, `set`, `list`, `delete`,
-`rotate`, `tui` (interactive terminal UI over the daemon socket),
+`rotate`, `passwd`, `tui` (interactive terminal UI over the daemon socket),
 `exec --secret NAME ... -- cmd` (fetch secrets, inject into child
 env, exec). `set KEY` reads the value from stdin only — never an argv
 argument, which would leak the secret via `/proc/<pid>/cmdline` to other UIDs.

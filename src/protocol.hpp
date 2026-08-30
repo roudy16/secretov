@@ -12,6 +12,8 @@ struct Request {
     std::string op;
     std::string key;
     std::string value;
+    std::string old_pass;  // "passwd" op only
+    std::string new_pass;  // "passwd" op only
 };
 
 inline std::optional<Request> parse_request(const std::string& line) {
@@ -31,6 +33,8 @@ inline std::optional<Request> parse_request(const std::string& line) {
         req.op = j.at("op").get<std::string>();
         req.key = j.value("key", std::string{});
         req.value = j.value("value", std::string{});
+        req.old_pass = j.value("old", std::string{});
+        req.new_pass = j.value("new", std::string{});
     } catch (const nlohmann::json::exception&) {
         return std::nullopt;
     }

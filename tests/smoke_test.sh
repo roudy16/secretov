@@ -67,6 +67,33 @@ OUT="$("$BIN" exec --secret VIA_STDIN=INJECTED -- sh -c 'printf %s "$INJECTED"')
 TUI_ERR="$("$BIN" tui </dev/null 2>&1 1>/dev/null)" && fail "tui with no tty should exit 1"
 echo "$TUI_ERR" | grep -q "requires a terminal" || fail "tui no-tty message: got '$TUI_ERR'"
 
+# 5c. passwd: wrong current passphrase rejected; correct one re-keys the store,
+# and a daemon restart requires the new passphrase.
+NEWPASS="staple battery horse correct"
+if printf 'wrong\n%s\n' "$NEWPASS" | "$BIN" passwd >/dev/null 2>&1; then
+    fail "passwd with wrong current passphrase should fail"
+fi
+printf '%s\n%s\n' "$PASS" "$NEWPASS" | "$BIN" passwd >/dev/null || fail "passwd"
+[ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after passwd"
+kill -TERM "$DAEMON_PID"
+wait "$DAEMON_PID" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    [ -S "$SOCK" ] || break
+    sleep 0.1
+done
+if printf '%s\n' "$PASS" | "$BIN" daemon >/dev/null 2>&1; then
+    fail "daemon start with old passphrase should fail after passwd"
+fi
+printf '%s\n' "$NEWPASS" | "$BIN" daemon >>"$WORK/daemon.log" 2>&1 &
+DAEMON_PID=$!
+for _ in $(seq 1 100); do
+    [ -S "$SOCK" ] && break
+    kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited early after passwd: $(cat "$WORK/daemon.log")"
+    sleep 0.1
+done
+[ -S "$SOCK" ] || fail "socket did not reappear after passwd restart"
+[ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after restart with new passphrase"
+
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
 printf 'deadbeefdeadbeef' > "$TOKEN"
