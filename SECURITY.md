@@ -76,13 +76,15 @@ salt/params/nonce fails decryption loudly; key_created_at tampering only skews
 auto-rotation (documented in DESIGN.md). KDF-DoS variant already blocked by
 the bounds check.
 
-### 8. Dependency fetch lacks checksum pinning — `open`
+### 8. Dependency fetch lacks checksum pinning — `done` (2026-08-30)
 
-`third_party/get-deps.sh` curls nlohmann/json and libsodium from GitHub
-releases pinned by version, no checksum; FTXUI is FetchContent-pinned to tag
-v7.0.0 (tags can move, hashes cannot). For libsodium especially, verify a
-sha256 of the tarball; pin FTXUI to a commit hash. Low risk (HTTPS+GitHub),
-five-line fix.
+`third_party/get-deps.sh` curled nlohmann/json and libsodium from GitHub
+releases pinned by version only; FTXUI was FetchContent-pinned to tag v7.0.0
+(tags can move). Fixed: get-deps.sh verifies sha256 of both downloads and
+deletes the file on mismatch; FTXUI pinned to commit d120f349 (= v7.0.0).
+Digests were cross-checked from two hosts each (GitHub release asset vs.
+download.libsodium.org; release asset vs. single_include at the git tag).
+Bumping a dependency means updating its pinned digest in the same change.
 
 ### 9. Housekeeping — `open`
 
@@ -93,5 +95,5 @@ TUI leaves values in terminal scrollback.
 ## Priority order for fixes
 
 1. ~~`secretov passwd` (finding 3)~~ — done 2026-08-30.
-2. Checksums in get-deps.sh + FTXUI commit pin (finding 8).
+2. ~~Checksums in get-deps.sh + FTXUI commit pin (finding 8)~~ — done 2026-08-30.
 3. Encrypted swap / zram on the host (findings 2, 4) — machine config, not code.

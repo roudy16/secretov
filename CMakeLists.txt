@@ -38,7 +38,7 @@ endif()
 include(FetchContent)
 FetchContent_Declare(ftxui
   GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
-  GIT_TAG v7.0.0
+  GIT_TAG d120f349b7e7b50584ea79a75a2523a5a66a087f  # v7.0.0; a hash cannot be moved, a tag can
   SYSTEM)
 set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
