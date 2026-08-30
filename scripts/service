@@ -1,0 +1,27 @@
+#!/usr/bin/env sh
+# Platform-agnostic entry point for managing secretov as a local service.
+# Dispatches to the concrete implementation for this OS/init system.
+set -eu
+
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+case "$(uname -s)" in
+Linux)
+    # is-system-running exits non-zero when merely "degraded" (any failed
+    # unit); any state string at all means a user manager is reachable.
+    state=$(systemctl --user is-system-running 2>/dev/null || true)
+    if [ -n "$state" ] && [ "$state" != "offline" ]; then
+        exec "$dir/linux-systemd.sh" "$@"
+    fi
+    echo "service: no systemd user session; no implementation for this setup" >&2
+    exit 1
+    ;;
+Darwin)
+    echo "service: macOS (launchd) implementation not written yet" >&2
+    exit 1
+    ;;
+*)
+    echo "service: no implementation for $(uname -s)" >&2
+    exit 1
+    ;;
+esac

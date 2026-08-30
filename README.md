@@ -29,3 +29,16 @@ just run tui                       # interactive terminal UI
 
 Commands: `init`, `daemon`, `get`, `set` (value via stdin only), `list`,
 `delete`, `rotate`, `exec`, `tui`.
+
+## Running as a service
+
+`scripts/service` manages the daemon as a local service (platform-agnostic
+dispatcher; Linux/systemd implemented, macOS/launchd not yet):
+
+```sh
+scripts/service install   # build + install binary to ~/.local/bin, register user unit
+scripts/service start     # prompts for passphrase (no auto-start at boot — it needs one)
+scripts/service stop
+scripts/service status
+scripts/service update    # rebuild + reinstall, restart daemon if running
+```
