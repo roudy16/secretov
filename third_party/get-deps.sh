@@ -5,10 +5,11 @@
 set -eu
 cd "$(dirname "$0")"
 
-JSON_URL=https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
-JSON_SHA256=9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6
-SODIUM_URL=https://github.com/jedisct1/libsodium/releases/download/1.0.20-RELEASE/libsodium-1.0.20.tar.gz
-SODIUM_SHA256=ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19
+JSON_URL=https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp
+JSON_SHA256=aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63
+SODIUM_VERSION=1.0.22
+SODIUM_URL=https://github.com/jedisct1/libsodium/releases/download/$SODIUM_VERSION-RELEASE/libsodium-$SODIUM_VERSION.tar.gz
+SODIUM_SHA256=adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349
 
 # fetch URL SHA256 DEST — download to DEST, verify, delete on mismatch.
 fetch() {
@@ -35,11 +36,11 @@ fi
 if [ ! -f sodium/lib/libsodium.a ]; then
   fetch "$SODIUM_URL" "$SODIUM_SHA256" libsodium.tar.gz
   tar xzf libsodium.tar.gz
-  cd libsodium-1.0.20
+  cd "libsodium-$SODIUM_VERSION"
   ./configure --prefix="$(cd .. && pwd)/sodium" --disable-shared --quiet
   make -j"$(nproc)" >/dev/null
   make install >/dev/null
   cd ..
-  rm -rf libsodium-1.0.20 libsodium.tar.gz
+  rm -rf "libsodium-$SODIUM_VERSION" libsodium.tar.gz
 fi
 echo "deps ready"

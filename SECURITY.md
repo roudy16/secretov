@@ -81,10 +81,12 @@ the bounds check.
 `third_party/get-deps.sh` curled nlohmann/json and libsodium from GitHub
 releases pinned by version only; FTXUI was FetchContent-pinned to tag v7.0.0
 (tags can move). Fixed: get-deps.sh verifies sha256 of both downloads and
-deletes the file on mismatch; FTXUI pinned to commit d120f349 (= v7.0.0).
-Digests were cross-checked from two hosts each (GitHub release asset vs.
-download.libsodium.org; release asset vs. single_include at the git tag).
-Bumping a dependency means updating its pinned digest in the same change.
+deletes the file on mismatch; FTXUI pinned by commit hash. Same day, all
+three bumped to latest stable: nlohmann/json 3.12.0, libsodium 1.0.22, FTXUI
+7.0.3 (commit f921fad2). Digests were cross-checked from two hosts each
+(GitHub release asset vs. download.libsodium.org; release asset vs.
+single_include at the git tag). Bumping a dependency means updating its
+pinned digest in the same change; re-verify from two sources.
 
 ### 9. Housekeeping — `open`
 
