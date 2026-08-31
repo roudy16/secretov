@@ -49,6 +49,50 @@ secretov list -p myproj -e dev
 
 `-e` falls back to `$SECRETOV_ENV`, then the manifest's `default_env`.
 
+## Backup and recovery
+
+There is no recovery path inside secretov: the store is one encrypted file
+and the passphrase is the only key. Two things must survive independently:
+
+1. **The passphrase** — keep it in your password manager. Without it a backup
+   is noise.
+2. **The store file** — `~/.local/share/secretov/store` (`$XDG_DATA_HOME`).
+   It is ciphertext (secretbox + Argon2id), safe to copy anywhere, including
+   cloud sync or a git repo of dotfiles.
+
+Also worth copying, though both are regenerable:
+`~/.config/secretov/token` (rewrite with 64 hex chars from
+`/dev/urandom` if lost — the daemon reads it at start) and
+`~/.config/secretov/projects.yaml` (registry; hand-editable).
+`.secretov.yaml` manifests live in their repos and contain no values.
+
+Writes are atomic (temp file + fsync + rename), so a plain copy at any moment
+is a consistent snapshot:
+
+```sh
+cp ~/.local/share/secretov/store  ~/backups/secretov-store-$(date +%F)
+cp ~/.config/secretov/token       ~/backups/secretov-token
+```
+
+A backup is decryptable only with the passphrase that was current when it was
+taken — after `secretov passwd`, take a fresh backup and retire old ones.
+
+**Verify a backup** without touching the live store, using overridden XDG
+dirs (this machine exports them globally, so override all three):
+
+```sh
+T=$(mktemp -d) && mkdir -p $T/data/secretov $T/config/secretov $T/run
+cp ~/backups/secretov-store-2026-08-30 $T/data/secretov/store
+cp ~/backups/secretov-token           $T/config/secretov/token
+export XDG_DATA_HOME=$T/data XDG_CONFIG_HOME=$T/config XDG_RUNTIME_DIR=$T/run
+secretov daemon &            # prompts for the passphrase
+secretov list                # keys appear -> backup is good
+kill %1; rm -rf $T; unset XDG_DATA_HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR
+```
+
+**Restore**: stop the daemon (`scripts/service stop`), copy the store (and
+token) back to their paths, `scripts/service start`.
+
 ## Running as a service
 
 `scripts/service` manages the daemon as a local service (platform-agnostic
