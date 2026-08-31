@@ -62,6 +62,10 @@ std::string dispatch(Store& store, const Request& req, std::uint64_t now) {
     if (req.op == "list") {
         return ok_keys(store.list());
     }
+    if (req.op == "getprefix") {
+        if (req.key.empty()) return error_response("missing prefix");
+        return ok_values(store.get_prefix(req.key));
+    }
     if (req.op == "rotate") {
         store.rotate(now);
         return ok_response();

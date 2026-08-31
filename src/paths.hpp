@@ -20,9 +20,19 @@
 
 namespace secretov {
 
+// Single source of truth for on-disk names.
+inline constexpr const char* kAppName = "secretov";
+inline constexpr const char* kStoreFileName = "store";
+inline constexpr const char* kTokenFileName = "token";
+inline constexpr const char* kRegistryFileName = "projects.yaml";
+inline constexpr const char* kSocketFileName = "secretov.sock";
+inline constexpr const char* kManifestFileName = ".secretov.yaml";
+inline constexpr const char* kEnvOverrideVar = "SECRETOV_ENV";
+
 struct Paths {
     std::string store;
     std::string token;
+    std::string registry;
     std::string socket;
 };
 
@@ -41,15 +51,18 @@ inline std::string home_dir() {
 
 inline Paths resolve_paths() {
     Paths p;
-    p.store = env_or("XDG_DATA_HOME", home_dir() + "/.local/share") + "/secretov/store";
-    p.token = env_or("XDG_CONFIG_HOME", home_dir() + "/.config") + "/secretov/token";
+    const std::string app = std::string("/") + kAppName + "/";
+    p.store = env_or("XDG_DATA_HOME", home_dir() + "/.local/share") + app + kStoreFileName;
+    const std::string config_dir = env_or("XDG_CONFIG_HOME", home_dir() + "/.config") + app;
+    p.token = config_dir + kTokenFileName;
+    p.registry = config_dir + kRegistryFileName;
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
     if (runtime && *runtime) {
-        p.socket = std::string(runtime) + "/secretov.sock";
+        p.socket = std::string(runtime) + "/" + kSocketFileName;
     } else {
         // No XDG_RUNTIME_DIR: put the socket in a private 0700 dir under /tmp so
         // a placing-a-socket-in-shared-/tmp race can't hand it to another UID.
-        std::string dir = "/tmp/secretov-" + std::to_string(::getuid());
+        std::string dir = "/tmp/" + std::string(kAppName) + "-" + std::to_string(::getuid());
         if (::mkdir(dir.c_str(), 0700) != 0) {
             if (errno != EEXIST) {
                 throw std::runtime_error("mkdir '" + dir + "': " + std::strerror(errno));
@@ -64,7 +77,7 @@ inline Paths resolve_paths() {
                                          "': must be a 0700 dir owned by our uid");
             }
         }
-        p.socket = dir + "/secretov.sock";
+        p.socket = dir + "/" + kSocketFileName;
     }
     return p;
 }

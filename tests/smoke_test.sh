@@ -94,6 +94,41 @@ done
 [ -S "$SOCK" ] || fail "socket did not reappear after passwd restart"
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after restart with new passphrase"
 
+# 5d. scopes: import a dotenv into dev/demo (manifest created), exec injects via
+# the manifest, collisions refused without --overwrite, list filters, registry
+# makes -p work from elsewhere, comments in the manifest survive a second import.
+PROJ="$WORK/demo"
+mkdir -p "$PROJ"
+printf 'DB_URL=postgres://x\n# a comment\nexport API_KEY="k # v"\n' > "$PROJ/.env"
+( cd "$PROJ" && "$BIN" import -p demo -e dev >/dev/null ) || fail "import"
+[ -f "$PROJ/.secretov.yaml" ] || fail "manifest not created"
+[ "$("$BIN" get dev/demo/DB_URL)" = "postgres://x" ] || fail "imported value"
+[ "$("$BIN" get dev/demo/API_KEY)" = "k # v" ] || fail "imported quoted value"
+if ( cd "$PROJ" && "$BIN" import -e dev >/dev/null 2>&1 ); then fail "re-import without --overwrite should fail"; fi
+printf '# keep me\n' >> "$PROJ/.secretov.yaml"
+printf 'DB_URL=postgres://y\nNEW_ONE=n\n' > "$PROJ/.env"
+( cd "$PROJ" && "$BIN" import -e dev --overwrite >/dev/null ) || fail "import --overwrite"
+grep -q '^# keep me$' "$PROJ/.secretov.yaml" || fail "manifest comment lost on import"
+grep -q '^      NEW_ONE:$' "$PROJ/.secretov.yaml" || fail "manifest entry not added"
+OUT="$(cd "$PROJ" && "$BIN" exec -e dev -- sh -c 'printf "%s|%s|%s" "$DB_URL" "$API_KEY" "$NEW_ONE"')"
+[ "$OUT" = "postgres://y|k # v|n" ] || fail "scoped exec got '$OUT'"
+DRY="$(cd "$PROJ" && "$BIN" exec -e dev --dry-run)"
+echo "$DRY" | grep -q "API_KEY <- dev/demo/API_KEY" || fail "dry-run missing mapping: $DRY"
+echo "$DRY" | grep -q "postgres" && fail "dry-run leaked a value"
+if ( cd "$PROJ" && "$BIN" exec -- true 2>/dev/null ); then fail "exec without env and without default_env should fail"; fi
+OUT="$(cd "$PROJ" && SECRETOV_ENV=dev "$BIN" exec -- sh -c 'printf %s "$NEW_ONE"')"
+[ "$OUT" = "n" ] || fail "SECRETOV_ENV not honoured"
+"$BIN" list -p demo -e dev | grep -qx "dev/demo/API_KEY" || fail "scoped list"
+if "$BIN" list -p demo -e dev | grep -qx "VIA_STDIN"; then fail "scoped list leaked unscoped key"; fi
+mkdir -p "$XDG_CONFIG_HOME/secretov"
+printf 'projects:\n  demo:\n    root: "%s"\n' "$PROJ" > "$XDG_CONFIG_HOME/secretov/projects.yaml"
+OUT="$(cd / && "$BIN" exec -p demo -e dev -- sh -c 'printf %s "$DB_URL"')"
+[ "$OUT" = "postgres://y" ] || fail "registry exec got '$OUT'"
+if ( cd / && "$BIN" exec -p nope -e dev -- true 2>/dev/null ); then fail "unregistered -p should fail"; fi
+# raw --secret still works anywhere, without a manifest
+OUT="$(cd / && "$BIN" exec --secret VIA_STDIN=RAW -- sh -c 'printf %s "$RAW"')"
+[ "$OUT" = "s3cr3t-value" ] || fail "raw exec got '$OUT'"
+
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
 printf 'deadbeefdeadbeef' > "$TOKEN"

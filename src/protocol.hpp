@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -51,6 +52,10 @@ inline std::string ok_value(const std::string& value) {
 
 inline std::string ok_keys(const std::vector<std::string>& keys) {
     return nlohmann::json{{"ok", true}, {"keys", keys}}.dump();
+}
+
+inline std::string ok_values(const std::map<std::string, std::string>& values) {
+    return nlohmann::json{{"ok", true}, {"values", values}}.dump();
 }
 
 inline std::string error_response(const std::string& msg) {

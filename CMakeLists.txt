@@ -46,6 +46,24 @@ set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ftxui)
 
+# yaml-cpp: manifests + registry. System package first, FetchContent fallback.
+find_package(yaml-cpp QUIET)
+if(NOT yaml-cpp_FOUND)
+  FetchContent_Declare(yaml-cpp
+    GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+    GIT_TAG 56e3bb550c91fd7005566f19c079cb7a503223cf  # yaml-cpp-0.9.0; a hash cannot be moved, a tag can
+    SYSTEM)
+  set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_INSTALL OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_FORMAT_SOURCE OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(yaml-cpp)
+endif()
+if(TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
+  add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)  # pre-0.8 system packages lack the namespaced target
+endif()
+
 # tui.cpp pulls FTXUI; keep it out of secretov_core so store_test never links it.
 file(GLOB SECRETOV_CORE_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
 list(REMOVE_ITEM SECRETOV_CORE_SRC
@@ -54,7 +72,7 @@ list(REMOVE_ITEM SECRETOV_CORE_SRC
 
 add_library(secretov_core STATIC ${SECRETOV_CORE_SRC})
 target_include_directories(secretov_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(secretov_core PUBLIC sodium nlohmann_json::nlohmann_json)
+target_link_libraries(secretov_core PUBLIC sodium nlohmann_json::nlohmann_json yaml-cpp::yaml-cpp)
 
 add_executable(secretov src/main.cpp src/tui.cpp)
 target_link_libraries(secretov PRIVATE secretov_core
@@ -65,6 +83,9 @@ enable_testing()
 add_executable(store_test tests/store_test.cpp)
 target_link_libraries(store_test PRIVATE secretov_core)
 add_test(NAME store_test COMMAND store_test)
+add_executable(manifest_test tests/manifest_test.cpp)
+target_link_libraries(manifest_test PRIVATE secretov_core)
+add_test(NAME manifest_test COMMAND manifest_test)
 
 add_test(NAME smoke_test
   COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_test.sh $<TARGET_FILE:secretov>)

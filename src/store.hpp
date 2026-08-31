@@ -18,6 +18,7 @@
 // integers are explicitly little-endian (manual byte packing).
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,6 +45,9 @@ class Store {
     void set(const std::string& key, const std::string& value);
     bool remove(const std::string& key);
     std::vector<std::string> list() const;
+    // Every key starting with `prefix` (plain string prefix; callers pass
+    // "env/project/" so matching is segment-safe).
+    std::map<std::string, std::string> get_prefix(const std::string& prefix) const;
 
     void rotate(std::uint64_t now);
     // Re-key the store under a different passphrase (fresh salt, re-encrypt,

@@ -74,8 +74,66 @@ env, exec). `set KEY` reads the value from stdin only — never an argv
 argument, which would leak the secret via `/proc/<pid>/cmdline` to other UIDs.
 No client-side caching — the daemon is a local socket away.
 
+## Scopes: projects, environments, manifests
+
+Store keys for scoped secrets are `env/project/KEY` (three segments). The
+store stays a flat map; the hierarchy is a naming convention. `shared` is a
+conventional environment name with no special handling — nothing is layered
+implicitly. Raw `get`/`set`/`delete` remain free-form.
+
+Project manifest, `.secretov.yaml` at the project root (safe to commit: names
+only, never values):
+
+```yaml
+version: "1"
+name: flows-admin
+default_env: dev            # optional; -e omitted without it is an error
+env:
+  dev:
+    secrets:
+      database-url:                        # -> dev/flows-admin/database-url
+        env_var_name: DATABASE_URL
+      openai-key:
+        key: shared/flows-admin/openai-key   # explicit full path, any env/project
+        env_var_name: OPENAI_API_KEY
+```
+
+User registry, `~/.config/secretov/projects.yaml`, maps project name to root
+(`${HOME}`/`${USER}` expanded) so `-p NAME` works from any directory:
+
+```yaml
+projects:
+  flows-admin:
+    root: "${HOME}/workspace/reshape/autocanvas/apps/flows-admin"
+```
+
+Resolution: project = `-p` (registry) else nearest `.secretov.yaml` walking up
+from cwd; env = `-e` else `$SECRETOV_ENV` else manifest `default_env` else
+error. Env var names come only from the manifest.
+
+Commands: `exec [-p] [-e] [--dry-run] -- cmd` (dry-run prints var names,
+never values; `--secret KEY[=VAR]` stays for raw one-offs), `import [FILE]
+[-p] [-e] [--overwrite]` (dotenv in, all-or-nothing on collisions, stores
+`env/project/VAR` and adds `VAR: {env_var_name: VAR}` to the manifest),
+`list [-p] [-e]`.
+
+Manifest edits are text-level insertions into the matching `secrets:` block
+— comments and formatting are preserved. The edited text is re-parsed and
+checked for the new entries before it is written; on any doubt the manifest
+is left untouched and the user is told to add the entries by hand.
+
+Wire: `getprefix` returns every key under a prefix in one round-trip; `exec`
+groups needed keys by `env/project/` prefix and issues one per group.
+
+Trust note: a manifest in a cloned repo may name any scope. Running `exec`
+inside an untrusted checkout hands its command those secrets — but you are
+already running that repo's code, so this does not widen the same-UID
+ceiling. File names (`.secretov.yaml`, `projects.yaml`, token, store, socket)
+live as constants in paths.hpp only.
+
 ## Dependencies
 
 libsodium (crypto), nlohmann/json (protocol + store serialization),
-FTXUI (TUI components for `secretov tui`; FetchContent, pinned tag).
-C++20, CMake. Nothing else without a fight.
+FTXUI (TUI components for `secretov tui`; FetchContent, pinned commit),
+yaml-cpp (manifest + registry parsing; system package first, FetchContent
+pinned commit fallback). C++20, CMake. Nothing else without a fight.

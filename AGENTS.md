@@ -20,15 +20,27 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   checks, auto-rotation. Security-critical.
 - `src/transport.{hpp,cpp}` — Listener/Connection interface + unix socket
   impl. New transports implement the interface; don't touch service logic.
-- `src/client.{hpp,cpp}`, `src/tui.cpp`, `src/paths.hpp`, `src/protocol.hpp`.
-- `tests/store_test.cpp` (assert-based, no framework), `tests/smoke_test.sh`
-  (full daemon lifecycle in a scratch env).
+- `src/manifest.{hpp,cpp}` — `.secretov.yaml` manifests, `projects.yaml`
+  registry, dotenv parsing, and the comment-preserving text insertion that
+  `import` uses to update manifests (re-parsed and verified before writing).
+- `src/client.{hpp,cpp}` (scope resolution for exec/import/list lives here),
+  `src/tui.cpp`, `src/paths.hpp` (all on-disk file names as constants —
+  single source of truth), `src/protocol.hpp`.
+- `tests/store_test.cpp`, `tests/manifest_test.cpp` (assert-based, no
+  framework), `tests/smoke_test.sh` (full daemon lifecycle + scopes in a
+  scratch env).
+- `scripts/service` + `scripts/linux-systemd.sh` — run the daemon as a
+  systemd user unit; SECURITY.md is the security worklist.
 
 ## Constraints
 
-- Dependencies: libsodium, nlohmann/json, FTXUI. Nothing else without a
-  fight. System packages are preferred when present; fallback is vendored
-  (`third_party/get-deps.sh`, no sudo needed) and FetchContent for FTXUI.
+- Dependencies: libsodium, nlohmann/json, FTXUI, yaml-cpp. Nothing else
+  without a fight. System packages are preferred when present; fallback is
+  vendored (`third_party/get-deps.sh`, sha256-verified, no sudo needed) and
+  FetchContent pinned by commit hash for FTXUI and yaml-cpp. Bumping any of
+  them means updating its digest/hash in the same change.
+- Manifest edits must never reformat the user's YAML or drop comments —
+  text-level insertion only (see `manifest_with_entries`).
 - Secrets never go in argv (`/proc/<pid>/cmdline` is world-readable) — this
   is why `set` reads stdin only. Preserve that property in new code.
 - Key/passphrase buffers: mlock + `sodium_memzero` on the daemon side;

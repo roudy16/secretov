@@ -29,7 +29,25 @@ just run tui                       # interactive terminal UI
 
 Commands: `init`, `daemon`, `get`, `set` (value via stdin only), `list`,
 `delete`, `rotate`, `passwd` (change store passphrase; daemon must be
-running), `exec`, `tui`.
+running), `exec`, `import`, `tui`.
+
+## Projects and environments
+
+Scoped secrets are keyed `env/project/KEY`. A `.secretov.yaml` at a project
+root maps secrets to environment variable names per environment (names only —
+safe to commit); `~/.config/secretov/projects.yaml` maps project names to
+roots so `-p` works from anywhere. Details and the manifest schema are in
+[DESIGN.md](DESIGN.md).
+
+```sh
+cd ~/src/myproj
+secretov import -p myproj -e dev          # .env -> dev/myproj/*, writes .secretov.yaml
+secretov exec -e dev -- npm run dev       # inject that env's secrets
+secretov exec -e dev --dry-run            # show VAR <- key, no values
+secretov list -p myproj -e dev
+```
+
+`-e` falls back to `$SECRETOV_ENV`, then the manifest's `default_env`.
 
 ## Running as a service
 

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -61,12 +62,20 @@ void test_roundtrip_and_persistence() {
         assert(!s.remove("api"));
         assert(!s.get("api").has_value());
         assert(s.list().size() == 1);
+
+        s.set("dev/p/A", "1");
+        s.set("dev/p/B", "2");
+        s.set("dev/p2/A", "3");
+        std::map<std::string, std::string> scoped = s.get_prefix("dev/p/");
+        assert(scoped.size() == 2 && scoped.at("dev/p/A") == "1" && scoped.at("dev/p/B") == "2");
+        assert(s.get_prefix("nope/").empty());
     }
     {
         Store s = Store::open(path, kPass, kNow1);
         assert(s.get("db").value() == "postgres://x");
         assert(!s.get("api").has_value());
         assert(s.key_created_at() == kNow1);
+        assert(s.get_prefix("dev/p/").size() == 2);
     }
 }
 

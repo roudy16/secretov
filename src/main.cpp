@@ -15,13 +15,17 @@ void print_usage(std::ostream& out) {
         << "  daemon                     run the secrets daemon (foreground)\n"
         << "  get KEY                    print a secret's value\n"
         << "  set KEY                    set a secret (value read from stdin)\n"
-        << "  list                       list secret names\n"
+        << "  list [-p NAME] [-e ENV]    list secret names (optionally one env/project scope)\n"
         << "  delete KEY                 remove a secret\n"
         << "  rotate                     re-encrypt the store with a fresh key\n"
         << "  passwd                     change the store passphrase\n"
         << "  tui                        interactive terminal UI\n"
-        << "  exec [--secret NAME[=ENVVAR]]... -- PROG [ARGS...]\n"
-        << "                             inject secrets into env and run PROG\n";
+        << "  exec [-p NAME] [-e ENV] [--dry-run] [--secret KEY[=ENVVAR]]... -- PROG [ARGS...]\n"
+        << "                             inject the project manifest's secrets (and any\n"
+        << "                             --secret raw keys) into env and run PROG\n"
+        << "  import [FILE] [-p NAME] [-e ENV] [--overwrite]\n"
+        << "                             import a dotenv file (default .env) into env/project/*\n"
+        << "                             and record the mapping in the project manifest\n";
 }
 
 }  // namespace
@@ -43,7 +47,8 @@ int main(int argc, char** argv) {
     try {
         if (cmd == "init") return cmd_init();
         if (cmd == "daemon") return run_daemon();
-        if (cmd == "list") return cmd_list();
+        if (cmd == "list") return cmd_list(argc - 2, argv + 2);
+        if (cmd == "import") return cmd_import(argc - 2, argv + 2);
         if (cmd == "rotate") return cmd_rotate();
         if (cmd == "passwd") return cmd_passwd();
         if (cmd == "tui") return run_tui();

@@ -283,6 +283,16 @@ std::vector<std::string> Store::list() const {
     return keys;
 }
 
+std::map<std::string, std::string> Store::get_prefix(const std::string& prefix) const {
+    std::map<std::string, std::string> out;
+    for (auto it = data_.begin(); it != data_.end(); ++it) {
+        if (it.key().compare(0, prefix.size(), prefix) == 0) {
+            out[it.key()] = it->get<std::string>();
+        }
+    }
+    return out;
+}
+
 // Fresh salt, key derived from `pass`, re-encrypt. Shared by rotate (same
 // passphrase) and change_passphrase (new one).
 void Store::rekey(const unsigned char* pass, std::size_t pass_len, std::uint64_t now) {
