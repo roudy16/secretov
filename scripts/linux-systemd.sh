@@ -93,11 +93,18 @@ install)
 update)
     was_active=false
     systemctl --user is-active --quiet secretov && was_active=true
+    cd "$REPO_DIR" && cmake --build build -j   # build first; a failed build must not take the daemon down
     $was_active && systemctl --user stop secretov
     build_and_install
     write_unit
-    $was_active && start
     echo "updated $BIN"
+    if $was_active; then
+        if [ -t 0 ]; then
+            start
+        else
+            echo "daemon was stopped for the update; no terminal to prompt for the passphrase — run: scripts/service start" >&2
+        fi
+    fi
     ;;
 start) start ;;
 stop) systemctl --user stop secretov ;;
