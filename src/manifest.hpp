@@ -18,14 +18,17 @@ struct SecretEntry {
     std::string env_var;  // env_var_name
 };
 
+using KeyValues = std::vector<std::pair<std::string, std::string>>;
+
 struct Manifest {
     std::string path;
     std::string project;
     std::optional<std::string> default_env;
     std::map<std::string, std::vector<SecretEntry>> envs;
+    // Plaintext env vars per environment, in file order. These live in the
+    // manifest itself and never touch the store — non-secret config only.
+    std::map<std::string, KeyValues> vars;
 };
-
-using KeyValues = std::vector<std::pair<std::string, std::string>>;
 
 // "env/project/name". Throws if any segment is empty or contains '/'.
 std::string scoped_key(const std::string& env, const std::string& project, const std::string& name);

@@ -70,8 +70,9 @@ the old passphrase — copy hygiene is on the user.
 `secretov` binary: `init`, `daemon`, `get`, `set`, `list`, `delete`,
 `rotate`, `passwd`, `tui` (interactive terminal UI over the daemon socket),
 `exec --secret NAME ... -- cmd` (fetch secrets, inject into child
-env, exec). `set KEY` reads the value from stdin only — never an argv
-argument, which would leak the secret via `/proc/<pid>/cmdline` to other UIDs.
+env, exec). `set KEY` creates or replaces — there is no separate update op;
+it reads the value from stdin only, never an argv argument, which would leak
+the secret via `/proc/<pid>/cmdline` to other UIDs.
 No client-side caching — the daemon is a local socket away.
 
 ## Scopes: projects, environments, manifests
@@ -90,6 +91,9 @@ name: flows-admin
 default_env: dev            # optional; -e omitted without it is an error
 env:
   dev:
+    vars:                                  # plaintext, committed, never stored
+      LOG_LEVEL: debug
+      API_URL: https://dev.example.com
     secrets:
       database-url:                        # -> dev/flows-admin/database-url
         env_var_name: DATABASE_URL
@@ -97,6 +101,18 @@ env:
         key: shared/flows-admin/openai-key   # explicit full path, any env/project
         env_var_name: OPENAI_API_KEY
 ```
+
+`vars:` is optional non-secret config: the YAML key is the environment
+variable name and the scalar value is injected verbatim, with no store lookup
+and no daemon round-trip. It exists so a project needs one file rather than a
+manifest plus a leftover `.env` for its non-sensitive settings. **Values here
+are committed in plaintext — anything sensitive belongs under `secrets:`.**
+Non-string scalars are stringified (`PORT: 8080` injects `"8080"`). A name
+appearing in both `vars:` and a secret's `env_var_name` for the same
+environment is rejected at parse time rather than given a silent precedence;
+`exec` injects vars before secrets, so an explicit `--secret KEY=VAR` on the
+command line still wins. `import` only ever writes `secrets:` — `vars:` is
+hand-maintained, and manifest edits leave it untouched.
 
 User registry, `~/.config/secretov/projects.yaml`, maps project name to root
 (`${HOME}`/`${USER}` expanded) so `-p NAME` works from any directory:
@@ -111,11 +127,15 @@ Resolution: project = `-p` (registry) else nearest `.secretov.yaml` walking up
 from cwd; env = `-e` else `$SECRETOV_ENV` else manifest `default_env` else
 error. Env var names come only from the manifest.
 
-Commands: `exec [-p] [-e] [--dry-run] -- cmd` (dry-run prints var names,
-never values; `--secret KEY[=VAR]` stays for raw one-offs), `import [FILE]
+Commands: `exec [-p] [-e] [--dry-run] -- cmd` (dry-run prints secret var
+names and their keys, never a secret value, and prints plaintext `vars:`
+values in full since they are already committed; `--secret KEY[=VAR]` stays
+for raw one-offs), `import [FILE]
 [-p] [-e] [--overwrite]` (dotenv in, all-or-nothing on collisions, stores
 `env/project/VAR` and adds `VAR: {env_var_name: VAR}` to the manifest),
-`list [-p] [-e]`.
+`list [-p] [-e]`, `set KEY [-p] [-e]` (resolves `env/project/KEY`, so a
+scoped secret can be replaced without retyping the three-segment key; a bare
+`set KEY` still writes the raw key).
 
 Manifest edits are text-level insertions into the matching `secrets:` block
 — comments and formatting are preserved. The edited text is re-parsed and

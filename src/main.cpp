@@ -14,7 +14,8 @@ void print_usage(std::ostream& out) {
         << "  init                       create the store and mint an API token\n"
         << "  daemon                     run the secrets daemon (foreground)\n"
         << "  get KEY                    print a secret's value\n"
-        << "  set KEY                    set a secret (value read from stdin)\n"
+        << "  set KEY [-p NAME] [-e ENV] set a secret, creating or replacing it\n"
+        << "                             (value read from stdin; -p/-e scope the key)\n"
         << "  list [-p NAME] [-e ENV]    list secret names (optionally one env/project scope)\n"
         << "  delete KEY                 remove a secret\n"
         << "  rotate                     re-encrypt the store with a fresh key\n"
@@ -60,14 +61,7 @@ int main(int argc, char** argv) {
             }
             return cmd_get(argv[2]);
         }
-        if (cmd == "set") {
-            // Value comes from stdin only; an argv VALUE would leak via /proc/<pid>/cmdline.
-            if (argc != 3) {
-                std::cerr << "usage: secretov set KEY   (value read from stdin)\n";
-                return 2;
-            }
-            return cmd_set(argv[2]);
-        }
+        if (cmd == "set") return cmd_set(argc - 2, argv + 2);
         if (cmd == "delete") {
             if (argc < 3) {
                 std::cerr << "usage: secretov delete KEY\n";

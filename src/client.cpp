@@ -146,6 +146,37 @@ std::string resolve_env(const ScopeArgs& scope, const Manifest* manifest) {
                              ", or add default_env to the manifest");
 }
 
+struct ResolvedScope {
+    std::string env;
+    std::string project;
+};
+
+// (env, project) for a scope flag pair. -p names the project outright and the
+// manifest is optional (only default_env needs it); otherwise the nearest
+// manifest from cwd supplies the project.
+ResolvedScope resolve_scope(const Paths& paths, const ScopeArgs& scope) {
+    std::optional<Manifest> manifest;
+    std::string project;
+    if (scope.project) {
+        project = *scope.project;
+        if (std::optional<std::string> root = registry_project_root(paths.registry, project)) {
+            manifest = load_manifest(*root + "/" + kManifestFileName);
+        }
+    } else {
+        manifest = resolve_manifest(paths, scope);
+        project = manifest->project;
+    }
+    return {resolve_env(scope, manifest ? &*manifest : nullptr), project};
+}
+
+// Plaintext vars for an env; empty when it declares none. Unlike entries_for
+// a missing env is not an error here — entries_for has already vetted it.
+const KeyValues& vars_for(const Manifest& m, const std::string& env) {
+    static const KeyValues kNone;
+    auto it = m.vars.find(env);
+    return it == m.vars.end() ? kNone : it->second;
+}
+
 const std::vector<SecretEntry>& entries_for(const Manifest& m, const std::string& env) {
     auto it = m.envs.find(env);
     if (it == m.envs.end()) {
@@ -202,11 +233,37 @@ int cmd_get(const std::string& key) {
     return 0;
 }
 
-int cmd_set(const std::string& key) {
+int cmd_set(int argc, char** argv) {
+    static const char* kUsage =
+        "usage: secretov set KEY [-p NAME] [-e ENV]   (value read from stdin)\n";
     Paths paths = resolve_paths();
+    ScopeArgs scope;
+    std::string name;
+    bool name_given = false;
     try {
-        std::string token = load_token(paths);
-        request_or_throw(paths, token, "set", key, read_stdin_value());
+        for (int i = 0; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (take_scope_arg(argc, argv, i, scope)) continue;
+            // A second positional would be an argv VALUE, which must never be
+            // accepted: it would leak the secret via /proc/<pid>/cmdline.
+            if (name_given || arg.empty() || arg[0] == '-') {
+                throw std::runtime_error("unexpected argument '" + arg + "'");
+            }
+            name = arg;
+            name_given = true;
+        }
+        if (!name_given) throw std::runtime_error("missing KEY");
+    } catch (const std::exception& e) {
+        std::cerr << "secretov set: " << e.what() << "\n" << kUsage;
+        return 2;
+    }
+    try {
+        std::string key = name;
+        if (scope.project || scope.env) {
+            ResolvedScope resolved = resolve_scope(paths, scope);
+            key = scoped_key(resolved.env, resolved.project, name);
+        }
+        request_or_throw(paths, load_token(paths), "set", key, read_stdin_value());
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;
@@ -226,19 +283,8 @@ int cmd_list(int argc, char** argv) {
         }
         std::string prefix;
         if (scope.project || scope.env) {
-            // -p alone needs no manifest: the prefix only needs the name.
-            std::optional<Manifest> manifest;
-            std::string project;
-            if (scope.project) {
-                project = *scope.project;
-                if (auto root = registry_project_root(paths.registry, project)) {
-                    manifest = load_manifest(*root + "/" + kManifestFileName);
-                }
-            } else {
-                manifest = resolve_manifest(paths, scope);
-                project = manifest->project;
-            }
-            prefix = scope_prefix(resolve_env(scope, manifest ? &*manifest : nullptr), project);
+            ResolvedScope resolved = resolve_scope(paths, scope);
+            prefix = scope_prefix(resolved.env, resolved.project);
         }
         nlohmann::json resp = request_or_throw(paths, load_token(paths), "list", "", std::nullopt);
         for (const auto& key : resp.value("keys", std::vector<std::string>{})) {
@@ -341,18 +387,31 @@ int cmd_exec(int argc, char** argv) {
         // Raw-only invocations (--secret with no -p/-e) skip the manifest so
         // one-off keys work anywhere, including inside a project directory.
         std::vector<std::pair<std::string, std::string>> wanted;  // (envvar, key)
+        KeyValues plain;                                          // (envvar, literal value)
         if (scope.project || scope.env || raw.empty()) {
             Manifest manifest = resolve_manifest(paths, scope);
             std::string env = resolve_env(scope, &manifest);
             for (const SecretEntry& e : entries_for(manifest, env)) {
                 wanted.emplace_back(e.env_var, e.key);
             }
+            plain = vars_for(manifest, env);
         }
         for (const auto& [key, envvar] : raw) wanted.emplace_back(envvar, key);
 
         if (dry_run) {
+            // Manifest vars are plaintext in a committed file, so printing them
+            // leaks nothing; secrets still show only their key.
+            for (const auto& [envvar, value] : plain) std::cout << envvar << " = " << value << "\n";
             for (const auto& [envvar, key] : wanted) std::cout << envvar << " <- " << key << "\n";
             return 0;
+        }
+
+        // Plaintext first, so an explicit --secret on the command line wins
+        // over a manifest var of the same name.
+        for (const auto& [envvar, value] : plain) {
+            if (::setenv(envvar.c_str(), value.c_str(), 1) != 0) {
+                throw std::runtime_error("setenv '" + envvar + "' failed");
+            }
         }
 
         // One getprefix per env/project/ group; keys without a '/' are fetched singly.

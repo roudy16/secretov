@@ -179,6 +179,7 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
             std::string env = env_pair.first.as<std::string>();
             require_segment(env, "environment");
             std::vector<SecretEntry> entries;
+            KeyValues plain;
             YAML::Node env_node = env_pair.second;
             if (env_node && !env_node.IsNull()) {
                 if (!env_node.IsMap()) {
@@ -216,8 +217,45 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
                         entries.push_back(std::move(e));
                     }
                 }
+
+                // Plaintext, non-secret config. The YAML key is the variable
+                // name; the value is used verbatim, never fetched.
+                YAML::Node vars = env_node["vars"];
+                if (vars && !vars.IsNull()) {
+                    if (!vars.IsMap()) {
+                        throw std::runtime_error("manifest '" + path + "': env '" + env +
+                                                 "' vars must be a mapping");
+                    }
+                    for (const auto& v : vars) {
+                        std::string var_name = v.first.as<std::string>();
+                        if (!is_identifier(var_name)) {
+                            throw std::runtime_error("manifest '" + path + "': var '" + var_name +
+                                                     "' (env " + env +
+                                                     ") is not a valid environment variable name");
+                        }
+                        if (!v.second.IsScalar()) {
+                            throw std::runtime_error("manifest '" + path + "': var '" + var_name +
+                                                     "' (env " + env +
+                                                     ") must be a scalar value");
+                        }
+                        plain.emplace_back(var_name, v.second.as<std::string>());
+                    }
+                }
+
+                // A variable defined twice has no sane precedence; refuse it
+                // here so every command that loads the manifest fails alike.
+                for (const auto& [var_name, value] : plain) {
+                    for (const SecretEntry& e : entries) {
+                        if (e.env_var == var_name) {
+                            throw std::runtime_error("manifest '" + path + "': '" + var_name +
+                                                     "' (env " + env +
+                                                     ") is set in both vars and secrets");
+                        }
+                    }
+                }
             }
             m.envs[env] = std::move(entries);
+            m.vars[env] = std::move(plain);
         }
     }
     return m;

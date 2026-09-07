@@ -8,7 +8,7 @@ namespace secretov {
 // Each returns a process exit code. Paths are resolved from the environment.
 int cmd_init();
 int cmd_get(const std::string& key);
-int cmd_set(const std::string& key);  // value is read from stdin
+int cmd_set(int argc, char** argv);     // KEY [-p NAME] [-e ENV]; value read from stdin
 int cmd_list(int argc, char** argv);    // [-p NAME] [-e ENV]
 int cmd_delete(const std::string& key);
 int cmd_rotate();

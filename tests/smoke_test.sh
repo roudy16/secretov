@@ -129,6 +129,53 @@ if ( cd / && "$BIN" exec -p nope -e dev -- true 2>/dev/null ); then fail "unregi
 OUT="$(cd / && "$BIN" exec --secret VIA_STDIN=RAW -- sh -c 'printf %s "$RAW"')"
 [ "$OUT" = "s3cr3t-value" ] || fail "raw exec got '$OUT'"
 
+# 5e. set -p/-e resolves env/project/NAME (same helper as list/exec/import).
+printf '%s' "postgres://z" | ( cd "$PROJ" && "$BIN" set DB_URL -e dev ) || fail "scoped set (manifest)"
+[ "$("$BIN" get dev/demo/DB_URL)" = "postgres://z" ] || fail "scoped set value"
+printf '%s' "from-registry" | ( cd / && "$BIN" set DB_URL -p demo -e dev ) || fail "scoped set (registry)"
+[ "$("$BIN" get dev/demo/DB_URL)" = "from-registry" ] || fail "registry scoped set value"
+# unscoped set still writes the raw key, and set can still create
+printf '%s' "raw" | "$BIN" set RAW_KEY || fail "unscoped set"
+[ "$("$BIN" get RAW_KEY)" = "raw" ] || fail "unscoped set value"
+# scoped set replaces, never duplicates
+[ "$("$BIN" list -p demo -e dev | grep -cx 'dev/demo/DB_URL')" = "1" ] || fail "scoped set duplicated key"
+if ( cd / && "$BIN" set DB_URL -e dev 2>/dev/null </dev/null ); then fail "set -e outside a project should fail"; fi
+
+# 5f. plaintext vars: injected from the manifest, never stored, shown by dry-run.
+python3 - "$PROJ/.secretov.yaml" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+t = t.replace("  dev:\n", "  dev:\n    vars:\n      LOG_LEVEL: debug\n      PORT: 8080\n", 1)
+p.write_text(t)
+PY
+OUT="$(cd "$PROJ" && "$BIN" exec -e dev -- sh -c 'printf "%s|%s|%s" "$LOG_LEVEL" "$PORT" "$DB_URL"')"
+[ "$OUT" = "debug|8080|from-registry" ] || fail "plaintext vars injection got '$OUT'"
+# vars are manifest-only; nothing was written to the store
+if "$BIN" get dev/demo/LOG_LEVEL >/dev/null 2>&1; then fail "plaintext var leaked into the store"; fi
+"$BIN" list -p demo -e dev | grep -qx "dev/demo/LOG_LEVEL" && fail "plaintext var appeared in list"
+# dry-run shows plaintext values (safe: they are committed) but still no secrets
+DRY="$(cd "$PROJ" && "$BIN" exec -e dev --dry-run)"
+echo "$DRY" | grep -q "LOG_LEVEL = debug" || fail "dry-run missing plaintext var: $DRY"
+echo "$DRY" | grep -q "DB_URL <- dev/demo/DB_URL" || fail "dry-run lost secret mapping"
+echo "$DRY" | grep -q "from-registry" && fail "dry-run leaked a secret value"
+# a var colliding with a secret's env_var_name is refused
+cp "$PROJ/.secretov.yaml" "$PROJ/.secretov.yaml.bak"
+python3 - "$PROJ/.secretov.yaml" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+p.write_text(t.replace("      PORT: 8080\n", "      PORT: 8080\n      DB_URL: oops\n", 1))
+PY
+if ( cd "$PROJ" && "$BIN" exec -e dev -- true 2>/dev/null ); then fail "vars/secrets collision should fail"; fi
+( cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1 || true ) | grep -q "set in both vars and secrets" \
+    || fail "collision message"
+mv "$PROJ/.secretov.yaml.bak" "$PROJ/.secretov.yaml"
+# import still edits the secrets block without disturbing vars
+printf 'LATER=x\n' > "$PROJ/.env"
+( cd "$PROJ" && "$BIN" import -e dev >/dev/null ) || fail "import alongside vars"
+grep -q "LOG_LEVEL: debug" "$PROJ/.secretov.yaml" || fail "import clobbered the vars block"
+OUT="$(cd "$PROJ" && "$BIN" exec -e dev -- sh -c 'printf "%s|%s" "$LOG_LEVEL" "$LATER"')"
+[ "$OUT" = "debug|x" ] || fail "post-import injection got '$OUT'"
+
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
 printf 'deadbeefdeadbeef' > "$TOKEN"

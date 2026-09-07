@@ -86,7 +86,7 @@ void zero(std::string& s) {
     s.clear();
 }
 
-enum class Mode { Normal, Add, ConfirmDelete, ConfirmRotate };
+enum class Mode { Normal, Add, Edit, ConfirmDelete, ConfirmRotate };
 
 std::string load_token(const Paths& paths) {
     std::string token = rstrip(read_file_string(paths.token));
@@ -106,7 +106,8 @@ int run_ui(Daemon& daemon) {
     std::string add_value;
     std::string status = "ready";
     Mode mode = Mode::Normal;
-    int active_tab = 0;  // 0 = key list, 1 = add form
+    int active_tab = 0;  // 0 = key list, 1 = add/edit form
+    int form_field = 0;  // 0 = name input, 1 = value input
 
     auto remask = [&] {
         if (revealed) {
@@ -154,14 +155,32 @@ int run_ui(Daemon& daemon) {
         zero(add_value);
         mode = Mode::Add;
         active_tab = 1;
+        form_field = 0;
         status = "adding secret";
     };
 
-    auto cancel_add = [&] {
+    // Edit reuses the add form's value buffer; the key is fixed to the
+    // selection and the old value is never fetched into the input (a blank
+    // field is one fewer plaintext copy, and 'r' already reveals on demand).
+    auto start_edit = [&] {
+        if (keys.empty()) {
+            status = "no secret to edit";
+            return;
+        }
+        remask();
+        zero(add_value);
+        mode = Mode::Edit;
+        active_tab = 1;
+        form_field = 1;
+        status = "editing " + keys[static_cast<std::size_t>(selected)];
+    };
+
+    auto cancel_form = [&] {
         zero(add_name);
         zero(add_value);
         mode = Mode::Normal;
         active_tab = 0;
+        form_field = 0;
         status = "cancelled";
     };
 
@@ -179,6 +198,25 @@ int run_ui(Daemon& daemon) {
             mode = Mode::Normal;
             active_tab = 0;
             refresh(name);
+        } catch (const std::exception& e) {
+            status = e.what();
+        }
+    };
+
+    auto submit_edit = [&] {
+        if (add_value.empty()) {
+            status = "value required";
+            return;
+        }
+        std::string key = keys[static_cast<std::size_t>(selected)];
+        try {
+            daemon.request("set", key, add_value);
+            status = "updated " + key;
+            zero(add_value);
+            mode = Mode::Normal;
+            active_tab = 0;
+            form_field = 0;
+            refresh(key);
         } catch (const std::exception& e) {
             status = e.what();
         }
@@ -216,7 +254,7 @@ int run_ui(Daemon& daemon) {
     InputOption value_opt;
     value_opt.password = true;
     Component value_input = Input(&add_value, "value", value_opt);
-    Component form = Container::Vertical({name_input, value_input});
+    Component form = Container::Vertical({name_input, value_input}, &form_field);
 
     Component tab = Container::Tab({menu, form}, &active_tab);
 
@@ -242,7 +280,8 @@ int run_ui(Daemon& daemon) {
         Element detail_pane = window(text(" detail "), detail_body) | flex;
 
         Element hints =
-            text(" a add   d delete   R rotate   r reveal   h hide   q quit ") | dim | center;
+            text(" a add   e edit   d delete   R rotate   r reveal   h hide   q quit ") | dim |
+            center;
         Element status_bar =
             hbox({
                 text(" " + daemon.socket_path() + " "),
@@ -269,6 +308,18 @@ int run_ui(Daemon& daemon) {
                                      })) |
                               size(WIDTH, GREATER_THAN, 44) | clear_under | center;
             root = dbox({root, overlay});
+        } else if (mode == Mode::Edit) {
+            Element overlay =
+                window(text(" edit secret "),
+                       vbox({
+                           hbox({text("name:  "),
+                                 text(keys[static_cast<std::size_t>(selected)]) | bold}),
+                           hbox({text("value: "), value_input->Render()}),
+                           separator(),
+                           text("Enter save   Esc cancel") | dim,
+                       })) |
+                size(WIDTH, GREATER_THAN, 44) | clear_under | center;
+            root = dbox({root, overlay});
         } else if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmRotate) {
             std::string msg = mode == Mode::ConfirmDelete
                                   ? "Delete '" + keys[static_cast<std::size_t>(selected)] + "'?"
@@ -291,6 +342,10 @@ int run_ui(Daemon& daemon) {
             }
             if (event == Event::Character('a')) {
                 start_add();
+                return true;
+            }
+            if (event == Event::Character('e')) {
+                start_edit();
                 return true;
             }
             if (event == Event::Character('r')) {
@@ -316,13 +371,17 @@ int run_ui(Daemon& daemon) {
             }
             return false;  // arrows / navigation fall through to the menu
         }
-        if (mode == Mode::Add) {
+        if (mode == Mode::Add || mode == Mode::Edit) {
             if (event == Event::Escape) {
-                cancel_add();
+                cancel_form();
                 return true;
             }
             if (event == Event::Return) {
-                submit_add();
+                if (mode == Mode::Add) {
+                    submit_add();
+                } else {
+                    submit_edit();
+                }
                 return true;
             }
             return false;  // typing falls through to the focused input

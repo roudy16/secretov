@@ -21,23 +21,30 @@ All dev workflows go through `just` (run `just` alone to list recipes):
 just setup && just build
 just run init                      # create store + API token (prompts for passphrase)
 just run daemon                    # foreground; prompts for passphrase
-printf 'hunter2' | just run set DB_PASS
+printf 'hunter2' | just run set DB_PASS   # creates or replaces
 just run get DB_PASS
 just run exec --secret DB_PASS -- your-command   # inject into child env
 just run tui                       # interactive terminal UI
 ```
 
-Commands: `init`, `daemon`, `get`, `set` (value via stdin only), `list`,
+Commands: `init`, `daemon`, `get`, `set` (create or replace; value via stdin
+only; `[-p NAME] [-e ENV]` to scope the key), `list`,
 `delete`, `rotate`, `passwd` (change store passphrase; daemon must be
 running), `exec`, `import`, `tui`.
 
-## Projects and environments
+## Using secretov in another project
+
+If you are here to *use* secretov rather than work on it, read
+**[USING.md](USING.md)** — onboarding, daily commands, and troubleshooting,
+written for consumers (human or agent).
 
 Scoped secrets are keyed `env/project/KEY`. A `.secretov.yaml` at a project
-root maps secrets to environment variable names per environment (names only —
-safe to commit); `~/.config/secretov/projects.yaml` maps project names to
-roots so `-p` works from anywhere. Details and the manifest schema are in
-[DESIGN.md](DESIGN.md).
+root maps secrets to environment variable names per environment (secret names
+only — safe to commit); `~/.config/secretov/projects.yaml` maps project names
+to roots so `-p` works from anywhere. A manifest can also carry a `vars:`
+block of plaintext non-secret config (log levels, public URLs) that `exec`
+injects without touching the store — committed as-is, so never put a secret
+there. Manifest schema is in [DESIGN.md](DESIGN.md).
 
 ```sh
 cd ~/src/myproj
@@ -45,9 +52,24 @@ secretov import -p myproj -e dev          # .env -> dev/myproj/*, writes .secret
 secretov exec -e dev -- npm run dev       # inject that env's secrets
 secretov exec -e dev --dry-run            # show VAR <- key, no values
 secretov list -p myproj -e dev
+printf 'new-pw' | secretov set DB_URL -e dev   # replaces dev/myproj/DB_URL
 ```
 
 `-e` falls back to `$SECRETOV_ENV`, then the manifest's `default_env`.
+
+Two steps `import` does **not** do, and both are easy to miss:
+
+1. **Register the project** — add it to `~/.config/secretov/projects.yaml`, or
+   `-p NAME` fails anywhere outside the project directory.
+2. **Set `default_env`** — add it to the manifest, or every later command needs
+   an explicit `-e`.
+
+```yaml
+# ~/.config/secretov/projects.yaml
+projects:
+  myproj:
+    root: "${HOME}/src/myproj"
+```
 
 ## Backup and recovery
 

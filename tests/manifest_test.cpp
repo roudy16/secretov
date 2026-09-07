@@ -156,6 +156,82 @@ void test_find_manifest_upward() {
     assert(found && *found == g_dir + "/a/.secretov.yaml");
 }
 
+
+void test_vars() {
+    const std::string text =
+        "version: \"1\"\n"
+        "name: proj\n"
+        "env:\n"
+        "  dev:\n"
+        "    vars:\n"
+        "      LOG_LEVEL: debug\n"
+        "      API_URL: https://dev.example.com\n"
+        "      PORT: 8080\n"
+        "      EMPTY: \"\"\n"
+        "    secrets:\n"
+        "      DB_URL:\n"
+        "        env_var_name: DB_URL\n";
+    Manifest m = parse_manifest(text, "test");
+    const KeyValues& v = m.vars.at("dev");
+    assert(v.size() == 4);
+    assert(v[0].first == "LOG_LEVEL" && v[0].second == "debug");        // file order kept
+    assert(v[1].second == "https://dev.example.com");
+    assert(v[2].second == "8080");                                      // YAML scalars stringified
+    assert(v[3].second.empty());
+    assert(m.envs.at("dev").size() == 1);                               // secrets unaffected
+
+    // An env with vars and no secrets block is legal.
+    Manifest only = parse_manifest(
+        "name: proj\nenv:\n  dev:\n    vars:\n      A: b\n", "test");
+    assert(only.vars.at("dev").size() == 1);
+    assert(only.envs.at("dev").empty());
+
+    // No vars block yields an empty list, not a missing env.
+    Manifest none = parse_manifest(
+        "name: proj\nenv:\n  dev:\n    secrets:\n      K:\n        env_var_name: K\n", "test");
+    assert(none.vars.at("dev").empty());
+
+    // A name defined in both vars and secrets has no sane precedence.
+    assert(throws_with(
+        [] {
+            parse_manifest("name: proj\nenv:\n  dev:\n    vars:\n      DUP: x\n"
+                           "    secrets:\n      whatever:\n        env_var_name: DUP\n",
+                           "test");
+        },
+        "is set in both vars and secrets"));
+
+    assert(throws_with(
+        [] { parse_manifest("name: proj\nenv:\n  dev:\n    vars:\n      bad-name: x\n", "test"); },
+        "not a valid environment variable name"));
+
+    assert(throws_with(
+        [] { parse_manifest("name: proj\nenv:\n  dev:\n    vars:\n      NESTED:\n        a: b\n", "test"); },
+        "must be a scalar value"));
+
+    assert(throws_with(
+        [] { parse_manifest("name: proj\nenv:\n  dev:\n    vars: notamap\n", "test"); },
+        "vars must be a mapping"));
+}
+
+// import edits the secrets: block textually; a sibling vars: block must survive.
+void test_insert_preserves_vars_block() {
+    const std::string text =
+        "version: \"1\"\n"
+        "name: proj\n"
+        "env:\n"
+        "  dev:\n"
+        "    vars:\n"
+        "      LOG_LEVEL: debug   # keep this comment\n"
+        "    secrets:\n"
+        "      EXISTING:\n"
+        "        env_var_name: EXISTING\n";
+    std::string out = manifest_with_entries(text, "proj", "dev", {{"ADDED", "ADDED"}});
+    assert(out.find("LOG_LEVEL: debug   # keep this comment") != std::string::npos);
+    Manifest m = parse_manifest(out, "test");
+    assert(m.vars.at("dev").size() == 1);
+    assert(m.vars.at("dev")[0].second == "debug");
+    assert(m.envs.at("dev").size() == 2);
+}
 }  // namespace
 
 int main() {
@@ -174,6 +250,8 @@ int main() {
     test_insert_new_env_block();
     test_insert_rejects_inline_and_mismatch();
     test_insert_fresh_and_four_space();
+    test_vars();
+    test_insert_preserves_vars_block();
     test_registry();
     test_find_manifest_upward();
 

@@ -4,6 +4,10 @@ Local secrets service: daemon + CLI + TUI in one C++20 binary. Read DESIGN.md
 first — it is the authoritative spec (threat model, protocol, file format,
 accepted security ceilings). Don't re-litigate decisions recorded there.
 
+This file is for working *on* secretov. USING.md is the consumer guide, for
+humans and agents using secretov from another project — any change to the CLI
+surface, scope resolution, or manifest/registry format must update it.
+
 ## Workflows
 
 All through `just`: `setup` (fetches vendored deps, configures), `build`,
