@@ -2,6 +2,7 @@
 
 Findings from a code-level review (2026-08-30) of the daemon, store, transport,
 client, and service scripts, evaluated against the threat model in DESIGN.md.
+Finding 9 re-reviewed and closed out 2026-09-07.
 Kept as a worklist: items below may be addressed in future sessions. Status
 values: `open`, `accepted` (documented ceiling, no fix planned), `done`.
 
@@ -88,14 +89,45 @@ three bumped to latest stable: nlohmann/json 3.12.0, libsodium 1.0.22, FTXUI
 single_include at the git tag). Bumping a dependency means updating its
 pinned digest in the same change; re-verify from two sources.
 
-### 9. Housekeeping — `open`
+### 9. Housekeeping — `accepted` (2026-09-07)
 
-Token read into unzeroed `std::string`s on both ends; `exec` secrets are
-inherited by all descendants of the child (standard env-injection tradeoff);
-TUI leaves values in terminal scrollback.
+Reviewed as three separate sub-items. None warrants code; one claim was simply
+wrong.
+
+**9a. Token read into unzeroed `std::string`s (both ends)** — `accepted`. The
+copies are real: the client's `load_token()` result, the `nlohmann::json`
+request and its `dump()`, the socket write buffer, and the daemon's
+process-lifetime `expected_token` (daemon.cpp:161) are all ordinary heap. But
+the token also sits in plaintext at `$CONFIG/token` (0600) for the life of the
+store, so the only exposure zeroing removes is RAM copies reachable via swap —
+and every attacker who can read swap (same UID, root, or an offline disk) reads
+the plaintext token file by the same means. No asymmetry: scrubbing the RAM
+copies buys nothing while the file itself is plaintext. Note the client, unlike
+the daemon, sets neither `RLIMIT_CORE=0` nor `PR_SET_DUMPABLE=0`, so a client
+crash can dump the token — same conclusion, since a reader of that core reads
+the token file too. Folds into #2's encrypted-swap advice. Revisit only if the
+token stops being an on-disk plaintext file.
+
+**9b. `exec` secrets inherited by all descendants** — `accepted`. `cmd_exec`
+calls `setenv` per secret and then `execvp` (client.cpp:385, 399); environment
+inheritance *is* the injection mechanism, so the blast radius is the child's
+whole process tree by construction. Not fixable without abandoning env
+injection, which is the feature. Unchanged from the original note; it was
+already labelled a standard tradeoff rather than a defect.
+
+**9c. TUI leaves values in terminal scrollback** — `done`; the claim was false.
+`run_ui` uses `ScreenInteractive::Fullscreen()` (tui.cpp:284), and in the pinned
+FTXUI 7.0.3 `ScreenInteractive` is an alias for `App` (screen_interactive.hpp:10)
+whose `Fullscreen()` delegates to `FullscreenAlternateScreen()` and enables
+`DECMode::kAlternateScreen` (app.cpp:1452, 1465, 675). The TUI therefore draws
+only on the alternate buffer, which the terminal discards on exit — nothing it
+renders reaches primary-buffer scrollback. The genuine TUI ceiling is the one
+already documented at the top of tui.cpp: FTXUI's per-frame copies of revealed
+values are not zeroed.
 
 ## Priority order for fixes
 
 1. ~~`secretov passwd` (finding 3)~~ — done 2026-08-30.
 2. ~~Checksums in get-deps.sh + FTXUI commit pin (finding 8)~~ — done 2026-08-30.
-3. Encrypted swap / zram on the host (findings 2, 4) — machine config, not code.
+3. Encrypted swap / zram on the host (findings 2, 4, 9a) — machine config, not
+   code. This is now the only outstanding mitigation in the worklist.
