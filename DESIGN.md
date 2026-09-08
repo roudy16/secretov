@@ -54,8 +54,9 @@ One encrypted file (`~/.local/share/secretov/store`), envelope-encrypted:
 
 The passphrase is entered at daemon start. The daemon derives the wrapping
 key, unwraps the data key, then zeroes both passphrase and wrapping key; from
-then on it holds only the data key (mlock'd). No keyring dependency; works
-headless.
+then on it holds only the data key (mlock'd). The binary has no keyring
+dependency and works headless; the optional systemd service (`scripts/`)
+feeds the passphrase from the session keyring at login.
 
 File header (plaintext, before ciphertext): magic + format version byte (2),
 Argon2id salt + params, key-created-at timestamp, wrap nonce, wrapped data

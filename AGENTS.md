@@ -33,7 +33,8 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   framework), `tests/smoke_test.sh` (full daemon lifecycle + scopes in a
   scratch env).
 - `scripts/service` + `scripts/linux-systemd.sh` — run the daemon as a
-  systemd user unit; SECURITY.md is the security worklist.
+  systemd user unit started at login, passphrase from the session keyring
+  via `secret-tool`; SECURITY.md is the security worklist.
 
 ## Constraints
 

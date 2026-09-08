@@ -119,12 +119,16 @@ token) back to their paths, `scripts/service start`.
 ## Running as a service
 
 `scripts/service` manages the daemon as a local service (platform-agnostic
-dispatcher; Linux/systemd implemented, macOS/launchd not yet):
+dispatcher; Linux/systemd implemented, macOS/launchd not yet). The passphrase
+is kept in the session keyring (`secret-tool`, package `libsecret-tools`) so
+the daemon starts at login without a prompt; see SECURITY.md finding 10 for
+what that trades away.
 
 ```sh
-scripts/service install   # build + install binary to ~/.local/bin, register user unit
-scripts/service start     # prompts for passphrase (no auto-start at boot — it needs one)
+scripts/service install      # build + install binary to ~/.local/bin, register + enable user unit
+scripts/service start        # stores the passphrase in the keyring on first use, then starts
+scripts/service passphrase   # replace the keyring copy (after `secretov passwd`)
 scripts/service stop
 scripts/service status
-scripts/service update    # rebuild + reinstall, restart daemon if running
+scripts/service update       # rebuild + reinstall, restart daemon if running
 ```

@@ -18,12 +18,13 @@ secretov list >/dev/null && echo up
 If you get `daemon not running at /run/user/1000/secretov.sock ?`, start it:
 
 ```sh
-~/workspace/roudy16/secretov/scripts/service start   # prompts for the passphrase
+~/workspace/roudy16/secretov/scripts/service start
 ```
 
-**This is interactive and must be redone after every reboot.** The daemon
-deliberately does not auto-start — it needs a passphrase and a boot-time
-service has no tty. An agent cannot start it unattended; ask the human.
+The daemon starts at login and takes its passphrase from the session
+keyring, so this is only needed if it was stopped or failed. It is
+non-interactive once the keyring holds the passphrase; if it prompts, a
+human must answer.
 
 **Upgrading secretov itself:** the first daemon start after upgrading past
 the envelope-encryption change migrates an older store file in place. This is
@@ -172,7 +173,7 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 
 | Message | Cause | Fix |
 |---|---|---|
-| `daemon not running at ... ?` | Daemon down (always after a reboot) | `scripts/service start` — interactive, needs the human |
+| `daemon not running at ... ?` | Daemon down | `scripts/service start`; check `scripts/service status` if it fails |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |

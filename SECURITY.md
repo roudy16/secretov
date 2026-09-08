@@ -61,12 +61,11 @@ a re-encrypt of the payload — cheap, and no passphrase is retained by the
 daemon at any point (`rotate`/`passwd` both carry the current passphrase on
 the request and verify it by unwrapping the stored data key).
 
-### 4. Service-script passphrase handoff residue — `accepted`
+### 4. Service-script passphrase handoff residue — `superseded` (2026-09-08)
 
-`scripts/service start` passes the passphrase through a bash variable
-(unzeroable heap) and a 0600 tmpfs file that lives a few hundred ms. Both are
-same-UID-readable during the window (within ceiling #1). tmpfs pages can
-swap — folds into #2's encrypted-swap advice. Nothing touches disk.
+`scripts/service start` used to pass the passphrase through a bash variable
+and a short-lived 0600 tmpfs file. Replaced by the keyring unlock in finding
+10; the script no longer touches the passphrase itself.
 
 ### 5. Socket squatting — `accepted`
 
@@ -139,10 +138,26 @@ renders reaches primary-buffer scrollback. The genuine TUI ceiling is the one
 already documented at the top of tui.cpp: FTXUI's per-frame copies of revealed
 values are not zeroed.
 
+### 10. Passphrase in the session keyring — `accepted` (2026-09-08)
+
+To start at login without a tty, `scripts/service` stores the store
+passphrase in the Secret Service login collection (gnome-keyring) and the
+unit pipes `secret-tool lookup` into the daemon. Consequences: (a) while the
+session is up, any same-UID process can read the passphrase from the keyring,
+not just the token — within ceiling #1, and no worse than the token file
+already is; (b) at rest the passphrase is protected by the login password
+(the keyring file is encrypted with it), so an offline disk image is now
+bounded by the login password rather than the store passphrase alone. On a
+machine without full-disk encryption that is the real cost. Not using the
+service keeps the old model: the passphrase exists only in your head while
+the daemon is down. `secretov passwd` must be followed by
+`scripts/service passphrase` or the next login fails to unlock and gives up
+after the unit's start limit.
+
 ## Priority order for fixes
 
 1. ~~`secretov passwd` (finding 3)~~ — done 2026-08-30.
 2. ~~Checksums in get-deps.sh + FTXUI commit pin (finding 8)~~ — done 2026-08-30.
 3. ~~Envelope encryption (format v2)~~ — done 2026-09-08.
-4. Encrypted swap / zram on the host (findings 2, 4, 9a) — machine config, not
+4. Encrypted swap / zram on the host (findings 2, 9a) — machine config, not
    code. This is now the only outstanding mitigation in the worklist.
