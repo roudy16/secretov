@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/string.hpp>
 #include <nlohmann/json.hpp>
 
 #include "client.hpp"
@@ -40,10 +42,20 @@ void zero(std::string& s) {
 
 enum class Mode { Normal, Add, Edit, ConfirmDelete };
 
+// One visible line of the key tree: a folder ("dev/proj/") or a secret.
+struct Row {
+    std::string id;  // full key, or folder prefix ending in '/'
+    bool dir;
+    int depth;
+};
+
 int run_ui(DaemonClient& daemon) {
     using namespace ftxui;
 
-    std::vector<std::string> keys;
+    std::vector<std::string> keys;    // every key, sorted
+    std::vector<Row> rows;            // visible tree rows
+    std::vector<std::string> labels;  // what the menu draws, parallel to rows
+    std::set<std::string> collapsed;  // folder ids currently folded
     int selected = 0;
     std::optional<std::string> revealed;  // fetched value for the selected key
     std::string add_name;
@@ -60,7 +72,69 @@ int run_ui(DaemonClient& daemon) {
         }
     };
 
-    auto refresh = [&](const std::string& select_key) {
+    auto row_at = [&](int i) -> const Row& { return rows[static_cast<std::size_t>(i)]; };
+
+    // Full key of the selected row; nullopt on a folder or an empty list.
+    auto current_key = [&]() -> std::optional<std::string> {
+        if (rows.empty() || row_at(selected).dir) return std::nullopt;
+        return row_at(selected).id;
+    };
+
+    // current_key(), with a status message naming the blocked action.
+    auto need_key = [&](const char* action) -> std::optional<std::string> {
+        std::optional<std::string> key = current_key();
+        if (!key) status = std::string(rows.empty() ? "no secret to " : "select a secret to ") + action;
+        return key;
+    };
+
+    // Rebuild the visible rows from `keys` and `collapsed`. Keys are sorted,
+    // so a folder's members are contiguous and its row is emitted the first
+    // time the prefix appears. `select_id` re-selects a row by id afterwards.
+    auto rebuild_rows = [&](const std::string& select_id) {
+        rows.clear();
+        labels.clear();
+        std::vector<std::string> branch;  // folder ids open along the current key
+        for (const std::string& key : keys) {
+            std::vector<std::string> folders;  // "a/", "a/b/", ... for this key
+            for (std::size_t slash = key.find('/'); slash != std::string::npos;
+                 slash = key.find('/', slash + 1)) {
+                folders.push_back(key.substr(0, slash + 1));
+            }
+            std::size_t shared = 0;
+            while (shared < folders.size() && shared < branch.size() &&
+                   branch[shared] == folders[shared]) {
+                ++shared;
+            }
+            branch.resize(shared);
+            bool hidden = false;
+            for (const std::string& f : branch) hidden = hidden || collapsed.count(f) > 0;
+            for (std::size_t d = shared; d < folders.size(); ++d) {
+                branch.push_back(folders[d]);
+                bool folded = collapsed.count(folders[d]) > 0;
+                if (!hidden) {
+                    std::size_t name_start = d == 0 ? 0 : folders[d - 1].size();
+                    rows.push_back({folders[d], true, static_cast<int>(d)});
+                    labels.push_back(std::string(2 * d, ' ') + (folded ? "▸ " : "▾ ") +
+                                     folders[d].substr(name_start));
+                }
+                hidden = hidden || folded;
+            }
+            if (!hidden) {
+                std::size_t name_start = folders.empty() ? 0 : folders.back().size();
+                rows.push_back({key, false, static_cast<int>(folders.size())});
+                labels.push_back(std::string(2 * folders.size() + 2, ' ') + key.substr(name_start));
+            }
+        }
+        if (!select_id.empty()) {
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                if (rows[i].id == select_id) selected = static_cast<int>(i);
+            }
+        }
+        if (selected >= static_cast<int>(rows.size())) selected = static_cast<int>(rows.size()) - 1;
+        if (selected < 0) selected = 0;
+    };
+
+    auto refresh = [&](const std::string& select_id) {
         remask();
         try {
             json resp = daemon.request("list");
@@ -70,25 +144,45 @@ int run_ui(DaemonClient& daemon) {
             return;
         }
         std::sort(keys.begin(), keys.end());
-        if (!select_key.empty()) {
-            auto it = std::find(keys.begin(), keys.end(), select_key);
-            if (it != keys.end()) selected = static_cast<int>(it - keys.begin());
+        rebuild_rows(select_id);
+    };
+
+    // Fold state of the selected folder: nullopt toggles, true unfolds, false folds.
+    auto fold = [&](std::optional<bool> open) {
+        if (rows.empty() || !row_at(selected).dir) return;
+        std::string id = row_at(selected).id;  // copy: rebuild_rows invalidates rows
+        bool folded = collapsed.count(id) > 0;
+        bool want_folded = open ? !*open : !folded;
+        if (want_folded == folded) return;
+        if (want_folded) {
+            collapsed.insert(id);
+        } else {
+            collapsed.erase(id);
         }
-        if (selected >= static_cast<int>(keys.size())) selected = static_cast<int>(keys.size()) - 1;
-        if (selected < 0) selected = 0;
+        rebuild_rows(id);
+    };
+
+    // Move the selection to the enclosing folder row, if any.
+    auto go_parent = [&] {
+        if (rows.empty()) return;
+        int depth = row_at(selected).depth;
+        for (int i = selected - 1; i >= 0; --i) {
+            if (row_at(i).dir && row_at(i).depth < depth) {
+                selected = i;
+                remask();
+                return;
+            }
+        }
     };
 
     auto reveal = [&] {
-        if (keys.empty()) {
-            status = "no secret to reveal";
-            return;
-        }
+        std::optional<std::string> key = need_key("reveal");
+        if (!key) return;
         try {
-            json resp = daemon.request("get", keys[static_cast<std::size_t>(selected)],
-                                       std::nullopt);
+            json resp = daemon.request("get", *key);
             remask();
             revealed = resp.value("value", std::string{});
-            status = "revealed " + keys[static_cast<std::size_t>(selected)];
+            status = "revealed " + *key;
         } catch (const std::exception& e) {
             status = e.what();
         }
@@ -107,16 +201,14 @@ int run_ui(DaemonClient& daemon) {
     // selection and the old value is never fetched into the input (a blank
     // field is one fewer plaintext copy, and 'r' already reveals on demand).
     auto start_edit = [&] {
-        if (keys.empty()) {
-            status = "no secret to edit";
-            return;
-        }
+        std::optional<std::string> key = need_key("edit");
+        if (!key) return;
         remask();
         zero(add_value);
         mode = Mode::Edit;
         active_tab = 1;
         form_field = 1;
-        status = "editing " + keys[static_cast<std::size_t>(selected)];
+        status = "editing " + *key;
     };
 
     auto cancel_form = [&] {
@@ -152,7 +244,7 @@ int run_ui(DaemonClient& daemon) {
             status = "value required";
             return;
         }
-        std::string key = keys[static_cast<std::size_t>(selected)];
+        std::string key = current_key().value_or("");
         try {
             daemon.request("set", key, add_value);
             status = "updated " + key;
@@ -167,7 +259,7 @@ int run_ui(DaemonClient& daemon) {
     };
 
     auto do_delete = [&] {
-        std::string key = keys[static_cast<std::size_t>(selected)];
+        std::string key = current_key().value_or("");
         try {
             daemon.request("delete", key, std::nullopt);
             status = "deleted " + key;
@@ -182,7 +274,7 @@ int run_ui(DaemonClient& daemon) {
 
     MenuOption menu_opt = MenuOption::Vertical();
     menu_opt.on_change = remask;
-    Component menu = Menu(&keys, &selected, menu_opt);
+    Component menu = Menu(&labels, &selected, menu_opt);
 
     Component name_input = Input(&add_name, "name");
     InputOption value_opt;
@@ -192,20 +284,40 @@ int run_ui(DaemonClient& daemon) {
 
     Component tab = Container::Tab({menu, form}, &active_tab);
 
+    ScreenInteractive screen = ScreenInteractive::Fullscreen();
+
     auto renderer = Renderer(tab, [&] {
+        // Wide enough for the longest visible label, capped so the detail
+        // pane keeps room for a value.
+        int list_width = 30;
+        for (const std::string& label : labels) {
+            list_width = std::max(list_width, string_width(label) + 6);
+        }
+        list_width = std::min(list_width, std::max(30, screen.dimx() * 3 / 5));
         Element list_pane = window(text(" secrets "),
-                                   keys.empty()
+                                   rows.empty()
                                        ? (text("(empty)") | dim | center)
                                        : (menu->Render() | vscroll_indicator | frame)) |
-                            size(WIDTH, EQUAL, 30);
+                            size(WIDTH, EQUAL, list_width);
 
         Element detail_body;
-        if (keys.empty()) {
+        if (rows.empty()) {
             detail_body = text("press 'a' to add a secret") | dim | center;
+        } else if (row_at(selected).dir) {
+            const std::string& folder = row_at(selected).id;
+            std::size_t count = 0;
+            for (const std::string& key : keys) {
+                if (key.compare(0, folder.size(), folder) == 0) ++count;
+            }
+            detail_body = vbox({
+                hbox({text("folder: "), text(folder) | bold}),
+                separator(),
+                text(std::to_string(count) + " secret(s)   h/l to fold/unfold") | dim,
+            });
         } else {
             Element value_line = revealed ? text(*revealed) : text("••••••••");
             detail_body = vbox({
-                hbox({text("name:  "), text(keys[static_cast<std::size_t>(selected)]) | bold}),
+                hbox({text("name:  "), text(row_at(selected).id) | bold}),
                 separator(),
                 hbox({text("value: "), value_line}),
                 text(revealed ? "" : "(press 'r' to reveal)") | dim,
@@ -213,8 +325,8 @@ int run_ui(DaemonClient& daemon) {
         }
         Element detail_pane = window(text(" detail "), detail_body) | flex;
 
-        Element hints =
-            text(" a add   e edit   d delete   r reveal   h hide   q quit ") | dim | center;
+        Element hints = text(" a add   e edit   d delete   r reveal/hide   j/k move   h/l fold   q quit ") |
+                        dim | center;
         Element status_bar =
             hbox({
                 text(" " + daemon.socket_path() + " "),
@@ -245,8 +357,7 @@ int run_ui(DaemonClient& daemon) {
             Element overlay =
                 window(text(" edit secret "),
                        vbox({
-                           hbox({text("name:  "),
-                                 text(keys[static_cast<std::size_t>(selected)]) | bold}),
+                           hbox({text("name:  "), text(current_key().value_or("")) | bold}),
                            hbox({text("value: "), value_input->Render()}),
                            separator(),
                            text("Enter save   Esc cancel") | dim,
@@ -254,7 +365,7 @@ int run_ui(DaemonClient& daemon) {
                 size(WIDTH, GREATER_THAN, 44) | clear_under | center;
             root = dbox({root, overlay});
         } else if (mode == Mode::ConfirmDelete) {
-            std::string msg = "Delete '" + keys[static_cast<std::size_t>(selected)] + "'?";
+            std::string msg = "Delete '" + current_key().value_or("") + "'?";
             Element overlay =
                 window(text(" confirm "), vbox({text(msg), separator(), text("y / n") | dim})) |
                 clear_under | center;
@@ -262,8 +373,6 @@ int run_ui(DaemonClient& daemon) {
         }
         return root;
     });
-
-    ScreenInteractive screen = ScreenInteractive::Fullscreen();
 
     Component app = CatchEvent(renderer, [&](Event event) -> bool {
         if (mode == Mode::Normal) {
@@ -280,23 +389,41 @@ int run_ui(DaemonClient& daemon) {
                 return true;
             }
             if (event == Event::Character('r')) {
-                reveal();
-                return true;
-            }
-            if (event == Event::Character('h')) {
-                remask();
-                status = "hidden";
-                return true;
-            }
-            if (event == Event::Character('d')) {
-                if (keys.empty()) {
-                    status = "no secret to delete";
+                if (revealed) {
+                    remask();
+                    status = "hidden";
                 } else {
-                    mode = Mode::ConfirmDelete;
+                    reveal();
                 }
                 return true;
             }
-            return false;  // arrows / navigation fall through to the menu
+            if (event == Event::Character('d')) {
+                if (need_key("delete")) mode = Mode::ConfirmDelete;
+                return true;
+            }
+            if (event == Event::Return || event == Event::Character(' ')) {
+                if (current_key()) {
+                    reveal();
+                } else {
+                    fold(std::nullopt);
+                }
+                return true;
+            }
+            if (event == Event::ArrowLeft || event == Event::Character('h')) {
+                bool open_folder = !rows.empty() && row_at(selected).dir &&
+                                   collapsed.count(row_at(selected).id) == 0;
+                if (open_folder) {
+                    fold(false);
+                } else {
+                    go_parent();
+                }
+                return true;
+            }
+            if (event == Event::ArrowRight || event == Event::Character('l')) {
+                fold(true);
+                return true;
+            }
+            return false;  // up/down and j/k fall through to the menu
         }
         if (mode == Mode::Add || mode == Mode::Edit) {
             if (event == Event::Escape) {
