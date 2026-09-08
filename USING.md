@@ -25,6 +25,11 @@ If you get `daemon not running at /run/user/1000/secretov.sock ?`, start it:
 deliberately does not auto-start — it needs a passphrase and a boot-time
 service has no tty. An agent cannot start it unattended; ask the human.
 
+**Upgrading secretov itself:** the first daemon start after upgrading past
+the envelope-encryption change migrates an older store file in place. This is
+one-way — back up `~/.local/share/secretov/store` first if you might need to
+roll the binary back (see Backup and recovery in README.md).
+
 ## Onboard a new project
 
 From the project root, with its `.env` present. Steps 3 and 4 are easy to
@@ -93,6 +98,8 @@ secretov list -p myproj -e dev          # keys in one scope
 printf 'new-value' | secretov set DB_URL -e dev   # replace one secret
 secretov get dev/myproj/DB_URL          # print one value (raw full key)
 secretov tui                            # browse/edit interactively
+secretov rotate                         # new encryption key (prompts for current passphrase)
+secretov passwd                         # change the passphrase (prompts for current + new)
 ```
 
 Values are **read from stdin only** — there is no `set KEY VALUE` form, because

@@ -38,7 +38,7 @@ void zero(std::string& s) {
     s.clear();
 }
 
-enum class Mode { Normal, Add, Edit, ConfirmDelete, ConfirmRotate };
+enum class Mode { Normal, Add, Edit, ConfirmDelete };
 
 int run_ui(DaemonClient& daemon) {
     using namespace ftxui;
@@ -178,16 +178,6 @@ int run_ui(DaemonClient& daemon) {
         mode = Mode::Normal;
     };
 
-    auto do_rotate = [&] {
-        try {
-            daemon.request("rotate");
-            status = "rotated encryption key";
-        } catch (const std::exception& e) {
-            status = e.what();
-        }
-        mode = Mode::Normal;
-    };
-
     refresh("");
 
     MenuOption menu_opt = MenuOption::Vertical();
@@ -224,8 +214,7 @@ int run_ui(DaemonClient& daemon) {
         Element detail_pane = window(text(" detail "), detail_body) | flex;
 
         Element hints =
-            text(" a add   e edit   d delete   R rotate   r reveal   h hide   q quit ") | dim |
-            center;
+            text(" a add   e edit   d delete   r reveal   h hide   q quit ") | dim | center;
         Element status_bar =
             hbox({
                 text(" " + daemon.socket_path() + " "),
@@ -264,10 +253,8 @@ int run_ui(DaemonClient& daemon) {
                        })) |
                 size(WIDTH, GREATER_THAN, 44) | clear_under | center;
             root = dbox({root, overlay});
-        } else if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmRotate) {
-            std::string msg = mode == Mode::ConfirmDelete
-                                  ? "Delete '" + keys[static_cast<std::size_t>(selected)] + "'?"
-                                  : "Rotate the encryption key?";
+        } else if (mode == Mode::ConfirmDelete) {
+            std::string msg = "Delete '" + keys[static_cast<std::size_t>(selected)] + "'?";
             Element overlay =
                 window(text(" confirm "), vbox({text(msg), separator(), text("y / n") | dim})) |
                 clear_under | center;
@@ -301,10 +288,6 @@ int run_ui(DaemonClient& daemon) {
                 status = "hidden";
                 return true;
             }
-            if (event == Event::Character('R')) {
-                mode = Mode::ConfirmRotate;
-                return true;
-            }
             if (event == Event::Character('d')) {
                 if (keys.empty()) {
                     status = "no secret to delete";
@@ -330,13 +313,9 @@ int run_ui(DaemonClient& daemon) {
             }
             return false;  // typing falls through to the focused input
         }
-        // Confirm modes: consume every key so nothing leaks to the menu.
+        // Confirm-delete mode: consume every key so nothing leaks to the menu.
         if (event == Event::Character('y') || event == Event::Character('Y')) {
-            if (mode == Mode::ConfirmDelete) {
-                do_delete();
-            } else {
-                do_rotate();
-            }
+            do_delete();
         } else {
             mode = Mode::Normal;
             status = "cancelled";

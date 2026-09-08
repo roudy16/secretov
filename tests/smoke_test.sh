@@ -55,8 +55,9 @@ printf '%s' "s3cr3t-value" | "$BIN" set VIA_STDIN
 "$BIN" delete FOO
 if "$BIN" get FOO >/dev/null 2>&1; then fail "get after delete should fail"; fi
 
-# 4. rotate; get still works
-"$BIN" rotate
+# 4. rotate; get still works. Wrong passphrase is rejected.
+if printf 'wrong\n' | "$BIN" rotate >/dev/null 2>&1; then fail "rotate with wrong passphrase should fail"; fi
+printf '%s\n' "$PASS" | "$BIN" rotate
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after rotate"
 
 # 5. exec injects secret into child env
@@ -93,6 +94,8 @@ for _ in $(seq 1 100); do
 done
 [ -S "$SOCK" ] || fail "socket did not reappear after passwd restart"
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after restart with new passphrase"
+printf '%s\n' "$NEWPASS" | "$BIN" rotate
+[ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after rotate with new passphrase"
 
 # 5d. scopes: import a dotenv into dev/demo (manifest created), exec injects via
 # the manifest, collisions refused without --overwrite, list filters, registry

@@ -19,6 +19,7 @@ void print_usage(std::ostream& out) {
         << "  list [-p NAME] [-e ENV]    list secret names (optionally one env/project scope)\n"
         << "  delete KEY                 remove a secret\n"
         << "  rotate                     re-encrypt the store with a fresh key\n"
+        << "                             (prompts for the current passphrase)\n"
         << "  passwd                     change the store passphrase\n"
         << "  tui                        interactive terminal UI\n"
         << "  exec [-p NAME] [-e ENV] [--dry-run] [--secret KEY[=ENVVAR]]... -- PROG [ARGS...]\n"

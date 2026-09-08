@@ -309,7 +309,9 @@ int cmd_delete(const std::string& key) {
 int cmd_rotate() {
     Paths paths = resolve_paths();
     try {
-        DaemonClient(paths).request("rotate");
+        std::string pass = read_passphrase("Current passphrase: ");
+        DaemonClient(paths).request_raw(nlohmann::json{{"op", "rotate"}, {"old", pass}});
+        std::cout << "rotated encryption key\n";
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;

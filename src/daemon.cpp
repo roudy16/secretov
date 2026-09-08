@@ -67,13 +67,13 @@ std::string dispatch(Store& store, const Request& req, std::uint64_t now) {
         return ok_values(store.get_prefix(req.key));
     }
     if (req.op == "rotate") {
-        store.rotate(now);
+        if (req.old_pass.empty()) return error_response("missing passphrase");
+        store.rotate(req.old_pass, now);
         return ok_response();
     }
     if (req.op == "passwd") {
-        if (req.new_pass.empty()) return error_response("missing new passphrase");
-        if (!store.passphrase_matches(req.old_pass)) return error_response("wrong passphrase");
-        store.change_passphrase(req.new_pass, now);
+        if (req.old_pass.empty() || req.new_pass.empty()) return error_response("missing passphrase");
+        store.change_passphrase(req.old_pass, req.new_pass);
         return ok_response();
     }
     return error_response("unknown op: " + req.op);
@@ -134,7 +134,7 @@ int run_daemon() {
     std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
     Store store = [&] {
         try {
-            return Store::open(paths.store, passphrase, now);
+            return Store::open(paths.store, passphrase);
         } catch (const std::exception& e) {
             std::cerr << "secretov: cannot open store: " << e.what() << "\n"
                       << "  (run 'secretov init' first, or check your passphrase)\n";
@@ -145,7 +145,8 @@ int run_daemon() {
     const std::uint64_t rotate_after = static_cast<std::uint64_t>(kRotateAfterDays) * 24 * 3600;
     if (now > store.key_created_at() && now - store.key_created_at() > rotate_after) {
         try {
-            store.rotate(now);
+            // The passphrase is still in hand at this point in startup.
+            store.rotate(passphrase, now);
             std::cerr << "secretov: key older than " << kRotateAfterDays
                       << " days; rotated on unlock\n";
         } catch (const std::exception& e) {
@@ -154,7 +155,8 @@ int run_daemon() {
         }
     }
 
-    // Store retains its own guarded copy; this local is no longer needed.
+    // The store retains only the data key from here on; the passphrase and
+    // the wrapping key derived from it are never held past unlock.
     sodium_memzero(passphrase.data(), passphrase.size());
     passphrase.clear();
 

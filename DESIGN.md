@@ -11,6 +11,11 @@ the same user, or root. Accepted ceiling; extend later if needed. Also accepted:
 the plaintext header's `key_created_at` is not authenticated, so tampering with
 it can only skew rotation scheduling (never expose or corrupt secrets).
 
+After unlock the daemon holds only the data key (see Storage); the passphrase
+and the key derived from it are zeroed once the data key is unwrapped. A
+reader of daemon memory gets the data key and the decrypted secrets, not the
+passphrase.
+
 ## Transport
 
 Unix domain socket at `$XDG_RUNTIME_DIR/secretov.sock`, mode 0600, peer UID
@@ -29,46 +34,64 @@ wire (token stays a string field).
 
 Newline-delimited JSON over the socket.
 
-Request:  `{"token": "...", "op": "get|set|list|delete|rotate|passwd", "key": "...", "value": "..."}`
+Request:  `{"token": "...", "op": "get|set|list|getprefix|delete|rotate|passwd", "key": "...", "value": "..."}`
 Response: `{"ok": true, "value"|"keys": ...}` or `{"ok": false, "error": "..."}`
 
-Verbs kept minimal. `rotate` and `passwd` are token-guarded admin ops;
-`passwd` additionally carries `"old"` and `"new"` fields, and the daemon
-verifies `"old"` against its retained passphrase (constant-time) before
-re-keying — the token alone cannot change the passphrase.
+Verbs kept minimal. `rotate` and `passwd` are token-guarded admin ops. Both
+carry `"old"` (the current passphrase); `passwd` also carries `"new"`. The
+daemon does not retain the passphrase, so it verifies `"old"` by deriving the
+wrapping key from it and unwrapping the stored data key — a wrong passphrase
+fails the MAC. The token alone can change neither the passphrase nor the data
+key.
 
 ## Storage
 
-One encrypted file (`~/.local/share/secretov/store`): libsodium secretbox
-(XSalsa20-Poly1305) over a JSON key→value map.
+One encrypted file (`~/.local/share/secretov/store`), envelope-encrypted:
 
-Master key: Argon2id-derived from a passphrase entered at daemon
-start/unlock. No keyring dependency; works headless.
+- A random 256-bit **data key** encrypts the payload: libsodium secretbox
+  (XSalsa20-Poly1305) over a JSON key→value map.
+- A **wrapping key**, Argon2id-derived from the passphrase, encrypts only the
+  data key (secretbox again, its own nonce). It never touches the payload.
 
-File header (plaintext, before ciphertext): magic + format version byte,
-Argon2id salt + params, key-created-at timestamp, nonce. Version byte exists
-so future format changes don't need migration heroics.
+The passphrase is entered at daemon start. The daemon derives the wrapping
+key, unwraps the data key, then zeroes both passphrase and wrapping key; from
+then on it holds only the data key (mlock'd). No keyring dependency; works
+headless.
 
-## Key rotation
+File header (plaintext, before ciphertext): magic + format version byte (2),
+Argon2id salt + params, key-created-at timestamp, wrap nonce, wrapped data
+key, payload nonce. Version 1 stores (no envelope: the derived key encrypted
+the payload directly) are upgraded in place on first open — decrypt with the
+derived key, mint a data key, persist as version 2. One-way; keep a backup if
+you might need to roll the binary back.
 
-Both triggers:
+## Key rotation and passphrase change
+
+Two distinct operations, as in envelope-based managers:
+
+- `rotate` — new data key. Decrypt the payload, re-encrypt under a fresh data
+  key, wrap it. Bounds a data-key compromise in time: a key read out of the
+  daemon's memory at time T cannot open ciphertext written after the rotation.
+  It does nothing for secrets already in the store (a reader of daemon memory
+  has those too) and nothing against a leaked passphrase.
+- `passwd` — new wrapping key. Fresh salt, derive from the new passphrase,
+  re-wrap the existing data key. The payload is untouched, so it is cheap.
+  This is the response to a leaked passphrase.
+
+Both are daemon ops that carry the current passphrase (see Protocol), because
+the daemon no longer retains it after unlock. Triggers:
 - Auto: on unlock, if key-created-at is older than N days (default 30),
-  re-encrypt with fresh salt + nonce transparently.
-- Manual: `secretov rotate` for on-demand rotation (e.g. suspected exposure).
+  rotate transparently — the passphrase is in hand at that moment.
+- Manual: `secretov rotate` and `secretov passwd`, each prompting for the
+  current passphrase.
 
-Rotation = decrypt whole file, re-encrypt with new salt/nonce. No envelope
-encryption; the store is one small file.
-
-Rotation never changes the passphrase. For a leaked passphrase the response
-is `secretov passwd` (daemon op, requires the current passphrase): fresh salt,
-key re-derived from the new passphrase, store re-encrypted, retained
-passphrase replaced. Old ciphertext copies (backups) remain decryptable with
-the old passphrase — copy hygiene is on the user.
+Old ciphertext copies (backups) remain openable with the passphrase and data
+key they were written under — copy hygiene is on the user.
 
 ## CLI
 
 `secretov` binary: `init`, `daemon`, `get`, `set`, `list`, `delete`,
-`rotate`, `passwd`, `tui` (interactive terminal UI over the daemon socket),
+`rotate` and `passwd` (both prompt for the current passphrase), `tui` (interactive terminal UI over the daemon socket),
 `exec --secret NAME ... -- cmd` (fetch secrets, inject into child
 env, exec). `set KEY` creates or replaces — there is no separate update op;
 it reads the value from stdin only, never an argv argument, which would leak

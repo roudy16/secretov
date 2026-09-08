@@ -13,7 +13,7 @@ struct Request {
     std::string op;
     std::string key;
     std::string value;
-    std::string old_pass;  // "passwd" op only
+    std::string old_pass;  // "rotate" and "passwd" ops (current passphrase)
     std::string new_pass;  // "passwd" op only
 };
 

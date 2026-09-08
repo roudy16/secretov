@@ -71,7 +71,7 @@ void test_roundtrip_and_persistence() {
         assert(s.get_prefix("nope/").empty());
     }
     {
-        Store s = Store::open(path, kPass, kNow1);
+        Store s = Store::open(path, kPass);
         assert(s.get("db").value() == "postgres://x");
         assert(!s.get("api").has_value());
         assert(s.key_created_at() == kNow1);
@@ -83,7 +83,7 @@ void test_roundtrip_and_persistence() {
 void test_wrong_passphrase() {
     std::string path = store_path("s3");
     Store::create(path, kPass, kNow1);
-    assert(throws_with([&] { Store::open(path, "nope", kNow1); },
+    assert(throws_with([&] { Store::open(path, "nope"); },
                        "wrong passphrase or corrupted store"));
 }
 
@@ -94,7 +94,7 @@ void test_corrupt_ciphertext() {
     std::vector<unsigned char> raw = read_raw(path);
     raw.back() ^= 0x01;  // flip a byte inside the ciphertext
     write_raw(path, raw);
-    assert(throws_with([&] { Store::open(path, kPass, kNow1); },
+    assert(throws_with([&] { Store::open(path, kPass); },
                        "wrong passphrase or corrupted store"));
 }
 
@@ -102,20 +102,22 @@ void test_corrupt_ciphertext() {
 void test_garbage_file() {
     std::string path = store_path("s5");
     write_raw(path, {'n', 'o', 'p', 'e', 0, 1, 2, 3});
-    assert(throws_with([&] { Store::open(path, kPass, kNow1); }, "not a secretov store"));
+    assert(throws_with([&] { Store::open(path, kPass); }, "not a secretov store"));
 }
 
-// 6. bump version byte to 2 -> "unsupported version"-class error.
+// 6. bump version byte to 3 -> "unsupported version"-class error (2 is valid).
 void test_bad_version() {
     std::string path = store_path("s6");
     Store::create(path, kPass, kNow1);
     std::vector<unsigned char> raw = read_raw(path);
-    raw[4] = 2;  // format version byte
+    raw[4] = 3;  // format version byte
     write_raw(path, raw);
-    assert(throws_with([&] { Store::open(path, kPass, kNow1); }, "unsupported version"));
+    assert(throws_with([&] { Store::open(path, kPass); }, "unsupported version"));
 }
 
-// 7. rotate: key_created_at updated; salt+nonce changed on disk; data survives.
+// 7. rotate: key_created_at updated; salt UNCHANGED, wrap nonce + wrapped
+// blob + payload nonce all change; data survives. Wrong passphrase leaves
+// the store untouched.
 void test_rotate() {
     std::string path = store_path("s7");
     std::vector<unsigned char> before;
@@ -125,23 +127,41 @@ void test_rotate() {
         before = read_raw(path);
         assert(s.key_created_at() == kNow1);
 
-        s.rotate(kNow2);
+        assert(throws_with([&] { s.rotate("wrong", kNow2); }, "wrong passphrase"));
+        assert(s.get("secret").value() == "value");
+        assert(s.key_created_at() == kNow1);
+
+        s.rotate(kPass, kNow2);
         assert(s.key_created_at() == kNow2);
         assert(s.get("secret").value() == "value");
     }
     std::vector<unsigned char> after = read_raw(path);
 
-    // Salt occupies bytes [5, 5+SALTBYTES); nonce sits after the three u64 fields.
+    // Header layout: magic(4) version(1) salt opslimit(8) memlimit(8)
+    // key_created_at(8) wrap_nonce wrapped_key payload_nonce ...
     const std::size_t salt_off = 5;
-    const std::size_t nonce_off = salt_off + crypto_pwhash_SALTBYTES + 8 + 8 + 8;
-    bool salt_changed = std::memcmp(before.data() + salt_off, after.data() + salt_off,
-                                    crypto_pwhash_SALTBYTES) != 0;
-    bool nonce_changed = std::memcmp(before.data() + nonce_off, after.data() + nonce_off,
-                                     crypto_secretbox_NONCEBYTES) != 0;
-    assert(salt_changed);
-    assert(nonce_changed);
+    const std::size_t wrap_nonce_off = salt_off + crypto_pwhash_SALTBYTES + 8 + 8 + 8;
+    const std::size_t wrapped_key_off = wrap_nonce_off + crypto_secretbox_NONCEBYTES;
+    const std::size_t wrapped_key_len = crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES;
+    const std::size_t payload_nonce_off = wrapped_key_off + wrapped_key_len;
 
-    Store s = Store::open(path, kPass, kNow2);
+    bool salt_unchanged = std::memcmp(before.data() + salt_off, after.data() + salt_off,
+                                      crypto_pwhash_SALTBYTES) == 0;
+    bool wrap_nonce_changed = std::memcmp(before.data() + wrap_nonce_off,
+                                          after.data() + wrap_nonce_off,
+                                          crypto_secretbox_NONCEBYTES) != 0;
+    bool wrapped_key_changed = std::memcmp(before.data() + wrapped_key_off,
+                                           after.data() + wrapped_key_off,
+                                           wrapped_key_len) != 0;
+    bool payload_nonce_changed = std::memcmp(before.data() + payload_nonce_off,
+                                             after.data() + payload_nonce_off,
+                                             crypto_secretbox_NONCEBYTES) != 0;
+    assert(salt_unchanged);
+    assert(wrap_nonce_changed);
+    assert(wrapped_key_changed);
+    assert(payload_nonce_changed);
+
+    Store s = Store::open(path, kPass);
     assert(s.get("secret").value() == "value");
     assert(s.key_created_at() == kNow2);
 }
@@ -155,31 +175,34 @@ void test_implausible_kdf_params() {
     const std::size_t memlimit_off = 5 + crypto_pwhash_SALTBYTES + 8;
     for (std::size_t i = 0; i < 8; ++i) raw[memlimit_off + i] = 0xFF;
     write_raw(path, raw);
-    assert(throws_with([&] { Store::open(path, kPass, kNow1); },
+    assert(throws_with([&] { Store::open(path, kPass); },
                        "implausible KDF parameters"));
 }
 
 // 10. change_passphrase: reopen works only with the new passphrase; data
-// survives; retained-passphrase comparison follows the change.
+// survives; key_created_at unchanged; wrong old passphrase / empty new
+// passphrase both throw and leave the store untouched.
 void test_change_passphrase() {
     std::string path = store_path("s10");
     {
         Store s = Store::create(path, kPass, kNow1);
         s.set("secret", "value");
-        assert(s.passphrase_matches(kPass));
 
-        s.change_passphrase("new pass", kNow2);
-        assert(s.key_created_at() == kNow2);
-        assert(s.passphrase_matches("new pass"));
-        assert(!s.passphrase_matches(kPass));
+        assert(throws_with([&] { s.change_passphrase("wrong", "new pass"); }, "wrong passphrase"));
+        assert(throws_with([&] { s.change_passphrase(kPass, ""); }, "empty passphrase"));
         assert(s.get("secret").value() == "value");
-        s.set("post", "change");  // persists under the new key
+
+        s.change_passphrase(kPass, "new pass");
+        assert(s.key_created_at() == kNow1);
+        assert(s.get("secret").value() == "value");
+        s.set("post", "change");  // persists under the new wrapping key
     }
-    assert(throws_with([&] { Store::open(path, kPass, kNow2); },
+    assert(throws_with([&] { Store::open(path, kPass); },
                        "wrong passphrase or corrupted store"));
-    Store s = Store::open(path, "new pass", kNow2);
+    Store s = Store::open(path, "new pass");
     assert(s.get("secret").value() == "value");
     assert(s.get("post").value() == "change");
+    assert(s.key_created_at() == kNow1);
 }
 
 // 8. create on existing path throws.
@@ -187,6 +210,48 @@ void test_create_existing() {
     std::string path = store_path("s8");
     Store::create(path, kPass, kNow1);
     assert(throws_with([&] { Store::create(path, kPass, kNow1); }, "already exists"));
+}
+
+// 11. version-1 fixture migrates in place on open: data readable, file grows
+// and its version byte becomes 2, and a second open still works. Wrong
+// passphrase against the v1 fixture still throws.
+const unsigned char kV1Fixture[] = {
+    0x53, 0x43, 0x54, 0x56, 0x01, 0x34, 0xf6, 0xca, 0xb5, 0xd8, 0xf0, 0x95,
+    0xa2, 0x9b, 0xa6, 0xd2, 0xd8, 0x43, 0xf0, 0x87, 0x45, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xf1, 0x53, 0x65, 0x00, 0x00, 0x00, 0x00, 0x24, 0xc3, 0xf7,
+    0x1e, 0x96, 0x05, 0xb1, 0x78, 0x76, 0xbc, 0x7e, 0x78, 0x7b, 0x5b, 0x47,
+    0x7e, 0x94, 0xdd, 0x07, 0xa6, 0x5d, 0x06, 0x0b, 0x39, 0x0b, 0xc4, 0x0e,
+    0xf6, 0x62, 0x62, 0x92, 0x38, 0x62, 0xff, 0x52, 0x7f, 0x69, 0xa2, 0x92,
+    0x2c, 0x5e, 0x62, 0x61, 0x92, 0xed, 0xc1, 0x89, 0x9e, 0x00, 0x18, 0xd0,
+    0xc7, 0x0b, 0x0d, 0x9a, 0xa6, 0xa5, 0xf1, 0x07, 0xfa, 0x31, 0x45, 0x52,
+    0x36, 0x5d, 0x0b, 0x5a, 0xd0, 0xbd, 0xc9, 0x3a, 0x79, 0x9b, 0x1e, 0xf8,
+    0x91,
+};
+constexpr std::size_t kV1FixtureLen = sizeof(kV1Fixture);
+
+void test_v1_migration() {
+    std::string path = store_path("s11");
+    write_raw(path, std::vector<unsigned char>(kV1Fixture, kV1Fixture + kV1FixtureLen));
+
+    {
+        Store s = Store::open(path, kPass);
+        assert(s.get("db").value() == "postgres://x");
+        assert(s.get("api").value() == "sk-123");
+    }
+
+    std::vector<unsigned char> migrated = read_raw(path);
+    assert(migrated.size() > kV1FixtureLen);
+    assert(migrated[4] == 2);  // format version byte
+
+    Store s2 = Store::open(path, kPass);
+    assert(s2.get("db").value() == "postgres://x");
+    assert(s2.get("api").value() == "sk-123");
+
+    std::string wrong_path = store_path("s11b");
+    write_raw(wrong_path, std::vector<unsigned char>(kV1Fixture, kV1Fixture + kV1FixtureLen));
+    assert(throws_with([&] { Store::open(wrong_path, "wrong"); },
+                       "wrong passphrase or corrupted store"));
 }
 
 }  // namespace
@@ -209,6 +274,7 @@ int main() {
     test_change_passphrase();
     test_create_existing();
     test_implausible_kdf_params();
+    test_v1_migration();
 
     std::printf("OK\n");
     return 0;

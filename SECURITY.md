@@ -8,13 +8,17 @@ values: `open`, `accepted` (documented ceiling, no fix planned), `done`.
 
 ## What holds up
 
-Matches DESIGN.md and is implemented carefully: secretbox (XSalsa20-Poly1305)
-with Argon2id, fresh salt+nonce per persist, KDF params bounds-checked before
-use (store.cpp), atomic fsync+rename writes, 0600 files/socket with the umask
+Matches DESIGN.md and is implemented carefully: envelope encryption
+(secretbox/XSalsa20-Poly1305 data key wrapped by an Argon2id-derived wrapping
+key), fresh payload nonce per persist, KDF params bounds-checked before use
+(store.cpp), atomic fsync+rename writes, 0600 files/socket with the umask
 race handled, SO_PEERCRED UID check, constant-time token compare, non-dumpable
-daemon (RLIMIT_CORE=0, PR_SET_DUMPABLE=0), mlock+memzero on key and passphrase,
-secrets never in argv, 1 MiB protocol line cap, in-memory rollback on failed
-persist. 256-bit random token; brute force irrelevant.
+daemon (RLIMIT_CORE=0, PR_SET_DUMPABLE=0), mlock+memzero on all key material.
+After unlock the daemon holds only the data key; the passphrase and the
+wrapping key derived from it are zeroed immediately once the data key is
+unwrapped and are never retained. Secrets never in argv, 1 MiB protocol line
+cap, in-memory rollback on failed persist. 256-bit random token; brute force
+irrelevant.
 
 ## Findings (ranked)
 
@@ -31,13 +35,14 @@ UID — out of scope unless the threat model changes.
 
 ### 2. Decrypted secrets live in ordinary heap — `open`
 
-Passphrase and key get mlock+memzero; the secrets themselves do not: the
-`nlohmann::json data_` map, the plaintext dump built in `Store::persist()`,
-and every `std::string` copy through get/set are plain heap — swappable, and
-freed copies are never zeroed. Core dumps are blocked, so practical exposure
-is swap. Cheapest real mitigation is machine-level: encrypted swap or zram.
-In-code zeroing of the persist buffer is possible; guarding the whole JSON map
-is not worth it.
+The data key gets mlock+memzero (the passphrase and the wrapping key derived
+from it are transient — zeroed right after the data key is unwrapped, never
+retained); the secrets themselves do not: the `nlohmann::json data_` map, the
+plaintext dump built in `Store::persist()`, and every `std::string` copy
+through get/set are plain heap — swappable, and freed copies are never
+zeroed. Core dumps are blocked, so practical exposure is swap. Cheapest real
+mitigation is machine-level: encrypted swap or zram. In-code zeroing of the
+persist buffer is possible; guarding the whole JSON map is not worth it.
 
 ### 3. No passphrase change — `done` (2026-08-30)
 
@@ -49,6 +54,12 @@ salt. Routed through the daemon rather than rewriting the file offline so a
 running daemon can never clobber the new passphrase with its stale key.
 Residual: old ciphertext copies (backups) remain decryptable with the old
 passphrase.
+
+2026-09-08: envelope encryption (format v2) landed; `passwd` is now a
+re-wrap of the existing data key under a fresh wrapping key (fresh salt), not
+a re-encrypt of the payload — cheap, and no passphrase is retained by the
+daemon at any point (`rotate`/`passwd` both carry the current passphrase on
+the request and verify it by unwrapping the stored data key).
 
 ### 4. Service-script passphrase handoff residue — `accepted`
 
@@ -72,10 +83,13 @@ another.
 
 ### 7. Unauthenticated header — `accepted`
 
-Salt, KDF params, key_created_at, nonce are outside the MAC. Tampering with
-salt/params/nonce fails decryption loudly; key_created_at tampering only skews
-auto-rotation (documented in DESIGN.md). KDF-DoS variant already blocked by
-the bounds check.
+Salt, KDF params, key_created_at, and both nonces (wrap + payload) are
+outside any MAC. The wrapped data key IS authenticated by its own MAC under
+the wrapping key (secretbox), so tampering with it fails loudly on unwrap.
+Tampering with salt/params/either nonce fails decryption loudly; key_created_at
+tampering only skews auto-rotation (documented in DESIGN.md). Same
+consequences as before envelope encryption. KDF-DoS variant already blocked
+by the bounds check.
 
 ### 8. Dependency fetch lacks checksum pinning — `done` (2026-08-30)
 
@@ -129,5 +143,6 @@ values are not zeroed.
 
 1. ~~`secretov passwd` (finding 3)~~ — done 2026-08-30.
 2. ~~Checksums in get-deps.sh + FTXUI commit pin (finding 8)~~ — done 2026-08-30.
-3. Encrypted swap / zram on the host (findings 2, 4, 9a) — machine config, not
+3. ~~Envelope encryption (format v2)~~ — done 2026-09-08.
+4. Encrypted swap / zram on the host (findings 2, 4, 9a) — machine config, not
    code. This is now the only outstanding mitigation in the worklist.

@@ -29,8 +29,9 @@ just run tui                       # interactive terminal UI
 
 Commands: `init`, `daemon`, `get`, `set` (create or replace; value via stdin
 only; `[-p NAME] [-e ENV]` to scope the key), `list`,
-`delete`, `rotate`, `passwd` (change store passphrase; daemon must be
-running), `exec`, `import`, `tui`.
+`delete`, `rotate` (new encryption key; prompts for the current passphrase),
+`passwd` (change store passphrase; daemon must be running), `exec`, `import`,
+`tui`.
 
 ## Using secretov in another project
 
