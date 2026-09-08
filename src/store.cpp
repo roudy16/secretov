@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "paths.hpp"
+
 namespace secretov {
 
 namespace {
@@ -126,40 +128,7 @@ void Store::persist() const {
     out.insert(out.end(), nonce, nonce + sizeof(nonce));
     out.insert(out.end(), ciphertext.begin(), ciphertext.end());
 
-    std::string tmp = path_ + ".tmp";
-    ::unlink(tmp.c_str());  // clear any stale tmp from a crashed write
-    int fd = ::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
-    if (fd < 0) {
-        throw std::runtime_error("create '" + tmp + "': " + std::strerror(errno));
-    }
-
-    std::size_t written = 0;
-    while (written < out.size()) {
-        ssize_t n = ::write(fd, out.data() + written, out.size() - written);
-        if (n < 0) {
-            int e = errno;
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            throw std::runtime_error("write '" + tmp + "': " + std::strerror(e));
-        }
-        written += static_cast<std::size_t>(n);
-    }
-    if (::fsync(fd) != 0) {
-        int e = errno;
-        ::close(fd);
-        ::unlink(tmp.c_str());
-        throw std::runtime_error("fsync '" + tmp + "': " + std::strerror(e));
-    }
-    if (::close(fd) != 0) {
-        int e = errno;
-        ::unlink(tmp.c_str());
-        throw std::runtime_error("close '" + tmp + "': " + std::strerror(e));
-    }
-    if (::rename(tmp.c_str(), path_.c_str()) != 0) {
-        int e = errno;
-        ::unlink(tmp.c_str());
-        throw std::runtime_error("rename '" + tmp + "' -> '" + path_ + "': " + std::strerror(e));
-    }
+    write_file_atomic(path_, std::string(out.begin(), out.end()), 0600);
 }
 
 Store Store::create(const std::string& path, const std::string& passphrase, std::uint64_t now) {

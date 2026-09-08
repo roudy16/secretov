@@ -23,33 +23,21 @@
 
 namespace secretov {
 
-namespace {
-
-// Read whole stdin, strip a single trailing newline. Keeps secrets out of argv.
-std::string read_stdin_value() {
-    std::stringstream ss;
-    ss << std::cin.rdbuf();
-    std::string value = ss.str();
-    if (!value.empty() && value.back() == '\n') value.pop_back();
-    if (!value.empty() && value.back() == '\r') value.pop_back();
-    return value;
-}
-
-std::string load_token(const Paths& paths) {
-    std::string token = rstrip(read_file_string(paths.token));
-    if (token.empty()) {
+DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
+    token_ = rstrip(read_file_string(paths.token));
+    if (token_.empty()) {
         throw std::runtime_error("token file '" + paths.token + "' is empty");
     }
-    return token;
 }
 
-// Connect, send one request, return the parsed response. Throws on I/O trouble.
-nlohmann::json send_request(const Paths& paths, const nlohmann::json& req) {
-    std::unique_ptr<Connection> conn = connect_unix(paths.socket);
+nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
+    nlohmann::json full = req;
+    full["token"] = token_;
+    std::unique_ptr<Connection> conn = connect_unix(socket_path_);
     if (!conn) {
-        throw std::runtime_error("daemon not running at " + paths.socket + " ?");
+        throw std::runtime_error("daemon not running at " + socket_path_ + " ?");
     }
-    if (!conn->write_line(req.dump())) {
+    if (!conn->write_line(full.dump())) {
         throw std::runtime_error("failed to send request to daemon");
     }
     auto line = conn->read_line();
@@ -65,26 +53,36 @@ nlohmann::json send_request(const Paths& paths, const nlohmann::json& req) {
     return resp;
 }
 
-// Send a request and, on a non-ok response, throw its error message.
-nlohmann::json request_or_throw(const Paths& paths, const nlohmann::json& req) {
-    nlohmann::json resp = send_request(paths, req);
+nlohmann::json DaemonClient::request_raw(const nlohmann::json& req) const {
+    nlohmann::json resp = send(req);
     if (!resp.value("ok", false)) {
         throw std::runtime_error(resp.value("error", std::string("request failed")));
     }
     return resp;
 }
 
-nlohmann::json request_or_throw(const Paths& paths, const std::string& token, const std::string& op,
-                                const std::string& key, const std::optional<std::string>& value) {
-    nlohmann::json req{{"token", token}, {"op", op}};
+nlohmann::json DaemonClient::request(const std::string& op, const std::string& key,
+                                     const std::optional<std::string>& value) const {
+    nlohmann::json req{{"op", op}};
     if (!key.empty()) req["key"] = key;
     if (value) req["value"] = *value;
-    return request_or_throw(paths, req);
+    return request_raw(req);
 }
 
-std::map<std::string, std::string> fetch_prefix(const Paths& paths, const std::string& token,
-                                                const std::string& prefix) {
-    nlohmann::json resp = request_or_throw(paths, token, "getprefix", prefix, std::nullopt);
+namespace {
+
+// Read whole stdin, strip a single trailing newline. Keeps secrets out of argv.
+std::string read_stdin_value() {
+    std::stringstream ss;
+    ss << std::cin.rdbuf();
+    std::string value = ss.str();
+    if (!value.empty() && value.back() == '\n') value.pop_back();
+    if (!value.empty() && value.back() == '\r') value.pop_back();
+    return value;
+}
+
+std::map<std::string, std::string> fetch_prefix(const DaemonClient& client, const std::string& prefix) {
+    nlohmann::json resp = client.request("getprefix", prefix);
     return resp.value("values", std::map<std::string, std::string>{});
 }
 
@@ -224,7 +222,7 @@ int cmd_init() {
 int cmd_get(const std::string& key) {
     Paths paths = resolve_paths();
     try {
-        nlohmann::json resp = request_or_throw(paths, load_token(paths), "get", key, std::nullopt);
+        nlohmann::json resp = DaemonClient(paths).request("get", key);
         std::cout << resp.value("value", std::string{}) << "\n";
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
@@ -263,7 +261,7 @@ int cmd_set(int argc, char** argv) {
             ResolvedScope resolved = resolve_scope(paths, scope);
             key = scoped_key(resolved.env, resolved.project, name);
         }
-        request_or_throw(paths, load_token(paths), "set", key, read_stdin_value());
+        DaemonClient(paths).request("set", key, read_stdin_value());
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;
@@ -286,7 +284,7 @@ int cmd_list(int argc, char** argv) {
             ResolvedScope resolved = resolve_scope(paths, scope);
             prefix = scope_prefix(resolved.env, resolved.project);
         }
-        nlohmann::json resp = request_or_throw(paths, load_token(paths), "list", "", std::nullopt);
+        nlohmann::json resp = DaemonClient(paths).request("list");
         for (const auto& key : resp.value("keys", std::vector<std::string>{})) {
             if (key.compare(0, prefix.size(), prefix) == 0) std::cout << key << "\n";
         }
@@ -300,7 +298,7 @@ int cmd_list(int argc, char** argv) {
 int cmd_delete(const std::string& key) {
     Paths paths = resolve_paths();
     try {
-        request_or_throw(paths, load_token(paths), "delete", key, std::nullopt);
+        DaemonClient(paths).request("delete", key);
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;
@@ -311,7 +309,7 @@ int cmd_delete(const std::string& key) {
 int cmd_rotate() {
     Paths paths = resolve_paths();
     try {
-        request_or_throw(paths, load_token(paths), "rotate", "", std::nullopt);
+        DaemonClient(paths).request("rotate");
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;
@@ -331,10 +329,7 @@ int cmd_passwd() {
                 return 1;
             }
         }
-        request_or_throw(paths, nlohmann::json{{"token", load_token(paths)},
-                                               {"op", "passwd"},
-                                               {"old", old_pass},
-                                               {"new", new_pass}});
+        DaemonClient(paths).request_raw(nlohmann::json{{"op", "passwd"}, {"old", old_pass}, {"new", new_pass}});
         std::cout << "passphrase changed\n";
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
@@ -415,14 +410,14 @@ int cmd_exec(int argc, char** argv) {
         }
 
         // One getprefix per env/project/ group; keys without a '/' are fetched singly.
-        std::string token = load_token(paths);
+        DaemonClient client(paths);
         std::map<std::string, std::map<std::string, std::string>> by_prefix;
         std::vector<std::string> missing;
         for (const auto& [envvar, key] : wanted) {
             std::size_t slash = key.find_last_of('/');
             std::string value;
             if (slash == std::string::npos) {
-                nlohmann::json resp = send_request(paths, nlohmann::json{{"token", token}, {"op", "get"}, {"key", key}});
+                nlohmann::json resp = client.send(nlohmann::json{{"op", "get"}, {"key", key}});
                 if (!resp.value("ok", false)) {
                     missing.push_back(key);
                     continue;
@@ -432,7 +427,7 @@ int cmd_exec(int argc, char** argv) {
                 std::string prefix = key.substr(0, slash + 1);
                 auto group = by_prefix.find(prefix);
                 if (group == by_prefix.end()) {
-                    group = by_prefix.emplace(prefix, fetch_prefix(paths, token, prefix)).first;
+                    group = by_prefix.emplace(prefix, fetch_prefix(client, prefix)).first;
                 }
                 auto hit = group->second.find(key);
                 if (hit == group->second.end()) {
@@ -523,8 +518,8 @@ int cmd_import(int argc, char** argv) {
         KeyValues pairs = parse_dotenv(read_file_string(file));
         if (pairs.empty()) throw std::runtime_error("nothing to import from " + file);
 
-        std::string token = load_token(paths);
-        std::map<std::string, std::string> existing = fetch_prefix(paths, token, scope_prefix(env, project));
+        DaemonClient client(paths);
+        std::map<std::string, std::string> existing = fetch_prefix(client, scope_prefix(env, project));
         std::vector<std::string> collisions;
         KeyValues name_to_var;
         for (const auto& [var, value] : pairs) {
@@ -542,7 +537,7 @@ int cmd_import(int argc, char** argv) {
         std::string new_text = manifest_with_entries(manifest_text, project, env, name_to_var);
 
         for (const auto& [var, value] : pairs) {
-            request_or_throw(paths, token, "set", scoped_key(env, project, var), value);
+            client.request("set", scoped_key(env, project, var), value);
         }
         if (new_text != manifest_text) write_file_atomic(manifest_path, new_text, 0644);
 

@@ -17,9 +17,9 @@
 #include <ftxui/dom/elements.hpp>
 #include <nlohmann/json.hpp>
 
+#include "client.hpp"
 #include "paths.hpp"
 #include "protocol.hpp"
-#include "transport.hpp"
 
 // Secret hygiene ceiling: revealed values and the add-form value buffer are
 // zeroed (sodium_memzero) as soon as they are re-masked/submitted/cancelled.
@@ -33,54 +33,6 @@ namespace {
 
 using nlohmann::json;
 
-// One persistent connection to the daemon, reconnected lazily after a failure.
-class Daemon {
-   public:
-    Daemon(std::string socket_path, std::string token)
-        : socket_path_(std::move(socket_path)), token_(std::move(token)) {}
-
-    // Sends one request and returns the ok response. Throws std::runtime_error
-    // on transport failure or a non-ok daemon reply; drops the connection so the
-    // next call reconnects.
-    json request(const std::string& op, const std::string& key,
-                 const std::optional<std::string>& value) {
-        if (!conn_) {
-            conn_ = connect_unix(socket_path_);
-            if (!conn_) {
-                throw std::runtime_error("daemon not running at " + socket_path_ + " ?");
-            }
-        }
-        json req{{"token", token_}, {"op", op}};
-        if (!key.empty()) req["key"] = key;
-        if (value) req["value"] = *value;
-
-        if (!conn_->write_line(req.dump())) {
-            conn_.reset();
-            throw std::runtime_error("lost connection to daemon");
-        }
-        std::optional<std::string> line = conn_->read_line();
-        if (!line) {
-            conn_.reset();
-            throw std::runtime_error("daemon closed connection");
-        }
-        json resp = json::parse(*line, nullptr, false);
-        if (resp.is_discarded()) {
-            throw std::runtime_error("malformed response from daemon");
-        }
-        if (!resp.value("ok", false)) {
-            throw std::runtime_error(resp.value("error", std::string("request failed")));
-        }
-        return resp;
-    }
-
-    const std::string& socket_path() const { return socket_path_; }
-
-   private:
-    std::string socket_path_;
-    std::string token_;
-    std::unique_ptr<Connection> conn_;
-};
-
 void zero(std::string& s) {
     if (!s.empty()) sodium_memzero(s.data(), s.size());
     s.clear();
@@ -88,15 +40,7 @@ void zero(std::string& s) {
 
 enum class Mode { Normal, Add, Edit, ConfirmDelete, ConfirmRotate };
 
-std::string load_token(const Paths& paths) {
-    std::string token = rstrip(read_file_string(paths.token));
-    if (token.empty()) {
-        throw std::runtime_error("token file '" + paths.token + "' is empty");
-    }
-    return token;
-}
-
-int run_ui(Daemon& daemon) {
+int run_ui(DaemonClient& daemon) {
     using namespace ftxui;
 
     std::vector<std::string> keys;
@@ -119,7 +63,7 @@ int run_ui(Daemon& daemon) {
     auto refresh = [&](const std::string& select_key) {
         remask();
         try {
-            json resp = daemon.request("list", "", std::nullopt);
+            json resp = daemon.request("list");
             keys = resp.value("keys", std::vector<std::string>{});
         } catch (const std::exception& e) {
             status = e.what();
@@ -236,7 +180,7 @@ int run_ui(Daemon& daemon) {
 
     auto do_rotate = [&] {
         try {
-            daemon.request("rotate", "", std::nullopt);
+            daemon.request("rotate");
             status = "rotated encryption key";
         } catch (const std::exception& e) {
             status = e.what();
@@ -417,23 +361,14 @@ int run_tui() {
     }
 
     Paths paths = resolve_paths();
-    std::string token;
     try {
-        token = load_token(paths);
+        DaemonClient daemon(paths);
+        daemon.request("list");  // fail fast if unreachable/unauthorized
+        return run_ui(daemon);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "secretov: %s\n", e.what());
         return 1;
     }
-
-    Daemon daemon(paths.socket, token);
-    try {
-        daemon.request("list", "", std::nullopt);  // fail fast if unreachable/unauthorized
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "secretov: %s\n", e.what());
-        return 1;
-    }
-
-    return run_ui(daemon);
 }
 
 }  // namespace secretov
