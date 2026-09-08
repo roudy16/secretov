@@ -19,9 +19,8 @@ passphrase.
 ## Transport
 
 Unix domain socket at `$XDG_RUNTIME_DIR/secretov.sock`, mode 0600, peer UID
-checked via `SO_PEERCRED`. The socket is hidden behind a generic connection
-interface (Listener/Connection adapter) so other transports can be added
-without touching service logic.
+checked via `SO_PEERCRED`. The unix socket is the only transport; Listener and
+Connection are plain classes over it, not an interface.
 
 ## Auth
 

@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <yaml-cpp/yaml.h>
 
@@ -266,13 +267,14 @@ Manifest load_manifest(const std::string& path) {
 }
 
 std::optional<std::string> find_manifest_upward(const std::string& start_dir) {
-    std::string dir = start_dir;
+    std::filesystem::path dir = start_dir;
     for (;;) {
-        std::string candidate = (dir == "/" ? "" : dir) + "/" + kManifestFileName;
-        if (::access(candidate.c_str(), F_OK) == 0) return candidate;
-        if (dir == "/" || dir.empty()) return std::nullopt;
-        std::size_t slash = dir.find_last_of('/');
-        dir = slash == 0 ? "/" : dir.substr(0, slash);
+        std::filesystem::path candidate = dir / kManifestFileName;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) return candidate.string();
+        std::filesystem::path parent = dir.parent_path();
+        if (parent == dir) return std::nullopt;
+        dir = parent;
     }
 }
 

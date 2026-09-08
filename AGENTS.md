@@ -22,8 +22,7 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   File format documented in store.hpp. Security-critical: review-level care.
 - `src/daemon.{hpp,cpp}` — request loop, peer-UID + constant-time token
   checks, auto-rotation. Security-critical.
-- `src/transport.{hpp,cpp}` — Listener/Connection interface + unix socket
-  impl. New transports implement the interface; don't touch service logic.
+- `src/transport.{hpp,cpp}` — unix socket Connection/Listener classes.
 - `src/manifest.{hpp,cpp}` — `.secretov.yaml` manifests, `projects.yaml`
   registry, dotenv parsing, and the comment-preserving text insertion that
   `import` uses to update manifests (re-parsed and verified before writing).

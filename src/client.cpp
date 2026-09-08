@@ -4,10 +4,10 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -33,7 +33,7 @@ DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
 nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     nlohmann::json full = req;
     full["token"] = token_;
-    std::unique_ptr<Connection> conn = connect_unix(socket_path_);
+    std::optional<Connection> conn = connect_unix(socket_path_);
     if (!conn) {
         throw std::runtime_error("daemon not running at " + socket_path_ + " ?");
     }
@@ -87,11 +87,12 @@ std::map<std::string, std::string> fetch_prefix(const DaemonClient& client, cons
 }
 
 std::string cwd() {
-    char buf[PATH_MAX];
-    if (!::getcwd(buf, sizeof(buf))) {
-        throw std::runtime_error(std::string("getcwd failed: ") + std::strerror(errno));
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::current_path(ec);
+    if (ec) {
+        throw std::runtime_error("getcwd failed: " + ec.message());
     }
-    return buf;
+    return p.string();
 }
 
 // --- scope resolution (see DESIGN.md "Scopes") -------------------------------

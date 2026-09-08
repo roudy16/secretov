@@ -32,6 +32,7 @@ fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 # 1. init
 printf '%s\n' "$PASS" | "$BIN" init >/dev/null || fail "init"
 [ -f "$TOKEN" ] || fail "token file not created"
+[ "$(stat -c %a "$XDG_DATA_HOME/secretov")" = "700" ] || fail "store dir not 0700"
 
 # 2. daemon in background; wait for socket
 printf '%s\n' "$PASS" | "$BIN" daemon >"$WORK/daemon.log" 2>&1 &

@@ -1,6 +1,5 @@
 #include "store.hpp"
 
-#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -47,27 +46,6 @@ std::uint64_t get_u64_le(const unsigned char* p) {
         v |= static_cast<std::uint64_t>(p[i]) << (8 * i);
     }
     return v;
-}
-
-std::vector<unsigned char> read_file(const std::string& path) {
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error("open '" + path + "' for read: " + std::strerror(errno));
-    }
-    std::vector<unsigned char> buf;
-    unsigned char chunk[4096];
-    for (;;) {
-        ssize_t n = ::read(fd, chunk, sizeof(chunk));
-        if (n < 0) {
-            int e = errno;
-            ::close(fd);
-            throw std::runtime_error("read '" + path + "': " + std::strerror(e));
-        }
-        if (n == 0) break;
-        buf.insert(buf.end(), chunk, chunk + n);
-    }
-    ::close(fd);
-    return buf;
 }
 
 // Reject attacker-controlled KDF params before crypto_pwhash allocates on them.
@@ -142,8 +120,11 @@ Store::Unwrapped Store::unwrap(const std::string& passphrase, const char* fail_m
     return {wrap_key, data_key};
 }
 
-void Store::persist() const {
-    std::string plaintext = data_.dump();
+// Encrypts `data` under the current data key and writes the whole file.
+// Callers that mutate the map pass a candidate and adopt it only after this
+// returns, so a failed write never leaves memory ahead of disk.
+void Store::persist(const nlohmann::json& data) const {
+    std::string plaintext = data.dump();
 
     unsigned char payload_nonce[crypto_secretbox_NONCEBYTES];
     randombytes_buf(payload_nonce, sizeof(payload_nonce));
@@ -197,7 +178,7 @@ Store Store::create(const std::string& path, const std::string& passphrase, std:
     free_guarded(wrap_key, crypto_secretbox_KEYBYTES);
 
     s.key_ = data_key;
-    s.persist();
+    s.persist(s.data_);
     return s;
 }
 
@@ -260,7 +241,8 @@ V1Decoded decode_v1(const std::vector<unsigned char>& buf, const std::string& pa
 
 Store Store::open(const std::string& path, const std::string& passphrase) {
     ensure_sodium();
-    std::vector<unsigned char> buf = read_file(path);
+    std::string raw = read_file_string(path);
+    std::vector<unsigned char> buf(raw.begin(), raw.end());
 
     if (buf.size() < sizeof(kMagic) + 1 ||
         std::memcmp(buf.data(), kMagic, sizeof(kMagic)) != 0) {
@@ -292,7 +274,7 @@ Store Store::open(const std::string& path, const std::string& passphrase) {
         free_guarded(decoded.key, crypto_secretbox_KEYBYTES);
 
         s.key_ = data_key;
-        s.persist();
+        s.persist(s.data_);
         return s;
     }
 
@@ -358,33 +340,18 @@ std::optional<std::string> Store::get(const std::string& key) const {
 }
 
 void Store::set(const std::string& key, const std::string& value) {
-    auto it = data_.find(key);
-    bool existed = it != data_.end();
-    std::string prev = existed ? it->get<std::string>() : std::string();
-    data_[key] = value;
-    try {
-        persist();
-    } catch (...) {
-        if (existed) {
-            data_[key] = prev;
-        } else {
-            data_.erase(key);
-        }
-        throw;
-    }
+    nlohmann::json next = data_;
+    next[key] = value;
+    persist(next);
+    data_ = std::move(next);
 }
 
 bool Store::remove(const std::string& key) {
-    auto it = data_.find(key);
-    if (it == data_.end()) return false;
-    std::string prev = it->get<std::string>();
-    data_.erase(it);
-    try {
-        persist();
-    } catch (...) {
-        data_[key] = prev;
-        throw;
-    }
+    if (!data_.contains(key)) return false;
+    nlohmann::json next = data_;
+    next.erase(key);
+    persist(next);
+    data_ = std::move(next);
     return true;
 }
 
@@ -439,7 +406,7 @@ void Store::rotate(const std::string& passphrase, std::uint64_t now) {
     std::memcpy(wrapped_key_, new_wrapped_key, sizeof(wrapped_key_));
     key_created_at_ = now;
     free_guarded(old_key, crypto_secretbox_KEYBYTES);
-    persist();
+    persist(data_);
 }
 
 void Store::change_passphrase(const std::string& old_pass, const std::string& new_pass) {
@@ -467,7 +434,7 @@ void Store::change_passphrase(const std::string& old_pass, const std::string& ne
     std::memcpy(wrap_nonce_, new_wrap_nonce, sizeof(wrap_nonce_));
     std::memcpy(wrapped_key_, new_wrapped_key, sizeof(wrapped_key_));
     // key_created_at_ unchanged: the data key itself did not change.
-    persist();
+    persist(data_);
 }
 
 Store::Store(Store&& other) noexcept

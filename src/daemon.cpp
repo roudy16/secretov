@@ -25,7 +25,7 @@ namespace {
 
 constexpr int kRotateAfterDays = 30;  // fixed 30d, make a flag if anyone asks
 
-// UnixSocketListener::accept() swallows EINTR, so a signal can't unwind the
+// Listener::accept() swallows EINTR, so a signal can't unwind the
 // accept loop. We unlink the socket and _exit from the handler instead.
 // No clean stack unwind on shutdown; OS reclaims the mlock'd key.
 char g_socket_path[512] = {};
@@ -186,11 +186,11 @@ int run_daemon() {
     ::sigaction(SIGTERM, &sa, nullptr);
     ::signal(SIGPIPE, SIG_IGN);
 
-    UnixSocketListener listener(paths.socket);
+    Listener listener(paths.socket);
     std::cerr << "secretov: listening on " << paths.socket << " (store " << paths.store << ")\n";
 
     for (;;) {
-        std::unique_ptr<Connection> conn = listener.accept();
+        std::optional<Connection> conn = listener.accept();
         if (!conn) {
             ::poll(nullptr, 0, 100);  // back off; avoid busy-spin on persistent accept errors (EMFILE)
             continue;  // one connection at a time; threads when a real client blocks another

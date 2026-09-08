@@ -81,7 +81,7 @@ class Store {
     // blob must unwrap) and hands back the wrapping key for re-wrapping.
     // Throws `fail_msg` on MAC failure.
     Unwrapped unwrap(const std::string& passphrase, const char* fail_msg) const;
-    void persist() const;
+    void persist(const nlohmann::json& data) const;
     void wipe();
 
     std::string path_;

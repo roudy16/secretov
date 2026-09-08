@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -85,24 +86,12 @@ inline Paths resolve_paths() {
 // Recursively create `dir` and any missing parents with mode 0700.
 inline void mkdir_p(const std::string& dir) {
     if (dir.empty() || dir == "/") return;
-    std::string partial;
-    std::size_t i = 0;
-    if (dir[0] == '/') {
-        partial = "/";
-        i = 1;
-    }
-    while (i <= dir.size()) {
-        if (i == dir.size() || dir[i] == '/') {
-            if (!partial.empty() && partial != "/") {
-                if (::mkdir(partial.c_str(), 0700) != 0 && errno != EEXIST) {
-                    throw std::runtime_error("mkdir '" + partial + "': " + std::strerror(errno));
-                }
-            }
-            if (i < dir.size()) partial.push_back('/');
-        } else {
-            partial.push_back(dir[i]);
-        }
-        ++i;
+    mode_t old_umask = ::umask(0077);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    ::umask(old_umask);
+    if (ec) {
+        throw std::runtime_error("mkdir '" + dir + "': " + ec.message());
     }
 }
 

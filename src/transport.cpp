@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 namespace secretov {
 
@@ -31,15 +32,32 @@ ssize_t read_retry(int fd, char* buf, size_t len) {
 
 }  // namespace
 
-UnixSocketConnection::UnixSocketConnection(int fd) : fd_(fd) {}
+Connection::Connection(int fd) : fd_(fd) {}
 
-UnixSocketConnection::~UnixSocketConnection() {
+Connection::~Connection() {
     if (fd_ >= 0) {
         ::close(fd_);
     }
 }
 
-std::optional<std::string> UnixSocketConnection::read_line() {
+Connection::Connection(Connection&& other) noexcept
+    : fd_(other.fd_), buffer_(std::move(other.buffer_)) {
+    other.fd_ = -1;
+}
+
+Connection& Connection::operator=(Connection&& other) noexcept {
+    if (this != &other) {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+        fd_ = other.fd_;
+        buffer_ = std::move(other.buffer_);
+        other.fd_ = -1;
+    }
+    return *this;
+}
+
+std::optional<std::string> Connection::read_line() {
     for (;;) {
         auto newline_pos = buffer_.find('\n');
         if (newline_pos != std::string::npos) {
@@ -64,7 +82,7 @@ std::optional<std::string> UnixSocketConnection::read_line() {
     }
 }
 
-bool UnixSocketConnection::write_line(const std::string& line) {
+bool Connection::write_line(const std::string& line) {
     std::string out = line;
     out.push_back('\n');
 
@@ -82,7 +100,7 @@ bool UnixSocketConnection::write_line(const std::string& line) {
     return true;
 }
 
-uid_t UnixSocketConnection::peer_uid() const {
+uid_t Connection::peer_uid() const {
     struct ucred cred{};
     socklen_t len = sizeof(cred);
     if (::getsockopt(fd_, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
@@ -91,7 +109,7 @@ uid_t UnixSocketConnection::peer_uid() const {
     return cred.uid;
 }
 
-UnixSocketListener::UnixSocketListener(const std::string& path) : fd_(-1), path_(path) {
+Listener::Listener(const std::string& path) : fd_(-1), path_(path) {
     fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd_ < 0) {
         throw_errno("socket() failed");
@@ -135,36 +153,36 @@ UnixSocketListener::UnixSocketListener(const std::string& path) : fd_(-1), path_
     }
 }
 
-UnixSocketListener::~UnixSocketListener() {
+Listener::~Listener() {
     if (fd_ >= 0) {
         ::close(fd_);
     }
     ::unlink(path_.c_str());
 }
 
-std::unique_ptr<Connection> UnixSocketListener::accept() {
+std::optional<Connection> Listener::accept() {
     int client_fd;
     do {
         client_fd = ::accept(fd_, nullptr, nullptr);
     } while (client_fd < 0 && errno == EINTR);
 
     if (client_fd < 0) {
-        return nullptr;
+        return std::nullopt;
     }
-    return std::make_unique<UnixSocketConnection>(client_fd);
+    return Connection(client_fd);
 }
 
-std::unique_ptr<Connection> connect_unix(const std::string& path) {
+std::optional<Connection> connect_unix(const std::string& path) {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        return nullptr;
+        return std::nullopt;
     }
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (path.size() >= sizeof(addr.sun_path)) {
         ::close(fd);
-        return nullptr;
+        return std::nullopt;
     }
     std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
@@ -175,9 +193,9 @@ std::unique_ptr<Connection> connect_unix(const std::string& path) {
 
     if (rc < 0) {
         ::close(fd);
-        return nullptr;
+        return std::nullopt;
     }
-    return std::make_unique<UnixSocketConnection>(fd);
+    return Connection(fd);
 }
 
 }  // namespace secretov
