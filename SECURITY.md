@@ -161,3 +161,4 @@ after the unit's start limit.
 3. ~~Envelope encryption (format v2)~~ — done 2026-09-08.
 4. Encrypted swap / zram on the host (findings 2, 9a) — machine config, not
    code. This is now the only outstanding mitigation in the worklist.
+   NOTE: Not sure this is necessary for a private local service.
