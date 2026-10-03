@@ -2,10 +2,13 @@
 # Fetches vendored deps when system packages (libsodium-dev, nlohmann-json3-dev)
 # are absent. Installs into third_party/ (gitignored). Downloads are verified
 # against pinned sha256 digests; a mismatch aborts before anything is used.
+# Each artifact gets a <artifact>.stamp recording version + digest; a missing
+# or different stamp (a pin bump) refetches, so bumps reach existing checkouts.
 set -eu
 cd "$(dirname "$0")"
 
-JSON_URL=https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp
+JSON_VERSION=3.12.0
+JSON_URL=https://github.com/nlohmann/json/releases/download/v$JSON_VERSION/json.hpp
 JSON_SHA256=aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63
 SODIUM_VERSION=1.0.22
 SODIUM_URL=https://github.com/jedisct1/libsodium/releases/download/$SODIUM_VERSION-RELEASE/libsodium-$SODIUM_VERSION.tar.gz
@@ -28,12 +31,21 @@ fetch() {
   fi
 }
 
-if [ ! -f nlohmann/json.hpp ]; then
+# stamp_ok ARTIFACT STAMP — artifact exists and its stamp matches STAMP.
+stamp_ok() {
+  [ -f "$1" ] && [ -f "$1.stamp" ] && [ "$(cat "$1.stamp")" = "$2" ]
+}
+
+JSON_STAMP="json $JSON_VERSION $JSON_SHA256"
+if ! stamp_ok nlohmann/json.hpp "$JSON_STAMP"; then
   mkdir -p nlohmann
   fetch "$JSON_URL" "$JSON_SHA256" nlohmann/json.hpp
+  echo "$JSON_STAMP" >nlohmann/json.hpp.stamp
 fi
 
-if [ ! -f sodium/lib/libsodium.a ]; then
+SODIUM_STAMP="libsodium $SODIUM_VERSION $SODIUM_SHA256"
+if ! stamp_ok sodium/lib/libsodium.a "$SODIUM_STAMP"; then
+  rm -rf sodium  # no stale headers from an older version
   fetch "$SODIUM_URL" "$SODIUM_SHA256" libsodium.tar.gz
   tar xzf libsodium.tar.gz
   cd "libsodium-$SODIUM_VERSION"
@@ -42,5 +54,6 @@ if [ ! -f sodium/lib/libsodium.a ]; then
   make install >/dev/null
   cd ..
   rm -rf "libsodium-$SODIUM_VERSION" libsodium.tar.gz
+  echo "$SODIUM_STAMP" >sodium/lib/libsodium.a.stamp
 fi
 echo "deps ready"
