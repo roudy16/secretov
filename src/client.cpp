@@ -1,7 +1,6 @@
 #include "client.hpp"
 
 #include <sodium.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -201,27 +200,6 @@ const KeyValues& vars_for(const Manifest& m, const std::string& env) {
     return it == m.vars.end() ? kNone : it->second;
 }
 
-// execvp's search, done against the caller's PATH before manifest vars are
-// applied: a manifest PATH reaches the child but cannot choose the program.
-std::string resolve_program(const std::string& name) {
-    if (name.find('/') != std::string::npos) return name;
-    const char* path_env = std::getenv("PATH");
-    std::string search_path = path_env ? path_env : "/bin:/usr/bin";  // glibc execvp default
-    std::size_t start = 0;
-    for (;;) {
-        std::size_t colon = search_path.find(':', start);
-        std::string dir = search_path.substr(start, colon - start);  // npos - start clamps to the end
-        std::string candidate = (dir.empty() ? "." : dir) + "/" + name;
-        struct stat st{};
-        if (::stat(candidate.c_str(), &st) == 0 && S_ISREG(st.st_mode) && ::access(candidate.c_str(), X_OK) == 0) {
-            return candidate;
-        }
-        if (colon == std::string::npos) break;
-        start = colon + 1;
-    }
-    throw std::runtime_error("cannot run '" + name + "': not found in PATH");
-}
-
 const std::vector<SecretEntry>& entries_for(const Manifest& m, const std::string& env) {
     auto it = m.envs.find(env);
     if (it == m.envs.end()) {
@@ -357,6 +335,9 @@ int cmd_delete(const std::string& key) {
     return 0;
 }
 
+// ponytail: cmd_rotate/cmd_passwd leave passphrase copies (these strings, the
+// request json and its dump()) unscrubbed on the heap; the process is
+// non-dumpable and exits right after. Scrub them if clients become long-lived.
 int cmd_rotate() {
     Paths paths = resolve_paths();
     try {
@@ -432,7 +413,6 @@ int cmd_exec(int argc, char** argv) {
     }
 
     Paths paths = resolve_paths();
-    std::string program;
     try {
         // Raw-only invocations (--secret with no -p/-e) skip the manifest so
         // one-off keys work anywhere, including inside a project directory.
@@ -455,8 +435,6 @@ int cmd_exec(int argc, char** argv) {
             for (const auto& [envvar, key] : wanted) std::cout << envvar << " <- " << key << "\n";
             return 0;
         }
-        program = resolve_program(argv[i]);
-
         // Plaintext first, so an explicit --secret on the command line wins
         // over a manifest var of the same name.
         for (const auto& [envvar, value] : plain) {
@@ -506,8 +484,9 @@ int cmd_exec(int argc, char** argv) {
         return 1;
     }
 
-    ::execv(program.c_str(), &argv[i]);
-    std::cerr << "secretov exec: cannot run '" << program << "': " << std::strerror(errno) << "\n";
+    // Manifests cannot set PATH, so execvp searches the caller's own PATH.
+    ::execvp(argv[i], &argv[i]);
+    std::cerr << "secretov exec: cannot run '" << argv[i] << "': " << std::strerror(errno) << "\n";
     return 1;
 }
 

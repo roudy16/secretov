@@ -149,22 +149,22 @@ inline void write_file_atomic(const std::string& path, const std::string& conten
         ::unlink(tmp.c_str());
         throw std::runtime_error("rename '" + tmp + "' -> '" + path + "': " + std::strerror(e));
     }
+    // The rename has replaced `path`: callers (Store::persist and the passwd/
+    // rotate commit) treat a throw as "nothing changed", so from here a failure
+    // is only a warning. ponytail: durability is best-effort past the rename.
     std::string dir = std::filesystem::path(path).parent_path().string();
     if (dir.empty()) dir = ".";
     int dir_fd = ::open(dir.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-    if (dir_fd < 0) {
-        throw std::runtime_error("open dir '" + dir + "' for fsync: " + std::strerror(errno));
+    if (dir_fd < 0 || ::fsync(dir_fd) != 0) {
+        std::cerr << "secretov: warning: wrote '" << path << "' but could not fsync dir '" << dir
+                  << "': " << std::strerror(errno) << " (a power loss may undo the write)\n";
     }
-    if (::fsync(dir_fd) != 0) {
-        int e = errno;
-        ::close(dir_fd);
-        throw std::runtime_error("fsync dir '" + dir + "': " + std::strerror(e));
-    }
-    ::close(dir_fd);
+    if (dir_fd >= 0) ::close(dir_fd);
 }
 
 // Read one secret line from stdin. On a tty: prompt on stderr with echo off
-// (restored after). Otherwise: read one line (enables scripted use). Bytes go
+// (restored after), and refuse (discarding it) any input queued past the line.
+// Otherwise: read one line (enables scripted use). Bytes go
 // straight from ::read into a pre-reserved buffer: no stdio buffer or string
 // reallocation keeps an unscrubbed copy, and nothing past the newline is
 // consumed, so successive calls can read successive lines of one pipe.
@@ -208,15 +208,34 @@ inline std::string read_secret_line(const std::string& prompt) {
         }
         line.push_back(byte);
     }
+    bool tty_input_left = false;
     if (echo_disabled) {
-        ::tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
+        // Lines after the first (a pasted PEM key) would otherwise reach the
+        // shell once we exit: run as commands, saved to history. Briefly drop
+        // ICANON so a trailing partial line counts too, then restore with
+        // TCSAFLUSH, which discards whatever is still queued.
+        termios peek = old_termios;
+        peek.c_lflag &= ~static_cast<tcflag_t>(ECHO | ICANON);
+        peek.c_cc[VMIN] = 0;
+        peek.c_cc[VTIME] = 1;  // 100 ms: a paste can arrive in chunks
+        if (::tcsetattr(STDIN_FILENO, TCSANOW, &peek) == 0) {
+            char leftover = 0;
+            tty_input_left = ::read(STDIN_FILENO, &leftover, 1) > 0;
+            sodium_memzero(&leftover, 1);
+        }
+        ::tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_termios);
     }
     if (on_tty) std::cerr << "\n";
-    if (read_errno != 0 || too_long) {
+    if (read_errno != 0 || too_long || tty_input_left) {
         sodium_memzero(line.data(), line.size());
         if (too_long) {
             throw std::runtime_error("input line longer than " +
                                      std::to_string(kMaxSecretLineBytes) + " bytes");
+        }
+        if (tty_input_left) {
+            throw std::runtime_error(
+                "more input followed the line on the terminal (multi-line paste?); "
+                "discarded it; pipe multi-line values on stdin instead");
         }
         throw std::runtime_error(std::string("read stdin: ") + std::strerror(read_errno));
     }

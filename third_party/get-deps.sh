@@ -39,18 +39,21 @@ stamp_ok() {
 JSON_STAMP="json $JSON_VERSION $JSON_SHA256"
 if ! stamp_ok nlohmann/json.hpp "$JSON_STAMP"; then
   mkdir -p nlohmann
-  fetch "$JSON_URL" "$JSON_SHA256" nlohmann/json.hpp
+  fetch "$JSON_URL" "$JSON_SHA256" nlohmann/json.hpp.new  # a failed fetch keeps the old header
+  mv nlohmann/json.hpp.new nlohmann/json.hpp
   echo "$JSON_STAMP" >nlohmann/json.hpp.stamp
 fi
 
 SODIUM_STAMP="libsodium $SODIUM_VERSION $SODIUM_SHA256"
 if ! stamp_ok sodium/lib/libsodium.a "$SODIUM_STAMP"; then
-  rm -rf sodium  # no stale headers from an older version
   fetch "$SODIUM_URL" "$SODIUM_SHA256" libsodium.tar.gz
   tar xzf libsodium.tar.gz
   cd "libsodium-$SODIUM_VERSION"
   ./configure --prefix="$(cd .. && pwd)/sodium" --disable-shared --quiet
   make -j"$(nproc)" >/dev/null
+  # Only now drop the old tree (no stale headers from an older version): a
+  # failed fetch or build above leaves the working one in place.
+  rm -rf ../sodium
   make install >/dev/null
   cd ..
   rm -rf "libsodium-$SODIUM_VERSION" libsodium.tar.gz

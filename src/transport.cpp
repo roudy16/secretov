@@ -32,12 +32,19 @@ ssize_t read_retry(int fd, char* buf, size_t len) {
     return n;
 }
 
+// erase() in read_line slides the unread tail forward and leaves a stale copy
+// of it past size(); zero the whole allocation, not just the live bytes.
+void scrub_whole_buffer(std::string& buffer) {
+    buffer.resize(buffer.capacity());
+    sodium_memzero(buffer.data(), buffer.size());
+}
+
 }  // namespace
 
 Connection::Connection(int fd) : fd_(fd) { buffer_.reserve(kInitialBufferBytes); }
 
 Connection::~Connection() {
-    sodium_memzero(buffer_.data(), buffer_.size());
+    scrub_whole_buffer(buffer_);
     if (fd_ >= 0) {
         ::close(fd_);
     }
@@ -53,7 +60,7 @@ Connection& Connection::operator=(Connection&& other) noexcept {
         if (fd_ >= 0) {
             ::close(fd_);
         }
-        sodium_memzero(buffer_.data(), buffer_.size());
+        scrub_whole_buffer(buffer_);
         fd_ = other.fd_;
         buffer_ = std::move(other.buffer_);
         scanned_ = other.scanned_;

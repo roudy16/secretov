@@ -141,6 +141,39 @@ if os.WEXITSTATUS(status) != 0 or b"tty-secret" in out:
     sys.exit("status %d, output %r" % (status, out))
 PY
 [ "$("$BIN" get TTY_KEY)" = "tty-secret" ] || fail "tty set value"
+# a multi-line paste at the tty prompt fails and leaves nothing queued for the
+# shell, which would run the secret lines as commands
+python3 - "$BIN" <<'PY' || fail "tty multi-line paste"
+import os, pty, select, sys
+pid, fd = pty.fork()
+if pid == 0:
+    script = '"$0" set PASTED; s=$?; IFS= read -r rest; echo "STATUS=$s LEFTOVER=[$rest]"'
+    os.execv("/bin/sh", ["sh", "-c", script, sys.argv[1]])
+out = b""
+while b"Value for PASTED" not in out:
+    if not select.select([fd], [], [], 5)[0]:
+        sys.exit("no prompt: %r" % out)
+    out += os.read(fd, 1024)
+os.write(fd, b"-----BEGIN KEY-----\nc2VjcmV0LWxpbmUtMg==\n-----END KEY-----\n")
+sent_marker = False
+while b"LEFTOVER=" not in out:
+    if not select.select([fd], [], [], 1)[0]:
+        if sent_marker:
+            break
+        os.write(fd, b"marker\n")  # the shell's read gets this only if the queue was flushed
+        sent_marker = True
+        continue
+    try:
+        out += os.read(fd, 1024)
+    except OSError:
+        break
+if b"LEFTOVER=" not in out:
+    os.kill(pid, 9)
+os.waitpid(pid, 0)
+if b"STATUS=1 LEFTOVER=[marker]" not in out:
+    sys.exit("got %r" % out)
+PY
+if "$BIN" get PASTED >/dev/null 2>&1; then fail "multi-line tty paste stored a value"; fi
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after set (stdin)"
 "$BIN" list | grep -qx FOO || fail "list missing FOO"
 "$BIN" list | grep -qx VIA_STDIN || fail "list missing VIA_STDIN"
@@ -282,19 +315,22 @@ head -c 700000 /dev/zero | tr '\0' y | "$BIN" set dev/demo/BIG2 || fail "set BIG
 "$BIN" delete dev/demo/BIG1
 "$BIN" delete dev/demo/BIG2
 
-# 5g. a manifest PATH reaches the child but cannot pick the program: argv[0]
-# resolves against the caller's PATH. A group-writable project dir is refused.
-mkdir -p "$PROJ/evil"
-printf '#!/bin/sh\nprintf EVIL\n' > "$PROJ/evil/sh"
-chmod +x "$PROJ/evil/sh"
+# 5g. a manifest cannot set PATH (it would pick the program and every program
+# the child spawns); a shebang-less executable still runs via /bin/sh like
+# execvp. A group-writable project dir is refused.
+mkdir -p "$PROJ/bin"
+printf 'printf noshebang-ran\n' > "$PROJ/bin/nosb"
+chmod +x "$PROJ/bin/nosb"
+OUT="$(PATH="$PROJ/bin:$PATH" "$BIN" exec --secret VIA_STDIN=X -- nosb)" || fail "shebang-less exec"
+[ "$OUT" = "noshebang-ran" ] || fail "shebang-less exec got '$OUT'"
 cp "$PROJ/.secretov.yaml" "$PROJ/.secretov.yaml.bak"
-python3 - "$PROJ/.secretov.yaml" "$PROJ/evil:$PATH" <<'PY2'
-import sys, json, pathlib
+python3 - "$PROJ/.secretov.yaml" <<'PY2'
+import sys, pathlib
 p = pathlib.Path(sys.argv[1]); t = p.read_text()
-p.write_text(t.replace("    vars:\n", "    vars:\n      PATH: " + json.dumps(sys.argv[2]) + "\n", 1))
+p.write_text(t.replace("    vars:\n", "    vars:\n      PATH: /tmp/evil\n", 1))
 PY2
-OUT="$(cd "$PROJ" && "$BIN" exec -e dev -- sh -c 'printf %s "$PATH"')"
-[ "$OUT" = "$PROJ/evil:$PATH" ] || fail "manifest PATH chose the program or was not passed: '$OUT'"
+ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "manifest PATH should be refused"
+echo "$ERR" | grep -q "cannot be set from a manifest" || fail "manifest PATH message: $ERR"
 mv "$PROJ/.secretov.yaml.bak" "$PROJ/.secretov.yaml"
 chmod g+w "$PROJ"
 ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "group-writable project dir should be refused"

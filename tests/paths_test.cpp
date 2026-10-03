@@ -55,6 +55,16 @@ void test_write_file_atomic_relative_path(const std::string& dir) {
     assert(secretov::read_file_string(dir + "/nested/abs_file") == "more");
 }
 
+void test_write_file_atomic_dir_fsync_failure_is_committed(const std::string& dir) {
+    // A dir without read permission allows the rename but not the dir open for
+    // fsync: the write has happened, so it must not throw.
+    std::string no_read_dir = dir + "/no_read";
+    assert(::mkdir(no_read_dir.c_str(), 0300) == 0);
+    secretov::write_file_atomic(no_read_dir + "/f", "committed", 0600);
+    assert(::chmod(no_read_dir.c_str(), 0700) == 0);
+    assert(secretov::read_file_string(no_read_dir + "/f") == "committed");
+}
+
 }  // namespace
 
 int main() {
@@ -68,6 +78,7 @@ int main() {
     test_secret_lines_from_one_pipe();
     test_secret_line_cap();
     test_write_file_atomic_relative_path(dir);
+    test_write_file_atomic_dir_fsync_failure_is_committed(dir);
 
     std::filesystem::remove_all(dir);
     std::printf("OK\n");

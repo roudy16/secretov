@@ -28,14 +28,19 @@ bool is_identifier(const std::string& s) {
     return true;
 }
 
-// ponytail: deny-list ceiling. Names that make a child process (or a nested
-// secretov) load attacker-chosen code or config; anything not listed here
-// still passes. Upgrade path is an allow-list per project if this leaks.
+// ponytail: deny-list ceiling. Names that make a child process, any program it
+// spawns, or a nested secretov load attacker-chosen code or config (PATH picks
+// every grandchild's programs, HOME/XDG_* pick their config); anything not
+// listed here still passes. Upgrade path is an allow-list per project if this leaks.
 bool is_denied_env_name(const std::string& name) {
-    static const char* const kDeniedPrefixes[] = {"LD_", "DYLD_", "SECRETOV_"};
+    static const char* const kDeniedPrefixes[] = {"LD_", "DYLD_", "SECRETOV_", "GIT_", "XDG_"};
     static const char* const kDeniedNames[] = {
-        "BASH_ENV",   "ENV",      "IFS",     "NODE_OPTIONS",      "PYTHONSTARTUP",   "PYTHONPATH",
-        "PERL5OPT",   "PERL5LIB", "RUBYOPT", "JAVA_TOOL_OPTIONS", "GIT_SSH_COMMAND", "GIT_EXEC_PATH"};
+        "PATH",          "HOME",         "BASH_ENV",          "ENV",        "IFS",
+        "PROMPT_COMMAND", "PS1",         "PS4",               "ZDOTDIR",    "PAGER",
+        "PSQL_PAGER",    "MANPAGER",     "LESSOPEN",          "LESSCLOSE",  "EDITOR",
+        "VISUAL",        "GCONV_PATH",   "NODE_OPTIONS",      "NODE_PATH",  "PYTHONSTARTUP",
+        "PYTHONPATH",    "PYTHONHOME",   "PERL5OPT",          "PERL5LIB",   "RUBYOPT",
+        "RUBYLIB",       "JAVA_TOOL_OPTIONS"};
     for (const char* prefix : kDeniedPrefixes) {
         if (name.compare(0, std::strlen(prefix), prefix) == 0) return true;
     }

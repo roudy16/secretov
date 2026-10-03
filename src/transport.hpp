@@ -20,7 +20,8 @@ public:
     Connection& operator=(Connection&& other) noexcept;
 
     // nullopt on EOF, error, or a line exceeding max_line_bytes (the peer is
-    // then dropped). Consumed bytes are zeroed in the receive buffer.
+    // then dropped). Consumed bytes are zeroed in the receive buffer, and the
+    // whole allocation is zeroed on destruction.
     std::optional<std::string> read_line(std::size_t max_line_bytes);
     bool write_line(const std::string& line);
     uid_t peer_uid() const;
