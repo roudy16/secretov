@@ -5,8 +5,11 @@ client, and service scripts, evaluated against the threat model in DESIGN.md.
 Finding 9 re-reviewed and closed out 2026-09-07. Findings 11–34 come from a
 second review against the deployed host (2026-10-03, tagged with the review's
 ids M1…I5), which also corrected 2, 3, 5, 9a and 10. A verification pass over
-those fixes (same day) reopened and closed gaps in 13, 17, 20, 21, 23, 28 and
-29; each carries a "verification pass" note.
+those fixes (same day, 43219db) closed gaps in 13, 17, 20, 21 and 28,
+accepted the concurrent-start case of 23, and corrected 29's rationale; each
+carries a "verification pass" note. A second verification pass (same day,
+7f36a00) closed further gaps in 11, 13 and 21, each under a "second
+verification pass" note.
 Kept as a worklist: items below may be addressed in future sessions. Status
 values: `open`, `open (host)` (owner action on the machine, not code),
 `accepted` (documented ceiling, no fix planned), `done`.
@@ -191,7 +194,7 @@ head while the daemon is down. `secretov passwd` must be followed by
 `scripts/service passphrase` or the next login fails to unlock and gives up
 after the unit's start limit.
 
-### 11. Manifest discovery trusts any `.secretov.yaml` up to `/` (M1) — `done` (2026-10-03, 7399ba7)
+### 11. Manifest discovery trusts any `.secretov.yaml` up to `/` (M1) — `done` (2026-10-03, 7399ba7, 7f36a00)
 
 `find_manifest_upward` used `exists()` only and `load_manifest` did no stat,
 so another UID could plant a manifest in `/tmp` or in a group-writable
@@ -203,6 +206,14 @@ or group/world-writable; the error names the path and the `chmod g-w,o-w`
 fix. The upward walk stops at the first directory you do not own, and a bad
 nearer manifest is an error, never skipped for an ancestor. Applies to `-p`
 registry manifests and `import` too.
+
+Second verification pass: `import` checked the directory only when the
+manifest already existed, so a first `import -p` under a 0002 umask stored
+the secrets and wrote the manifest into a group-writable dir, which the next
+`exec` refused. It also treated a dangling `.secretov.yaml` symlink as absent
+and replaced it with a regular file. Now a manifest about to be created has
+its directory checked before anything is stored, and existence is tested
+without following symlinks, so a dangling link fails as it does for `exec`.
 
 ### 12. Workspace writable by another account (M2) — `open (host)`
 
@@ -225,7 +236,7 @@ chmod runs: `blueowl/.secretov.yaml` and `wed_photo/.secretov.yaml` are 0664,
 and all four project dirs under `~/workspace/roudy16` (blueowl, wed_photo,
 homecloud, homestat) are 0775. The `chmod -R` above fixes all of them.
 
-### 13. Secret values in shell history; interactive `set` echoed (M3) — `done` (2026-10-03, afa8352)
+### 13. Secret values in shell history; interactive `set` echoed (M3) — `done` (2026-10-03, afa8352, 43219db, 7f36a00)
 
 The docs showed `printf 'value' | secretov set KEY`, writing the value to
 shell history (plaintext on an unencrypted disk), and `set` on a tty read
@@ -241,6 +252,17 @@ trailing partial line counts), restores the terminal with TCSAFLUSH, and fails
 with `more input followed the line` when there was any; nothing reaches the
 shell (smoke test pastes three lines). The docs' `read -rs` stripped leading
 and trailing blanks from the value; they now use `IFS= read -rs`.
+
+Second verification pass: TCSAFLUSH discards only what is queued, and the tty
+queue holds ~4 KiB, so the terminal wrote the rest of a longer paste (an
+RSA-8192 or full-chain PEM) after secretov exited and the shell ran it. The
+prompt now drains until the line is quiet for 100 ms (`ponytail:` 1 MiB cap)
+before flushing; the smoke test pastes 9.6 KiB from a blocking writer. A paste
+whose chunks arrive more than 100 ms apart can still slip past (the detection
+window). The terminal also silently cut a line at 4095 bytes, so a long tty
+value was stored truncated with exit 0; a tty line that long is now refused.
+And a stray Enter at the `set` prompt stored an empty value over an existing
+key; an empty tty `set` value is now refused (a piped one still works).
 
 ### 14. Backup-verify recipe sent the passphrase to shell history (M4) — `done` (2026-10-03, afa8352)
 
@@ -266,7 +288,7 @@ See #10(a). Fix is a design change: a random machine-local unlock key in a
 second wrap slot, stored in the keyring instead of the passphrase —
 revocable on its own and useless against backups taken before it existed.
 
-### 17. Passphrase retained in daemon memory (L3) — `done` (2026-10-03, afa8352)
+### 17. Passphrase retained in daemon memory (L3) — `done` (2026-10-03, afa8352, 43219db)
 
 DESIGN.md and "What holds up" claimed the daemon never retained the
 passphrase, but `std::getline(std::cin)` left it in glibc's unscrubbed stdin
@@ -294,7 +316,7 @@ successful write, leaving the keyring copy stale. Fixed: both build the new
 key and header as candidates, persist, and only then adopt them; on failure
 nothing changes.
 
-### 20. No parent-directory fsync after rename (L6) — `done` (2026-10-03, afa8352)
+### 20. No parent-directory fsync after rename (L6) — `done` (2026-10-03, afa8352, 43219db)
 
 A power loss could roll back an acknowledged `set`/`delete`/`passwd`.
 `write_file_atomic` now fsyncs the parent directory after the rename.
@@ -306,7 +328,7 @@ it was unchanged. A failure past the rename is now a stderr warning
 (durability best-effort, `ponytail:` in code); paths_test injects it with a
 0300 directory.
 
-### 21. Manifest env names and `exec` program lookup (L7) — `done` (2026-10-03, 7399ba7); cross-scope `key:` `accepted`
+### 21. Manifest env names and `exec` program lookup (L7) — `done` (2026-10-03, 7399ba7, 43219db, 7f36a00); cross-scope `key:` `accepted`
 
 `vars:` could set `PATH`, `LD_PRELOAD`, `BASH_ENV`, ..., and `PATH` was
 applied before `execvp`, so a manifest could choose which `psql` ran. Fixed:
@@ -329,6 +351,17 @@ scripts (lost with `execv`). `--secret KEY=VAR` on the command
 line is not filtered (your own argv). A manifest `key:` naming another
 project's scope is accepted under ceiling #1: since finding 11 a manifest is
 only read if you own it and nobody else can write it.
+
+Second verification pass: siblings of denied names still passed — `PERLLIB`,
+`JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `PYTHONUSERBASE` (runs the user site's
+`.pth` files), `PSQLRC` (psql `\!` at connect), `SSH_ASKPASS` with
+`SSH_ASKPASS_REQUIRE`, `KUBECONFIG` (exec credential plugins) and
+`AWS_CONFIG_FILE` (`credential_process`) — and proxy/CA overrides let a
+manifest intercept the child's secret-bearing requests. All now denied:
+those names, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in both cases,
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+`NODE_EXTRA_CA_CERTS`. `NO_PROXY` stays allowed: it can only bypass a proxy,
+not redirect traffic.
 
 ### 22. Client never authenticated the daemon end (L8) — `done` (2026-10-03, afa8352)
 
@@ -377,7 +410,7 @@ decoded to `t`. Now: a duplicate key is an error naming both lines; double
 quotes decode `\n \t \r \\ \"` and any other escape is an error; stripping an
 unquoted ` #...` comment prints a warning naming the line and key.
 
-### 28. Vendored dependency bumps never reached a checkout (L14) — `done` (2026-10-03, 295fec5, eeb441a)
+### 28. Vendored dependency bumps never reached a checkout (L14) — `done` (2026-10-03, 295fec5, eeb441a, 43219db)
 
 get-deps.sh only checked that files existed, and `update` never ran it.
 Now each artifact has a version+digest `.stamp` and is refetched when it
@@ -390,7 +423,8 @@ system libsodium), and checkouts from before 295fec5 have no stamps, so their
 first `install`/`update` always refetches. Now json.hpp is fetched to a
 temporary name and libsodium's old tree is removed only after the new one
 built; a failed fetch keeps both. README notes that the first run after
-295fec5 needs network and takes minutes.
+295fec5 (`just setup` or `scripts/service install|update`) needs network and
+takes minutes.
 
 ### 29. Unit set only NoNewPrivileges (L15) — `done` (2026-10-03, eeb441a); namespace options `accepted`
 

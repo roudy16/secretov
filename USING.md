@@ -119,8 +119,11 @@ is world-readable via `/proc/<pid>/cmdline`. On a terminal, `set` prompts
 whole (multi-line values work). Never paste a multi-line value (a PEM key, a
 cert) at the prompt: `set` fails with `more input followed the line` and
 discards the rest so it never reaches your shell; pipe it instead
-(`secretov set K < key.pem`). Prompted input (passphrases and the `set`
-prompt) is capped at 4096 bytes per line; pipe longer `set` values. From a
+(`secretov set K < key.pem`). The terminal silently cuts a line at 4095
+bytes, so a prompted line that long is refused; pipe longer `set` values
+(piped passphrase lines are capped at 4096 bytes). An empty line at the `set`
+prompt is refused too, so a stray Enter never blanks a key; pipe an empty
+value if you mean it. From a
 script, read the value into a variable first so it never lands in shell
 history:
 
@@ -189,8 +192,9 @@ one that nobody else can change:
   `set -p/-e`, `import`, `--dry-run`, including `-p` registry lookups)
   refuses with the fix, e.g.
   `refusing manifest directory '/path': writable by group or others; fix with: chmod g-w,o-w '/path'`.
-  A default umask of 0002 makes new project dirs group-writable; run the
-  `chmod` it prints.
+  An `import` that would create the manifest checks its directory the same
+  way before storing anything. A default umask of 0002 makes new project dirs
+  group-writable; run the `chmod` it prints.
 - **Discovery** walks up from the current directory only through directories
   you own, so a manifest in `/tmp`, `/home`, or `/` is never picked up. A bad
   nearer manifest is an error; secretov never falls back to one further up.
@@ -199,9 +203,14 @@ one that nobody else can change:
   `IFS`, `PROMPT_COMMAND`, `PS1`, `PS4`, `ZDOTDIR`, `PAGER`, `PSQL_PAGER`,
   `MANPAGER`, `LESSOPEN`, `LESSCLOSE`, `EDITOR`, `VISUAL`, `GCONV_PATH`,
   `NODE_OPTIONS`, `NODE_PATH`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`,
-  `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, or `JAVA_TOOL_OPTIONS` — they
-  make the child (or anything it runs) load code or config the manifest
-  picks. `--secret KEY=VAR` on your own command line is not filtered.
+  `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`, `JAVA_TOOL_OPTIONS`,
+  `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `PYTHONUSERBASE`, `PSQLRC`,
+  `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `KUBECONFIG`, or `AWS_CONFIG_FILE` —
+  they make the child (or anything it runs) load code or config the manifest
+  picks — nor the proxy and CA overrides `HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY` (either case), `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, or `NODE_EXTRA_CA_CERTS`, which
+  would let it intercept the child's requests. `--secret KEY=VAR` on your own command line is not filtered.
 - **Program lookup.** `exec` finds the command on *your* `PATH` (a manifest
   cannot set `PATH`).
 

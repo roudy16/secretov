@@ -124,8 +124,10 @@ whole stream when piped), never an argv argument, which would leak the secret
 via `/proc/<pid>/cmdline` to other UIDs. Tty prompts refuse to run from a
 background process group, where the typed line would land in the shell, and
 fail (discarding the input) when more input follows the line, so the rest of a
-multi-line paste never reaches the shell either. Every prompted or stdin
-passphrase line, and a tty `set` value, is capped at 4096 bytes.
+multi-line paste never reaches the shell either; they drain a paste longer
+than the tty queue before flushing. A tty line of 4095 bytes or more is
+refused (the terminal silently truncates there), as is an empty tty `set`
+value; a piped passphrase line is capped at 4096 bytes.
 No client-side caching — the daemon is a local socket away.
 
 ## Scopes: projects, environments, manifests
@@ -207,7 +209,8 @@ owned by the caller and not group/world-writable, and its directory (and a
 symlink target's) owned by the caller or root and not group/world-writable;
 anything else is refused with the `chmod` fix, never skipped for an ancestor.
 `vars:` keys and `env_var_name` reject a deny list of names that make the
-child or anything it spawns load code or config (`LD_*`, `DYLD_*`,
+child or anything it spawns load code or config, or redirect its traffic
+through a proxy or CA of the manifest's choosing (`LD_*`, `DYLD_*`,
 `SECRETOV_*`, `GIT_*`, `XDG_*`, `PATH`, `HOME`, `BASH_ENV`, `PAGER`,
 `NODE_OPTIONS`, ...; full list in manifest.cpp and USING.md — a deny list, so
 a ceiling). With `PATH` denied, `exec` finds the program on the caller's own
