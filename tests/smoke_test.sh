@@ -33,6 +33,44 @@ fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 printf '%s\n' "$PASS" | "$BIN" init >/dev/null || fail "init"
 [ -f "$TOKEN" ] || fail "token file not created"
 [ "$(stat -c %a "$XDG_DATA_HOME/secretov")" = "700" ] || fail "store dir not 0700"
+# secret lines are capped (fixed buffer, never reallocated)
+LONG_ERR="$(head -c 5000 /dev/zero | tr '\0' a | "$BIN" init 2>&1)" && fail "over-long passphrase accepted"
+echo "$LONG_ERR" | grep -q "longer than 4096 bytes" || fail "long passphrase message: $LONG_ERR"
+
+# 1b. daemon on a tty but in a background process group fails fast instead of
+# stopping on SIGTTOU (the passphrase would then be typed into the shell).
+python3 - "$BIN" <<'PY' || fail "background daemon on a tty did not fail fast"
+import os, pty, sys, time
+pid, fd = pty.fork()
+if pid == 0:
+    child = os.fork()
+    if child == 0:
+        os.setpgid(0, 0)
+        os.execv(sys.argv[1], [sys.argv[1], "daemon"])
+    os.setpgid(child, child)
+    status = None
+    for _ in range(50):
+        done, st = os.waitpid(child, os.WNOHANG | os.WUNTRACED)
+        if done:
+            status = st
+            break
+        time.sleep(0.1)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    if not ok:
+        os.kill(child, 9)
+    os._exit(0 if ok else 3)
+out = b""
+while True:
+    try:
+        chunk = os.read(fd, 1024)
+    except OSError:
+        break
+    if not chunk:
+        break
+    out += chunk
+_, status = os.waitpid(pid, 0)
+sys.exit(0 if os.WEXITSTATUS(status) == 0 and b"foreground" in out else "got %r" % out)
+PY
 
 # 2. daemon in background; wait for socket
 printf '%s\n' "$PASS" | "$BIN" daemon >"$WORK/daemon.log" 2>&1 &
@@ -44,12 +82,63 @@ for _ in $(seq 1 100); do
 done
 [ -S "$SOCK" ] || fail "socket did not appear"
 
+# 2b. a second daemon is refused and leaves the first one's socket alone
+SECOND_ERR="$(printf '%s\n' "$PASS" | timeout 5 "$BIN" daemon 2>&1)" && fail "second daemon should be refused"
+echo "$SECOND_ERR" | grep -q "already running" || fail "second daemon message: $SECOND_ERR"
+[ -S "$SOCK" ] || fail "second daemon removed the live socket"
+"$BIN" list >/dev/null || fail "first daemon unreachable after a second start attempt"
+
+# 2c. clients are non-dumpable (no core dumps of tokens/values); a non-dumpable
+# process's /proc files are owned by root rather than by us.
+{ sleep 3; } 2>/dev/null | "$BIN" set DUMPCHK &
+SET_PID=$!
+DUMPABLE_OFF=""
+for _ in $(seq 1 50); do
+    owner="$(stat -c %u "/proc/$SET_PID/environ" 2>/dev/null || true)"
+    [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] && { DUMPABLE_OFF=1; break; }
+    sleep 0.1
+done
+kill "$SET_PID" 2>/dev/null || true
+wait "$SET_PID" 2>/dev/null || true
+[ -n "$DUMPABLE_OFF" ] || fail "client process is still dumpable"
+
 # 3. set/get round-trip (set reads value from stdin only), list, delete
 printf '%s' "bar" | "$BIN" set FOO
 [ "$("$BIN" get FOO)" = "bar" ] || fail "get after set (stdin)"
 # argv VALUE form is rejected (would leak the secret via /proc/<pid>/cmdline)
 if "$BIN" set BADKEY somevalue 2>/dev/null; then fail "argv-form 'set KEY VALUE' should fail"; fi
 printf '%s' "s3cr3t-value" | "$BIN" set VIA_STDIN
+# piped stdin is read whole: multi-line values survive
+printf 'line1\nline2\n' | "$BIN" set MULTI
+[ "$("$BIN" get MULTI)" = "$(printf 'line1\nline2')" ] || fail "multi-line piped set"
+# on a tty, set prompts with echo off and reads one line
+python3 - "$BIN" <<'PY' || fail "tty set"
+import os, pty, select, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1], "set", "TTY_KEY"])
+out = b""
+while b"Value for TTY_KEY" not in out:
+    if not select.select([fd], [], [], 5)[0]:
+        sys.exit("no prompt: %r" % out)
+    out += os.read(fd, 1024)
+os.write(fd, b"tty-secret\n")
+while True:
+    if not select.select([fd], [], [], 5)[0]:
+        os.kill(pid, 9)
+        sys.exit("set did not finish after one line: %r" % out)
+    try:
+        chunk = os.read(fd, 1024)
+    except OSError:
+        break
+    if not chunk:
+        break
+    out += chunk
+_, status = os.waitpid(pid, 0)
+if os.WEXITSTATUS(status) != 0 or b"tty-secret" in out:
+    sys.exit("status %d, output %r" % (status, out))
+PY
+[ "$("$BIN" get TTY_KEY)" = "tty-secret" ] || fail "tty set value"
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after set (stdin)"
 "$BIN" list | grep -qx FOO || fail "list missing FOO"
 "$BIN" list | grep -qx VIA_STDIN || fail "list missing VIA_STDIN"
@@ -77,6 +166,10 @@ if printf 'wrong\n%s\n' "$NEWPASS" | "$BIN" passwd >/dev/null 2>&1; then
 fi
 printf '%s\n%s\n' "$PASS" "$NEWPASS" | "$BIN" passwd >/dev/null || fail "passwd"
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after passwd"
+# a short new passphrase is accepted with a warning
+SHORT_OUT="$(printf '%s\n%s\n' "$NEWPASS" "short" | "$BIN" passwd 2>&1)" || fail "passwd to short"
+echo "$SHORT_OUT" | grep -q "shorter than 12" || fail "no short-passphrase warning: $SHORT_OUT"
+printf '%s\n%s\n' "short" "$NEWPASS" | "$BIN" passwd >/dev/null 2>&1 || fail "passwd back from short"
 kill -TERM "$DAEMON_PID"
 wait "$DAEMON_PID" 2>/dev/null || true
 for _ in $(seq 1 50); do
@@ -179,6 +272,13 @@ printf 'LATER=x\n' > "$PROJ/.env"
 grep -q "LOG_LEVEL: debug" "$PROJ/.secretov.yaml" || fail "import clobbered the vars block"
 OUT="$(cd "$PROJ" && "$BIN" exec -e dev -- sh -c 'printf "%s|%s" "$LOG_LEVEL" "$LATER"')"
 [ "$OUT" = "debug|x" ] || fail "post-import injection got '$OUT'"
+# a scope whose values total more than the daemon's 1 MiB request cap still
+# fetches: the client's response cap is far larger
+head -c 700000 /dev/zero | tr '\0' x | "$BIN" set dev/demo/BIG1 || fail "set BIG1"
+head -c 700000 /dev/zero | tr '\0' y | "$BIN" set dev/demo/BIG2 || fail "set BIG2"
+( cd "$PROJ" && "$BIN" exec -e dev -- true ) || fail "exec with a >1 MiB scope"
+"$BIN" delete dev/demo/BIG1
+"$BIN" delete dev/demo/BIG2
 
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"

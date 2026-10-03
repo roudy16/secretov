@@ -5,6 +5,7 @@
 // used by main, the daemon, and the client.
 
 #include <fcntl.h>
+#include <sodium.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -111,7 +112,8 @@ inline std::string read_file_string(const std::string& path) {
     return ss.str();
 }
 
-// Atomic write via tmp + fsync + rename, mirroring Store::persist.
+// Atomic write via tmp + fsync + rename + parent-dir fsync (without the last,
+// a power cut can roll the rename back after we reported success).
 inline void write_file_atomic(const std::string& path, const std::string& contents, mode_t mode) {
     ensure_parent_dir(path);
     std::string tmp = path + ".tmp";
@@ -147,34 +149,88 @@ inline void write_file_atomic(const std::string& path, const std::string& conten
         ::unlink(tmp.c_str());
         throw std::runtime_error("rename '" + tmp + "' -> '" + path + "': " + std::strerror(e));
     }
+    std::string dir = std::filesystem::path(path).parent_path().string();
+    if (dir.empty()) dir = ".";
+    int dir_fd = ::open(dir.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        throw std::runtime_error("open dir '" + dir + "' for fsync: " + std::strerror(errno));
+    }
+    if (::fsync(dir_fd) != 0) {
+        int e = errno;
+        ::close(dir_fd);
+        throw std::runtime_error("fsync dir '" + dir + "': " + std::strerror(e));
+    }
+    ::close(dir_fd);
 }
 
-// Read a passphrase. On a tty: prompt on stderr, disable echo (restored after).
-// Otherwise: read one line from stdin (enables scripted testing). Empty errors.
-inline std::string read_passphrase(const std::string& prompt) {
-    std::string line;
-    if (::isatty(STDIN_FILENO)) {
-        std::cerr << prompt << std::flush;
-        termios old_termios{};
-        bool have_termios = ::tcgetattr(STDIN_FILENO, &old_termios) == 0;
-        if (have_termios) {
+// Read one secret line from stdin. On a tty: prompt on stderr with echo off
+// (restored after). Otherwise: read one line (enables scripted use). Bytes go
+// straight from ::read into a pre-reserved buffer: no stdio buffer or string
+// reallocation keeps an unscrubbed copy, and nothing past the newline is
+// consumed, so successive calls can read successive lines of one pipe.
+inline std::string read_secret_line(const std::string& prompt) {
+    // ponytail: fixed line cap so the buffer never reallocates; the tty line
+    // discipline caps canonical input at 4 KiB anyway.
+    constexpr std::size_t kMaxSecretLineBytes = 4096;
+    const bool on_tty = ::isatty(STDIN_FILENO);
+    termios old_termios{};
+    bool echo_disabled = false;
+    if (on_tty) {
+        // A background job touching the terminal gets SIGTTOU/SIGTTIN and
+        // stops; the user's next typed line then lands in the shell (and its
+        // history) instead of here.
+        pid_t foreground_pgrp = ::tcgetpgrp(STDIN_FILENO);
+        if (foreground_pgrp != -1 && foreground_pgrp != ::getpgrp()) {
+            throw std::runtime_error(
+                "cannot prompt from a background process; run it in the foreground "
+                "or pipe the input on stdin");
+        }
+        if (::tcgetattr(STDIN_FILENO, &old_termios) == 0) {
             termios no_echo = old_termios;
             no_echo.c_lflag &= ~static_cast<tcflag_t>(ECHO);
-            ::tcsetattr(STDIN_FILENO, TCSANOW, &no_echo);
+            echo_disabled = ::tcsetattr(STDIN_FILENO, TCSANOW, &no_echo) == 0;
         }
-        std::getline(std::cin, line);
-        if (have_termios) {
-            ::tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
+        std::cerr << prompt << std::flush;
+    }
+    std::string line;
+    line.reserve(kMaxSecretLineBytes);
+    bool too_long = false;
+    int read_errno = 0;
+    for (;;) {
+        char byte;
+        ssize_t n = ::read(STDIN_FILENO, &byte, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) read_errno = errno;
+        if (n <= 0 || byte == '\n') break;
+        if (line.size() == kMaxSecretLineBytes) {
+            too_long = true;
+            break;
         }
-        std::cerr << "\n";
-    } else {
-        std::getline(std::cin, line);
+        line.push_back(byte);
+    }
+    if (echo_disabled) {
+        ::tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
+    }
+    if (on_tty) std::cerr << "\n";
+    if (read_errno != 0 || too_long) {
+        sodium_memzero(line.data(), line.size());
+        if (too_long) {
+            throw std::runtime_error("input line longer than " +
+                                     std::to_string(kMaxSecretLineBytes) + " bytes");
+        }
+        throw std::runtime_error(std::string("read stdin: ") + std::strerror(read_errno));
     }
     if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.empty()) {
+    return line;
+}
+
+// read_secret_line, but an empty passphrase is an error.
+inline std::string read_passphrase(const std::string& prompt) {
+    std::string passphrase = read_secret_line(prompt);
+    if (passphrase.empty()) {
         throw std::runtime_error("empty passphrase");
     }
-    return line;
+    return passphrase;
 }
 
 // Strip trailing whitespace/newlines (used when reading the token file).

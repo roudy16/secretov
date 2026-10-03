@@ -1,3 +1,7 @@
+#include <sys/prctl.h>
+
+#include <cerrno>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <string>
@@ -33,6 +37,13 @@ void print_usage(std::ostream& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Every command holds a token, passphrase, or secret values at some point;
+    // none may land in a core dump. execve resets this for `exec` children.
+    if (::prctl(PR_SET_DUMPABLE, 0) != 0) {
+        std::cerr << "secretov: prctl(PR_SET_DUMPABLE) failed: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
     if (argc < 2) {
         print_usage(std::cerr);
         return 2;

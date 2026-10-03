@@ -23,6 +23,17 @@
 
 namespace secretov {
 
+namespace {
+
+// ponytail: fixed 64 MiB response cap (getprefix returns a whole scope's
+// values); far above the daemon's 1 MiB request cap so a scope can outgrow
+// any single value. Stream getprefix if scopes ever get this big.
+constexpr std::size_t kMaxResponseBytes = 64 << 20;
+
+constexpr std::size_t kRecommendedMinPassphraseChars = 12;
+
+}  // namespace
+
 DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
     token_ = rstrip(read_file_string(paths.token));
     if (token_.empty()) {
@@ -37,10 +48,16 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     if (!conn) {
         throw std::runtime_error("daemon not running at " + socket_path_ + " ?");
     }
+    // Authenticate the daemon end before the token or any passphrase leaves us.
+    uid_t daemon_uid = conn->peer_uid();
+    if (daemon_uid != ::getuid()) {
+        throw std::runtime_error("socket " + socket_path_ + " is served by uid " +
+                                 std::to_string(daemon_uid) + ", not ours; refusing to send");
+    }
     if (!conn->write_line(full.dump())) {
         throw std::runtime_error("failed to send request to daemon");
     }
-    auto line = conn->read_line();
+    auto line = conn->read_line(kMaxResponseBytes);
     if (!line) {
         throw std::runtime_error("daemon closed connection without responding");
     }
@@ -79,6 +96,13 @@ std::string read_stdin_value() {
     if (!value.empty() && value.back() == '\n') value.pop_back();
     if (!value.empty() && value.back() == '\r') value.pop_back();
     return value;
+}
+
+void warn_if_short_passphrase(const std::string& passphrase) {
+    if (passphrase.size() < kRecommendedMinPassphraseChars) {
+        std::cerr << "secretov: warning: new passphrase is shorter than "
+                  << kRecommendedMinPassphraseChars << " characters\n";
+    }
 }
 
 std::map<std::string, std::string> fetch_prefix(const DaemonClient& client, const std::string& prefix) {
@@ -197,6 +221,7 @@ int cmd_init() {
                 return 1;
             }
         }
+        warn_if_short_passphrase(passphrase);
 
         ensure_parent_dir(paths.store);
         Store::create(paths.store, passphrase, static_cast<std::uint64_t>(std::time(nullptr)));
@@ -262,7 +287,10 @@ int cmd_set(int argc, char** argv) {
             ResolvedScope resolved = resolve_scope(paths, scope);
             key = scoped_key(resolved.env, resolved.project, name);
         }
-        DaemonClient(paths).request("set", key, read_stdin_value());
+        // A tty gets a no-echo single-line prompt; a pipe is read whole (multi-line values).
+        std::string value =
+            ::isatty(STDIN_FILENO) ? read_secret_line("Value for " + key + ": ") : read_stdin_value();
+        DaemonClient(paths).request("set", key, value);
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
         return 1;
@@ -332,6 +360,7 @@ int cmd_passwd() {
                 return 1;
             }
         }
+        warn_if_short_passphrase(new_pass);
         DaemonClient(paths).request_raw(nlohmann::json{{"op", "passwd"}, {"old", old_pass}, {"new", new_pass}});
         std::cout << "passphrase changed\n";
     } catch (const std::exception& e) {

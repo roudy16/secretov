@@ -2,6 +2,7 @@
 
 #include <sys/types.h>
 
+#include <cstddef>
 #include <optional>
 #include <string>
 
@@ -18,18 +19,23 @@ public:
     Connection(Connection&& other) noexcept;
     Connection& operator=(Connection&& other) noexcept;
 
-    std::optional<std::string> read_line();
+    // nullopt on EOF, error, or a line exceeding max_line_bytes (the peer is
+    // then dropped). Consumed bytes are zeroed in the receive buffer.
+    std::optional<std::string> read_line(std::size_t max_line_bytes);
     bool write_line(const std::string& line);
     uid_t peer_uid() const;
 
 private:
     int fd_;
     std::string buffer_;
+    std::size_t scanned_ = 0;  // buffer_ prefix already searched for '\n'
 };
 
 // Unix socket listener. The only transport secretov has or plans to have.
 class Listener {
 public:
+    // Refuses (throws) when a live daemon already answers at `path`; only a
+    // stale socket is unlinked.
     explicit Listener(const std::string& path);
     ~Listener();
 
@@ -38,11 +44,22 @@ public:
 
     std::optional<Connection> accept();
 
+    // Identity of the socket inode this listener bound; the path is unlinked
+    // on exit only while it still names that inode.
+    dev_t bound_dev() const { return bound_dev_; }
+    ino_t bound_ino() const { return bound_ino_; }
+
 private:
     int fd_;
     std::string path_;
+    dev_t bound_dev_ = 0;
+    ino_t bound_ino_ = 0;
 };
 
 std::optional<Connection> connect_unix(const std::string& path);
+
+// Unlink `path` only if it still names the inode (dev, ino). Async-signal-safe
+// (lstat + unlink only), so the daemon's signal handler can use it.
+void unlink_if_same_inode(const char* path, dev_t dev, ino_t ino);
 
 }  // namespace secretov

@@ -86,6 +86,9 @@ add_test(NAME store_test COMMAND store_test)
 add_executable(manifest_test tests/manifest_test.cpp)
 target_link_libraries(manifest_test PRIVATE secretov_core)
 add_test(NAME manifest_test COMMAND manifest_test)
+add_executable(paths_test tests/paths_test.cpp)
+target_link_libraries(paths_test PRIVATE secretov_core)
+add_test(NAME paths_test COMMAND paths_test)
 
 add_test(NAME smoke_test
   COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_test.sh $<TARGET_FILE:secretov>)

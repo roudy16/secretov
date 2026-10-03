@@ -25,17 +25,24 @@ namespace {
 
 constexpr int kRotateAfterDays = 30;  // fixed 30d, make a flag if anyone asks
 
+// Cap unterminated request growth; a peer that never sends '\n' gets dropped.
+constexpr std::size_t kMaxRequestBytes = 1 << 20;  // 1 MiB
+
 // Listener::accept() swallows EINTR, so a signal can't unwind the
 // accept loop. We unlink the socket and _exit from the handler instead.
 // No clean stack unwind on shutdown; OS reclaims the mlock'd key.
+// Set before the handler is installed, so the handler never sees them torn.
 char g_socket_path[512] = {};
+dev_t g_socket_dev = 0;
+ino_t g_socket_ino = 0;
 
 void on_signal(int) {
-    if (g_socket_path[0] != '\0') {
-        ::unlink(g_socket_path);
-    }
+    // Another daemon may have replaced the path since we bound it; leave theirs.
+    unlink_if_same_inode(g_socket_path, g_socket_dev, g_socket_ino);
     ::_exit(0);
 }
+
+void scrub(std::string& s) { sodium_memzero(s.data(), s.size()); }
 
 bool token_matches(const std::string& expected, const std::string& got) {
     if (expected.size() != got.size()) return false;
@@ -84,23 +91,30 @@ void serve_connection(Connection& conn, Store& store, const std::string& expecte
         conn.write_line(error_response("permission denied: peer uid mismatch"));
         return;
     }
-    while (auto line = conn.read_line()) {
+    while (auto line = conn.read_line(kMaxRequestBytes)) {
+        // ponytail: nlohmann::json's parse tree holds its own copies of the
+        // passphrase/value strings and frees them unscrubbed; scrubbing those
+        // needs a custom allocator or a hand-rolled parser.
         auto req = parse_request(*line);
+        scrub(*line);
         if (!req) {
             conn.write_line(error_response("malformed request"));
             continue;
         }
-        if (!token_matches(expected_token, req->token)) {
-            conn.write_line(error_response("invalid token"));
-            continue;
-        }
         std::string response;
-        try {
-            response = dispatch(store, *req, static_cast<std::uint64_t>(std::time(nullptr)));
-        } catch (const std::exception& e) {
-            std::cerr << "secretov: error handling '" << req->op << "': " << e.what() << "\n";
-            response = error_response(e.what());
+        if (!token_matches(expected_token, req->token)) {
+            response = error_response("invalid token");
+        } else {
+            try {
+                response = dispatch(store, *req, static_cast<std::uint64_t>(std::time(nullptr)));
+            } catch (const std::exception& e) {
+                std::cerr << "secretov: error handling '" << req->op << "': " << e.what() << "\n";
+                response = error_response(e.what());
+            }
         }
+        scrub(req->old_pass);
+        scrub(req->new_pass);
+        scrub(req->value);
         if (!conn.write_line(response)) {
             return;  // peer went away mid-write; drop the connection
         }
@@ -122,6 +136,13 @@ int run_daemon() {
     }
 
     Paths paths = resolve_paths();
+
+    // Fail before the passphrase prompt (and any auto-rotate, which would
+    // re-key the store under the running daemon). Listener re-checks at bind.
+    if (connect_unix(paths.socket)) {
+        std::cerr << "secretov: daemon already running at " << paths.socket << "\n";
+        return 1;
+    }
 
     std::string passphrase;
     try {
@@ -179,14 +200,19 @@ int run_daemon() {
     }
     std::strncpy(g_socket_path, paths.socket.c_str(), sizeof(g_socket_path) - 1);
 
+    Listener listener(paths.socket);
+    g_socket_dev = listener.bound_dev();
+    g_socket_ino = listener.bound_ino();
+
+    // Installed only after the globals above are final. A signal in the gap
+    // takes the default action and leaves a stale socket, which the next
+    // start removes.
     struct sigaction sa{};
     sa.sa_handler = on_signal;
     ::sigemptyset(&sa.sa_mask);
     ::sigaction(SIGINT, &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
     ::signal(SIGPIPE, SIG_IGN);
-
-    Listener listener(paths.socket);
     std::cerr << "secretov: listening on " << paths.socket << " (store " << paths.store << ")\n";
 
     for (;;) {

@@ -1,5 +1,6 @@
 #include "transport.hpp"
 
+#include <sodium.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -18,8 +19,9 @@ namespace {
     throw std::runtime_error(what + ": " + std::strerror(errno));
 }
 
-// Cap unterminated line growth; a peer that never sends '\n' gets dropped.
-constexpr std::size_t kMaxLineBytes = 1 << 20;  // 1 MiB
+// ponytail: lines past this reallocate the receive buffer, leaving unscrubbed
+// copies on the heap; requests carrying passphrases are far smaller.
+constexpr std::size_t kInitialBufferBytes = 64 << 10;
 
 // EINTR-safe read; -1 on real error, 0 on EOF, >0 bytes read otherwise.
 ssize_t read_retry(int fd, char* buf, size_t len) {
@@ -32,16 +34,17 @@ ssize_t read_retry(int fd, char* buf, size_t len) {
 
 }  // namespace
 
-Connection::Connection(int fd) : fd_(fd) {}
+Connection::Connection(int fd) : fd_(fd) { buffer_.reserve(kInitialBufferBytes); }
 
 Connection::~Connection() {
+    sodium_memzero(buffer_.data(), buffer_.size());
     if (fd_ >= 0) {
         ::close(fd_);
     }
 }
 
 Connection::Connection(Connection&& other) noexcept
-    : fd_(other.fd_), buffer_(std::move(other.buffer_)) {
+    : fd_(other.fd_), buffer_(std::move(other.buffer_)), scanned_(other.scanned_) {
     other.fd_ = -1;
 }
 
@@ -50,22 +53,28 @@ Connection& Connection::operator=(Connection&& other) noexcept {
         if (fd_ >= 0) {
             ::close(fd_);
         }
+        sodium_memzero(buffer_.data(), buffer_.size());
         fd_ = other.fd_;
         buffer_ = std::move(other.buffer_);
+        scanned_ = other.scanned_;
         other.fd_ = -1;
     }
     return *this;
 }
 
-std::optional<std::string> Connection::read_line() {
+std::optional<std::string> Connection::read_line(std::size_t max_line_bytes) {
     for (;;) {
-        auto newline_pos = buffer_.find('\n');
+        auto newline_pos = buffer_.find('\n', scanned_);
         if (newline_pos != std::string::npos) {
-            std::string line = buffer_.substr(0, newline_pos);
+            std::string line(buffer_.data(), newline_pos);
+            // The line may carry a passphrase (rotate/passwd); don't leave it behind.
+            sodium_memzero(buffer_.data(), newline_pos + 1);
             buffer_.erase(0, newline_pos + 1);
+            scanned_ = 0;
             return line;
         }
-        if (buffer_.size() > kMaxLineBytes) {
+        scanned_ = buffer_.size();
+        if (buffer_.size() > max_line_bytes) {
             return std::nullopt;
         }
 
@@ -79,6 +88,7 @@ std::optional<std::string> Connection::read_line() {
             return std::nullopt;
         }
         buffer_.append(chunk, static_cast<size_t>(n));
+        sodium_memzero(chunk, static_cast<size_t>(n));
     }
 }
 
@@ -110,12 +120,23 @@ uid_t Connection::peer_uid() const {
 }
 
 Listener::Listener(const std::string& path) : fd_(-1), path_(path) {
+    struct stat existing{};
+    if (::lstat(path_.c_str(), &existing) == 0) {
+        if (connect_unix(path_)) {
+            throw std::runtime_error("daemon already running at " + path_);
+        }
+        if (!S_ISSOCK(existing.st_mode)) {
+            throw std::runtime_error(path_ + " exists and is not a socket; refusing to remove it");
+        }
+        if (::unlink(path_.c_str()) != 0 && errno != ENOENT) {
+            throw_errno("unlink stale socket '" + path_ + "'");
+        }
+    }
+
     fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd_ < 0) {
         throw_errno("socket() failed");
     }
-
-    ::unlink(path_.c_str());
 
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -145,6 +166,16 @@ Listener::Listener(const std::string& path) : fd_(-1), path_(path) {
     }
     ::umask(old_umask);
 
+    struct stat bound{};
+    if (::lstat(path_.c_str(), &bound) != 0) {
+        std::string err = std::string("stat(") + path_ + ") failed: " + std::strerror(errno);
+        ::close(fd_);
+        ::unlink(path_.c_str());
+        throw std::runtime_error(err);
+    }
+    bound_dev_ = bound.st_dev;
+    bound_ino_ = bound.st_ino;
+
     if (::listen(fd_, SOMAXCONN) != 0) {
         std::string err = std::string("listen(") + path_ + ") failed: " + std::strerror(errno);
         ::close(fd_);
@@ -157,7 +188,7 @@ Listener::~Listener() {
     if (fd_ >= 0) {
         ::close(fd_);
     }
-    ::unlink(path_.c_str());
+    unlink_if_same_inode(path_.c_str(), bound_dev_, bound_ino_);
 }
 
 std::optional<Connection> Listener::accept() {
@@ -196,6 +227,13 @@ std::optional<Connection> connect_unix(const std::string& path) {
         return std::nullopt;
     }
     return Connection(fd);
+}
+
+void unlink_if_same_inode(const char* path, dev_t dev, ino_t ino) {
+    struct stat current{};
+    if (ino != 0 && ::lstat(path, &current) == 0 && current.st_dev == dev && current.st_ino == ino) {
+        ::unlink(path);
+    }
 }
 
 }  // namespace secretov
