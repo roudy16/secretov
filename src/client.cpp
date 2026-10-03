@@ -288,8 +288,17 @@ int cmd_set(int argc, char** argv) {
             key = scoped_key(resolved.env, resolved.project, name);
         }
         // A tty gets a no-echo single-line prompt; a pipe is read whole (multi-line values).
-        std::string value =
-            ::isatty(STDIN_FILENO) ? read_secret_line("Value for " + key + ": ") : read_stdin_value();
+        std::string value;
+        if (::isatty(STDIN_FILENO)) {
+            value = read_secret_line("Value for " + key + ": ");
+            // A stray Enter would otherwise silently overwrite the key with "".
+            if (value.empty()) {
+                throw std::runtime_error(
+                    "empty value on the terminal; nothing stored (pipe an empty value if you mean it)");
+            }
+        } else {
+            value = read_stdin_value();
+        }
         DaemonClient(paths).request("set", key, value);
     } catch (const std::exception& e) {
         std::cerr << "secretov: " << e.what() << "\n";
@@ -539,7 +548,9 @@ int cmd_import(int argc, char** argv) {
         }
         std::optional<Manifest> manifest;
         std::string manifest_text;
-        if (::access(manifest_path.c_str(), F_OK) == 0) {
+        // symlink_status: a dangling link must fail in read_manifest_text, not be
+        // replaced. It throws on any error other than "not found".
+        if (std::filesystem::exists(std::filesystem::symlink_status(manifest_path))) {
             manifest_text = read_manifest_text(manifest_path);
             manifest = parse_manifest(manifest_text, manifest_path);
             if (scope.project && manifest->project != project) {
@@ -547,6 +558,10 @@ int cmd_import(int argc, char** argv) {
                                          "', not '" + project + "'");
             }
             project = manifest->project;
+        } else {
+            // Check now: storing first and then writing an untrusted manifest
+            // would leave secrets that every later exec/import refuses.
+            require_trusted_manifest_dir(manifest_path);
         }
         std::string env = resolve_env(scope, manifest ? &*manifest : nullptr);
 

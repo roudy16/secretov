@@ -208,7 +208,8 @@ void test_manifest_trust() {
 
 void test_denied_env_names() {
     for (const char* name : {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "NODE_OPTIONS", "SECRETOV_ENV",
-                             "PAGER", "GIT_CONFIG_COUNT", "XDG_RUNTIME_DIR", "PATH", "HOME"}) {
+                             "PAGER", "GIT_CONFIG_COUNT", "XDG_RUNTIME_DIR", "PATH", "HOME", "PSQLRC",
+                             "https_proxy"}) {
         std::string as_var = std::string("name: p\nenv:\n  dev:\n    vars:\n      ") + name + ": x\n";
         assert(throws_with([&] { parse_manifest(as_var, "t"); }, "cannot be set from a manifest"));
         std::string as_secret =

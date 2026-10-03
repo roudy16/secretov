@@ -40,7 +40,13 @@ bool is_denied_env_name(const std::string& name) {
         "PSQL_PAGER",    "MANPAGER",     "LESSOPEN",          "LESSCLOSE",  "EDITOR",
         "VISUAL",        "GCONV_PATH",   "NODE_OPTIONS",      "NODE_PATH",  "PYTHONSTARTUP",
         "PYTHONPATH",    "PYTHONHOME",   "PERL5OPT",          "PERL5LIB",   "RUBYOPT",
-        "RUBYLIB",       "JAVA_TOOL_OPTIONS"};
+        "RUBYLIB",       "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "PERLLIB",
+        "PYTHONUSERBASE", "PSQLRC",       "SSH_ASKPASS",       "SSH_ASKPASS_REQUIRE",   "KUBECONFIG",
+        "AWS_CONFIG_FILE",
+        // Proxy and CA overrides let a manifest intercept the child's secret-bearing requests.
+        "HTTP_PROXY",    "http_proxy",    "HTTPS_PROXY",       "https_proxy",           "ALL_PROXY",
+        "all_proxy",     "SSL_CERT_FILE", "SSL_CERT_DIR",      "CURL_CA_BUNDLE",        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS"};
     for (const char* prefix : kDeniedPrefixes) {
         if (name.compare(0, std::strlen(prefix), prefix) == 0) return true;
     }
@@ -58,7 +64,7 @@ void require_manifest_env_name(const std::string& name, const std::string& path,
     if (is_denied_env_name(name)) {
         throw std::runtime_error("manifest '" + path + "': " + what +
                                  " cannot be set from a manifest (it can load code into the child "
-                                 "process or steer secretov)");
+                                 "process, redirect its traffic, or steer secretov)");
     }
 }
 
@@ -320,13 +326,17 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
     return m;
 }
 
+void require_trusted_manifest_dir(const std::string& manifest_path) {
+    require_trusted_dir(std::filesystem::path(manifest_path).parent_path());
+}
+
 std::string read_manifest_text(const std::string& path) {
     std::error_code ec;
     std::filesystem::path real = std::filesystem::canonical(path, ec);
     if (ec) throw std::runtime_error("manifest '" + path + "': " + ec.message());
     // Both the directory holding the name and, for a symlink, the one holding
     // the target: write access to either lets someone swap the content.
-    require_trusted_dir(std::filesystem::path(path).parent_path());
+    require_trusted_manifest_dir(path);
     if (real != std::filesystem::path(path)) require_trusted_dir(real.parent_path());
 
     int fd = ::open(real.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);

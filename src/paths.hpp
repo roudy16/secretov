@@ -163,15 +163,19 @@ inline void write_file_atomic(const std::string& path, const std::string& conten
 }
 
 // Read one secret line from stdin. On a tty: prompt on stderr with echo off
-// (restored after), and refuse (discarding it) any input queued past the line.
+// (restored after); refuse (discarding it) any input queued past the line, and
+// a line the terminal may have truncated.
 // Otherwise: read one line (enables scripted use). Bytes go
 // straight from ::read into a pre-reserved buffer: no stdio buffer or string
 // reallocation keeps an unscrubbed copy, and nothing past the newline is
 // consumed, so successive calls can read successive lines of one pipe.
 inline std::string read_secret_line(const std::string& prompt) {
-    // ponytail: fixed line cap so the buffer never reallocates; the tty line
-    // discipline caps canonical input at 4 KiB anyway.
+    // ponytail: fixed line cap so the buffer never reallocates.
     constexpr std::size_t kMaxSecretLineBytes = 4096;
+    // The canonical tty line discipline (N_TTY_BUF_SIZE 4096) keeps the first
+    // 4095 bytes of a line and silently drops the rest, so a line that long
+    // may be truncated.
+    constexpr std::size_t kMaxTtyLineBytes = 4095;
     const bool on_tty = ::isatty(STDIN_FILENO);
     termios old_termios{};
     bool echo_disabled = false;
@@ -212,25 +216,42 @@ inline std::string read_secret_line(const std::string& prompt) {
     if (echo_disabled) {
         // Lines after the first (a pasted PEM key) would otherwise reach the
         // shell once we exit: run as commands, saved to history. Briefly drop
-        // ICANON so a trailing partial line counts too, then restore with
-        // TCSAFLUSH, which discards whatever is still queued.
+        // ICANON so a trailing partial line counts too. The tty queue holds
+        // only ~4 KiB and the terminal writes the rest of a longer paste as we
+        // read, so drain until the line has been quiet for 100 ms, then
+        // restore with TCSAFLUSH, which discards whatever is still queued.
         termios peek = old_termios;
         peek.c_lflag &= ~static_cast<tcflag_t>(ECHO | ICANON);
         peek.c_cc[VMIN] = 0;
         peek.c_cc[VTIME] = 1;  // 100 ms: a paste can arrive in chunks
         if (::tcsetattr(STDIN_FILENO, TCSANOW, &peek) == 0) {
-            char leftover = 0;
-            tty_input_left = ::read(STDIN_FILENO, &leftover, 1) > 0;
-            sodium_memzero(&leftover, 1);
+            // ponytail: drain cap; past it the rest of an endless stream reaches the shell.
+            constexpr std::size_t kMaxDrainBytes = 1 << 20;
+            char drain_buffer[4096];
+            std::size_t drained_bytes = 0;
+            while (drained_bytes < kMaxDrainBytes) {
+                ssize_t n = ::read(STDIN_FILENO, drain_buffer, sizeof(drain_buffer));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                tty_input_left = true;
+                drained_bytes += static_cast<std::size_t>(n);
+            }
+            sodium_memzero(drain_buffer, sizeof(drain_buffer));
         }
         ::tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_termios);
     }
     if (on_tty) std::cerr << "\n";
-    if (read_errno != 0 || too_long || tty_input_left) {
+    const bool tty_truncated = on_tty && line.size() >= kMaxTtyLineBytes;
+    if (read_errno != 0 || too_long || tty_input_left || tty_truncated) {
         sodium_memzero(line.data(), line.size());
         if (too_long) {
             throw std::runtime_error("input line longer than " +
                                      std::to_string(kMaxSecretLineBytes) + " bytes");
+        }
+        if (tty_truncated) {
+            throw std::runtime_error("line may have been truncated by the terminal (" +
+                                     std::to_string(kMaxTtyLineBytes) +
+                                     "-byte limit); pipe long values on stdin instead");
         }
         if (tty_input_left) {
             throw std::runtime_error(

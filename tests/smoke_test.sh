@@ -141,38 +141,66 @@ if os.WEXITSTATUS(status) != 0 or b"tty-secret" in out:
     sys.exit("status %d, output %r" % (status, out))
 PY
 [ "$("$BIN" get TTY_KEY)" = "tty-secret" ] || fail "tty set value"
-# a multi-line paste at the tty prompt fails and leaves nothing queued for the
-# shell, which would run the secret lines as commands
-python3 - "$BIN" <<'PY' || fail "tty multi-line paste"
-import os, pty, select, sys
+# Run `set KEY` on a pty and type PAYLOAD_FILE's bytes in one blocking write,
+# as a terminal emulator pastes; once quiet, type "marker". Passes when set
+# exits 1 with EXPECTED in its output and the shell's next `read` gets only the
+# marker: nothing of the payload reached the shell (which would run it as
+# commands and save it to history).
+tty_set_refused() {
+    python3 - "$BIN" "$@" <<'PY'
+import os, pty, select, sys, threading, time
+binary, key, payload_path, expected = sys.argv[1:5]
+payload = open(payload_path, "rb").read()
 pid, fd = pty.fork()
 if pid == 0:
-    script = '"$0" set PASTED; s=$?; IFS= read -r rest; echo "STATUS=$s LEFTOVER=[$rest]"'
-    os.execv("/bin/sh", ["sh", "-c", script, sys.argv[1]])
+    script = '"$0" set "$1"; s=$?; IFS= read -r rest; echo "STATUS=$s LEFTOVER=[$rest]"'
+    os.execv("/bin/sh", ["sh", "-c", script, binary, key])
 out = b""
-while b"Value for PASTED" not in out:
+while ("Value for " + key).encode() not in out:
     if not select.select([fd], [], [], 5)[0]:
         sys.exit("no prompt: %r" % out)
     out += os.read(fd, 1024)
-os.write(fd, b"-----BEGIN KEY-----\nc2VjcmV0LWxpbmUtMg==\n-----END KEY-----\n")
+def write_all():
+    view = memoryview(payload)
+    while view:
+        view = view[os.write(fd, view):]
+writer = threading.Thread(target=write_all, daemon=True)
+writer.start()
 sent_marker = False
-while b"LEFTOVER=" not in out:
+deadline = time.monotonic() + 20
+while b"LEFTOVER=" not in out and time.monotonic() < deadline:
     if not select.select([fd], [], [], 1)[0]:
         if sent_marker:
             break
-        os.write(fd, b"marker\n")  # the shell's read gets this only if the queue was flushed
-        sent_marker = True
+        if not writer.is_alive():
+            os.write(fd, b"marker\n")
+            sent_marker = True
         continue
     try:
-        out += os.read(fd, 1024)
+        out += os.read(fd, 65536)
     except OSError:
         break
 if b"LEFTOVER=" not in out:
     os.kill(pid, 9)
 os.waitpid(pid, 0)
-if b"STATUS=1 LEFTOVER=[marker]" not in out:
-    sys.exit("got %r" % out)
+if b"STATUS=1 LEFTOVER=[marker]" not in out or expected.encode() not in out:
+    sys.exit("got %r" % out[-2000:])
 PY
+}
+# a multi-line paste at the tty prompt fails and leaves nothing for the shell
+printf -- '-----BEGIN KEY-----\nc2VjcmV0LWxpbmUtMg==\n-----END KEY-----\n' > "$WORK/paste"
+tty_set_refused PASTED "$WORK/paste" "more input followed the line" || fail "tty multi-line paste"
+# ...even one larger than the ~4 KiB tty input queue, which the terminal
+# writes in pieces as the queue drains
+python3 -c 'import sys; sys.stdout.write("-----BEGIN KEY-----\n" + "".join("SECRETLINE%03d%s\n" % (i, "A" * 50) for i in range(150)) + "-----END KEY-----\n")' > "$WORK/paste"
+tty_set_refused PASTED "$WORK/paste" "more input followed the line" || fail "tty paste over 8 KiB"
+# a tty line the terminal may have truncated (4095 bytes kept) is refused
+{ head -c 5000 /dev/zero | tr '\0' a; printf '\n'; } > "$WORK/paste"
+tty_set_refused PASTED "$WORK/paste" "truncated by the terminal" || fail "tty over-long line"
+# a stray Enter at the tty prompt does not overwrite the key with ""
+printf '\n' > "$WORK/paste"
+tty_set_refused TTY_KEY "$WORK/paste" "empty value on the terminal" || fail "tty empty value"
+[ "$("$BIN" get TTY_KEY)" = "tty-secret" ] || fail "tty empty value overwrote the key"
 if "$BIN" get PASTED >/dev/null 2>&1; then fail "multi-line tty paste stored a value"; fi
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after set (stdin)"
 "$BIN" list | grep -qx FOO || fail "list missing FOO"
@@ -336,6 +364,19 @@ chmod g+w "$PROJ"
 ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "group-writable project dir should be refused"
 echo "$ERR" | grep -q "chmod g-w,o-w '$PROJ'" || fail "untrusted dir message: $ERR"
 chmod g-w "$PROJ"
+# import refuses a new manifest's untrusted dir before storing anything, and a
+# dangling manifest symlink fails as it does for exec instead of being replaced
+GW="$WORK/gw"
+mkdir -p "$GW"
+printf 'GWTOK=x\n' > "$GW/.env"
+chmod g+w "$GW"
+ERR="$(cd "$GW" && "$BIN" import -p gw -e dev 2>&1)" && fail "import into a group-writable dir should fail"
+echo "$ERR" | grep -q "writable by group or others" || fail "import untrusted dir message: $ERR"
+if "$BIN" get dev/gw/GWTOK >/dev/null 2>&1; then fail "refused import stored a secret"; fi
+chmod g-w "$GW"
+ln -s missing "$GW/.secretov.yaml"
+if ( cd "$GW" && "$BIN" import -p gw -e dev >/dev/null 2>&1 ); then fail "import replaced a dangling manifest link"; fi
+[ -L "$GW/.secretov.yaml" ] || fail "dangling manifest link was replaced"
 
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
