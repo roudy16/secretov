@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <ftxui/component/component.hpp>
@@ -17,7 +19,7 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
-#include <ftxui/screen/string.hpp>
+#include <ftxui/screen/terminal.hpp>
 #include <nlohmann/json.hpp>
 
 #include "client.hpp"
@@ -28,7 +30,8 @@
 // Secret hygiene ceiling: the revealed value, the form value buffer (Edit
 // prefills it with the current value) and the paste buffer are zeroed
 // (sodium_memzero, whole capacity) as soon as they are re-masked, submitted,
-// cancelled or the TUI exits. FTXUI copies buffer contents into its own render
+// cancelled or the TUI exits. The detail pane wraps the revealed value as views
+// into it, but FTXUI copies buffer contents and those pieces into its own render
 // structures each frame, and a buffer that outgrows its reserve reallocates;
 // those copies are not zeroed. Best-effort — good enough for a local TUI, not
 // a hardened enclave. Upgrade path: a custom no-copy render element if it matters.
@@ -48,6 +51,9 @@ void zero(std::string& s) {
 
 // ponytail: values longer than this reallocate and leave an unzeroed copy behind.
 constexpr std::size_t kSecretReserve = 4096;
+
+// Narrower terminals stack the list above the detail pane.
+constexpr int kStackedBelowColumns = 80;
 
 // Copies a daemon reply's value into `into` and wipes the reply's own copy.
 void take_value(nlohmann::json& resp, std::string& into) {
@@ -79,7 +85,7 @@ int run_ui(DaemonClient& daemon) {
 
     std::vector<std::string> keys;    // every key, sorted
     std::vector<Row> rows;            // visible tree rows
-    std::vector<std::string> labels;  // what the menu draws, parallel to rows
+    std::vector<std::string> labels;  // each row's last path segment, parallel to rows
     std::set<std::string> collapsed;  // folder ids currently folded
     int selected = 0;
     std::optional<std::string> revealed;  // fetched value for the selected key
@@ -95,6 +101,9 @@ int run_ui(DaemonClient& daemon) {
     Mode mode = Mode::Normal;
     int active_tab = 0;  // 0 = key list, 1 = add/edit form
     int form_field = 0;  // 0 = name input, 1 = value input
+    int detail_scroll = 0;     // first detail-pane line shown
+    std::string detail_row_id;  // row detail_scroll belongs to; a new row starts at the top
+    int list_text_width = 0;    // columns a list row may use, set each frame before the menu renders
 
     auto remask = [&] {
         if (revealed) {
@@ -145,15 +154,14 @@ int run_ui(DaemonClient& daemon) {
                 if (!hidden) {
                     std::size_t name_start = d == 0 ? 0 : folders[d - 1].size();
                     rows.push_back({folders[d], true, static_cast<int>(d)});
-                    labels.push_back(std::string(2 * d, ' ') + (folded ? "▸ " : "▾ ") +
-                                     folders[d].substr(name_start));
+                    labels.push_back(folders[d].substr(name_start));
                 }
                 hidden = hidden || folded;
             }
             if (!hidden) {
                 std::size_t name_start = folders.empty() ? 0 : folders.back().size();
                 rows.push_back({key, false, static_cast<int>(folders.size())});
-                labels.push_back(std::string(2 * folders.size() + 2, ' ') + key.substr(name_start));
+                labels.push_back(key.substr(name_start));
             }
         }
         if (!select_id.empty()) {
@@ -364,8 +372,27 @@ int run_ui(DaemonClient& daemon) {
 
     refresh("");
 
+    // Marker, indentation and fold glyph in front of a row's name. Every row
+    // puts its glyph at column 2*depth, so a top-level secret never lines up
+    // with a folder's children.
+    auto row_prefix = [&](int i, bool is_selected) {
+        const Row& row = row_at(i);
+        const char* glyph = !row.dir ? "· " : collapsed.count(row.id) > 0 ? "▸ " : "▾ ";
+        return std::string(is_selected ? "> " : "  ") + std::string(2 * static_cast<std::size_t>(row.depth), ' ') +
+               glyph;
+    };
+
     MenuOption menu_opt = MenuOption::Vertical();
     menu_opt.on_change = remask;
+    // Names are cut to the pane instead of letting the menu scroll sideways,
+    // which would hide the marker and the tree structure.
+    menu_opt.entries_option.transform = [&](const EntryState& entry) {
+        std::string prefix = row_prefix(entry.index, entry.active);
+        Element line = text(prefix + ellipsize(entry.label, list_text_width - text_columns(prefix)));
+        if (row_at(entry.index).dir) line |= bold;
+        if (entry.active) line |= inverted;
+        return line;
+    };
     Component menu = Menu(&labels, &selected, menu_opt);
 
     InputOption name_opt;
@@ -384,65 +411,122 @@ int run_ui(DaemonClient& daemon) {
 
     ScreenInteractive screen = ScreenInteractive::Fullscreen();
 
-    auto renderer = Renderer(tab, [&] {
-        // Wide enough for the longest visible label, capped so the detail
-        // pane keeps room for a value.
-        int list_width = 30;
-        for (const std::string& label : labels) {
-            list_width = std::max(list_width, string_width(label) + 6);
-        }
-        list_width = std::min(list_width, std::max(30, screen.dimx() * 3 / 5));
-        Element list_pane = window(text(" secrets "),
-                                   rows.empty()
-                                       ? (text("(empty)") | dim | center)
-                                       : (menu->Render() | vscroll_indicator | frame)) |
-                            size(WIDTH, EQUAL, list_width);
+    // A blank margin keeps a modal's border from merging with the pane borders under it.
+    auto modal = [](Element dialog) {
+        return hbox({text(" "), vbox({text(" "), std::move(dialog), text(" ")}), text(" ")}) | clear_under | center;
+    };
 
-        Element detail_body;
+    auto renderer = Renderer(tab, [&] {
+        // FTXUI sizes its screen only after Render, so a resize would lag a
+        // frame behind screen.dimx(); ask the terminal directly.
+        Dimensions terminal = Terminal::Size();
+        bool stacked = terminal.dimx < kStackedBelowColumns;
+        int panes_height = std::max(terminal.dimy - 2, 6);  // minus hint line and status bar
+        int list_width = terminal.dimx;
+        int list_height = stacked ? panes_height / 2 : panes_height;
+        if (!stacked) {
+            int longest = 0;
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+                longest = std::max(longest, text_columns(row_prefix(i, false)) +
+                                                text_columns(labels[static_cast<std::size_t>(i)]));
+            }
+            // +3: borders and scroll indicator. At most 2/5 so the detail pane keeps room for a value.
+            list_width = std::clamp(longest + 3, 24, terminal.dimx * 2 / 5);
+        }
+        list_text_width = list_width - 3;
+        Element list_pane = window(text(" secrets "),
+                                   rows.empty() ? (text("(empty)") | dim | center)
+                                                : (menu->Render() | vscroll_indicator | yframe)) |
+                            size(WIDTH, EQUAL, list_width) | size(HEIGHT, EQUAL, list_height);
+
+        int detail_width = stacked ? terminal.dimx : terminal.dimx - list_width;
+        int detail_height = stacked ? panes_height - list_height : panes_height;
+        int detail_text_width = detail_width - 2;
+        int detail_text_height = std::max(detail_height - 2, 1);
+        Elements detail_lines;
+        auto add_wrapped = [&](std::string_view content, Decorator style) {
+            for (std::string_view piece : wrap_lines(content, detail_text_width)) {
+                detail_lines.push_back(text(std::string(piece)) | style);
+            }
+        };
+        std::string detail_id = rows.empty() ? "" : row_at(selected).id;
+        if (detail_id != detail_row_id) {
+            detail_row_id = detail_id;
+            detail_scroll = 0;
+        }
         if (rows.empty()) {
-            detail_body = text("press 'a' to add a secret") | dim | center;
+            detail_lines.push_back(text("press 'a' to add a secret") | dim);
         } else if (row_at(selected).dir) {
             const std::string& folder = row_at(selected).id;
             std::size_t count = 0;
             for (const std::string& key : keys) {
                 if (key.compare(0, folder.size(), folder) == 0) ++count;
             }
-            detail_body = vbox({
-                hbox({text("folder: "), text(folder) | bold}),
-                separator(),
-                text(std::to_string(count) + " secret(s)   h/l to fold/unfold") | dim,
-            });
+            detail_lines.push_back(text("folder:") | dim);
+            add_wrapped(folder, bold);
+            detail_lines.push_back(separator());
+            detail_lines.push_back(text(std::to_string(count) + " secret(s)"));
         } else {
-            Element value_line = revealed ? text(*revealed) : text("••••••••");
-            detail_body = vbox({
-                hbox({text("name:  "), text(row_at(selected).id) | bold}),
-                separator(),
-                hbox({text("value: "), value_line}),
-                text(revealed ? "" : "(press 'r' to reveal)") | dim,
-            });
+            detail_lines.push_back(text("name:") | dim);
+            add_wrapped(row_at(selected).id, bold);
+            detail_lines.push_back(separator());
+            detail_lines.push_back(text("value:") | dim);
+            if (revealed) {
+                add_wrapped(*revealed, nothing);
+            } else {
+                detail_lines.push_back(text("••••••••"));
+                detail_lines.push_back(text("(press 'r' to reveal)") | dim);
+            }
         }
-        Element detail_pane = window(text(" detail "), detail_body) | flex;
+        int detail_line_count = static_cast<int>(detail_lines.size());
+        bool detail_overflows = detail_line_count > detail_text_height;
+        detail_scroll = std::clamp(detail_scroll, 0, std::max(0, detail_line_count - detail_text_height));
+        int detail_last = std::min(detail_line_count, detail_scroll + detail_text_height);
+        std::string detail_title = " detail ";
+        if (detail_overflows) {
+            detail_title += std::to_string(detail_scroll + 1) + "-" + std::to_string(detail_last) + "/" +
+                            std::to_string(detail_line_count) + " J/K scroll ";
+        }
+        Elements shown_lines(std::make_move_iterator(detail_lines.begin() + detail_scroll),
+                             std::make_move_iterator(detail_lines.begin() + detail_last));
+        Element detail_pane = window(text(detail_title), vbox(std::move(shown_lines))) |
+                              size(WIDTH, EQUAL, detail_width) | size(HEIGHT, EQUAL, detail_height);
 
-        Element hints = text(" a add   e edit   d delete   r reveal/hide   j/k move   h/l fold   q quit ") |
-                        dim | center;
-        Element status_bar =
-            hbox({
-                text(" " + daemon.socket_path() + " "),
-                separator(),
-                text(" keys: " + std::to_string(keys.size()) + " "),
-                separator(),
-                text(" " + status + " ") | flex,
-            }) |
-            inverted;
+        std::vector<std::string> hint_items;
+        if (mode == Mode::Normal) {
+            hint_items = {"j/k move", revealed ? "r hide" : "r reveal"};
+            if (detail_overflows) hint_items.push_back("J/K scroll");
+            hint_items.insert(hint_items.end(), {"h/l fold", "a add", "e edit", "d delete", "q quit"});
+        } else if (mode == Mode::Add || mode == Mode::Edit) {
+            bool in_name = mode == Mode::Add && form_field == 0;
+            hint_items = {in_name ? "Enter next field" : "Enter save"};
+            if (mode == Mode::Add) hint_items.push_back("Tab switch field");
+            hint_items.insert(hint_items.end(), {value_masked ? "Ctrl-R show value" : "Ctrl-R hide value",
+                                                 "Ctrl-U/W erase", "Ctrl-A/E line start/end", "Esc cancel"});
+        } else {
+            hint_items = {"y yes", "Enter/Esc/any other key no"};
+        }
+        Element hints = text(" " + fit_hints(hint_items, terminal.dimx - 2) + " ") | dim | center;
 
-        Element root = vbox({
-            hbox({list_pane, detail_pane}) | flex,
-            hints,
-            status_bar,
-        });
+        // The message comes first and shrinks last; the socket path only shows when it fits.
+        std::string message = " " + status + " ";
+        std::string key_count = " keys: " + std::to_string(keys.size()) + " ";
+        std::string socket = " " + daemon.socket_path() + " ";
+        Elements status_parts = {text(message) | flex, separator(), text(key_count)};
+        if (text_columns(message) + text_columns(key_count) + text_columns(socket) + 2 <= terminal.dimx) {
+            status_parts.push_back(separator());
+            status_parts.push_back(text(socket) | dim);
+        }
+        Element status_bar = hbox(std::move(status_parts)) | inverted;
 
-        if (mode == Mode::Add || mode == Mode::Edit || mode == Mode::ConfirmOverwrite) {
-            bool adding = mode != Mode::Edit;
+        Element panes = stacked ? vbox({list_pane, detail_pane}) : hbox({list_pane, detail_pane});
+        Element root = vbox({panes | flex, hints, status_bar});
+
+        // The overwrite confirm replaces the form rather than sitting on it: a
+        // modal's blank margin would cut through the form's border.
+        if (mode == Mode::Add || mode == Mode::Edit) {
+            bool adding = mode == Mode::Add;
+            int overlay_width = std::clamp(terminal.dimx - 4, 20, 72);
             Elements lines;
             if (adding) {
                 lines.push_back(hbox({text("name:  "), name_input->Render()}));
@@ -451,33 +535,26 @@ int run_ui(DaemonClient& daemon) {
                     lines.push_back(text("       exists: saving will ask to overwrite") | color(Color::Yellow));
                 }
             } else {
-                lines.push_back(hbox({text("name:  "), text(current_key().value_or("")) | bold}));
+                lines.push_back(
+                    hbox({text("name:  "), text(ellipsize(current_key().value_or(""), overlay_width - 9)) | bold}));
             }
             // ponytail: 8 visible lines; taller values scroll with the cursor.
             lines.push_back(hbox({text("value: "), value_input->Render() | size(HEIGHT, LESS_THAN, 8)}));
             std::optional<std::string> problem = show_form_problem ? form_problem() : std::nullopt;
             if (problem) lines.push_back(text("       " + *problem) | color(Color::Red));
-            lines.push_back(separator());
-            std::string enter_action = adding && form_field == 0 ? "next field" : "save";
-            lines.push_back(text("Enter " + enter_action + (adding ? "   Tab switch field" : "") +
-                                 "   Esc cancel") |
-                            dim);
-            lines.push_back(text(std::string("Ctrl-R ") + (value_masked ? "show" : "hide") +
-                                 " value   Ctrl-U/Ctrl-W erase   Ctrl-A/Ctrl-E line start/end") |
-                            dim);
-            int overlay_width = std::clamp(screen.dimx() - 4, 20, 72);
-            Element overlay = window(text(adding ? " add secret " : " edit secret "), vbox(std::move(lines))) |
-                              size(WIDTH, EQUAL, overlay_width) | clear_under | center;
-            root = dbox({root, overlay});
+            root = dbox({root, modal(window(text(adding ? " add secret " : " edit secret "), vbox(std::move(lines))) |
+                                     size(WIDTH, EQUAL, overlay_width))});
         }
         if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmOverwrite) {
             std::string question = mode == Mode::ConfirmDelete
                                        ? "Delete '" + current_key().value_or("") + "'? [y/N]"
                                        : "Overwrite '" + trim_key_name(add_name) + "'? [y/N]";
-            Element overlay = window(text(" confirm "), vbox({text(question), separator(),
-                                                              text("y yes   Enter/Esc/any other key no") | dim})) |
-                              clear_under | center;
-            root = dbox({root, overlay});
+            int question_width = std::min(text_columns(question), std::max(terminal.dimx - 6, 10));
+            Elements question_lines;
+            for (std::string_view piece : wrap_lines(question, question_width)) {
+                question_lines.push_back(text(std::string(piece)));
+            }
+            root = dbox({root, modal(window(text(" confirm "), vbox(std::move(question_lines))))});
         }
         return root;
     });
@@ -559,6 +636,10 @@ int run_ui(DaemonClient& daemon) {
             }
             if (event == Event::ArrowRight || event == Event::Character('l')) {
                 fold(true);
+                return true;
+            }
+            if (event == Event::Character('J') || event == Event::Character('K')) {
+                detail_scroll += event == Event::Character('J') ? 1 : -1;  // the renderer clamps it
                 return true;
             }
             return false;  // up/down and j/k fall through to the menu

@@ -148,9 +148,17 @@ until you reveal them.
 
 | Where | Keys |
 |---|---|
-| tree | `j`/`k` or arrows move, `h`/`l` fold/unfold, Enter/Space reveal or fold, `r` reveal/hide, `a` add, `e` edit, `d` delete, `q`/Ctrl-C quit |
+| tree | `j`/`k` or arrows move, `h`/`l` fold/unfold, Enter/Space reveal or fold, `r` reveal/hide, `J`/`K` scroll the detail pane, `a` add, `e` edit, `d` delete, `q`/Ctrl-C quit |
 | add/edit form | Enter: next field (add name) or save, Tab switch field, Esc cancel, Ctrl-R show/hide the value, Ctrl-U erase to line start, Ctrl-W erase previous word or path segment, Ctrl-A/Ctrl-E line start/end |
 | confirm (`[y/N]`) | `y` yes; Enter, Esc, or any other key no |
+
+The hint line above the status bar shows the keys for the current mode,
+dropping the least-used ones when the terminal is narrow. Long names are cut
+with `…` in the tree; the detail pane shows the full name and the revealed
+value wrapped (multi-line values keep their lines), and its title shows
+`first-last/total J/K scroll` when they don't fit. Below 80 columns the tree
+sits above the detail pane. The status bar shows the latest message first,
+then the key count, then the socket path when there is room.
 
 Add starts the name at the selected folder (`dev/api/`); the name is trimmed
 and must not start or end with `/` or contain `//` or control characters.

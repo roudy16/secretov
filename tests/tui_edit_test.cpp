@@ -5,6 +5,8 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 
@@ -56,12 +58,36 @@ void test_readline_edits() {
     assert(text == "first\nond" && cursor == 0);
 }
 
+void test_layout_text() {
+    using secretov::ellipsize;
+    using secretov::wrap_lines;
+    using View = std::vector<std::string_view>;
+    assert(secretov::text_columns("a·b…") == 4);
+    assert(ellipsize("staging", 7) == "staging");
+    assert(ellipsize("staging", 4) == "sta…");
+    assert(ellipsize("ab·cd", 4) == "ab·…");
+    assert(ellipsize("staging", 1) == "…");
+    assert(ellipsize("staging", 0).empty());
+
+    assert(wrap_lines("abcdefg", 3) == (View{"abc", "def", "g"}));
+    assert(wrap_lines("abc", 3) == (View{"abc"}));
+    assert(wrap_lines("", 3) == (View{""}));
+    assert(wrap_lines("ab\n\nabcd\n", 3) == (View{"ab", "", "abc", "d", ""}));
+    assert(wrap_lines("··", 1) == (View{"·", "·"}));
+
+    std::vector<std::string> hints = {"j/k move", "a add", "q quit"};
+    assert(secretov::fit_hints(hints, 80) == "j/k move  a add  q quit");
+    assert(secretov::fit_hints(hints, 18) == "j/k move  q quit");
+    assert(secretov::fit_hints(hints, 3) == "q quit");
+}
+
 }  // namespace
 
 int main() {
     test_key_names();
     test_folder_prefix();
     test_readline_edits();
+    test_layout_text();
     std::printf("OK\n");
     return 0;
 }

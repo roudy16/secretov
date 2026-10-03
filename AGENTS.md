@@ -28,8 +28,8 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   `import` uses to update manifests (re-parsed and verified before writing).
   `read_manifest_text` (owner/mode check) is the only way a manifest is read.
 - `src/client.{hpp,cpp}` (scope resolution for exec/import/list lives here),
-  `src/tui.cpp` (+ `src/tui_edit.{hpp,cpp}`: FTXUI-free form helpers — key
-  name validation, readline edits), `src/paths.hpp` (all on-disk file names as constants —
+  `src/tui.cpp` (+ `src/tui_edit.{hpp,cpp}`: FTXUI-free helpers — key
+  name validation, readline edits, wrapping/ellipsizing for the layout), `src/paths.hpp` (all on-disk file names as constants —
   single source of truth), `src/protocol.hpp`.
 - `tests/store_test.cpp`, `tests/manifest_test.cpp`, `tests/paths_test.cpp`,
   `tests/tui_edit_test.cpp`
