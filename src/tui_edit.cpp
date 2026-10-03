@@ -1,6 +1,9 @@
 #include "tui_edit.hpp"
 
+#include <sodium.h>
+
 #include <algorithm>
+#include <cctype>
 
 namespace secretov {
 
@@ -52,6 +55,26 @@ std::string folder_prefix(std::string_view row_id) {
     std::size_t last_slash = row_id.rfind('/');
     if (last_slash == std::string_view::npos) return "";
     return std::string(row_id.substr(0, last_slash + 1));
+}
+
+bool contains_ignore_case(std::string_view text, std::string_view needle) {
+    if (needle.empty()) return true;
+    auto same = [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+    };
+    return std::search(text.begin(), text.end(), needle.begin(), needle.end(), same) != text.end();
+}
+
+std::string osc52_copy_sequence(std::string_view value) {
+    constexpr std::string_view kStart = "\x1b]52;c;";
+    std::size_t encoded_size = sodium_base64_ENCODED_LEN(value.size(), sodium_base64_VARIANT_ORIGINAL);  // with NUL
+    std::string sequence(kStart.size() + encoded_size, '\0');
+    std::copy(kStart.begin(), kStart.end(), sequence.begin());
+    sodium_bin2base64(sequence.data() + kStart.size(), encoded_size,
+                      reinterpret_cast<const unsigned char*>(value.data()), value.size(),
+                      sodium_base64_VARIANT_ORIGINAL);
+    sequence.back() = '\a';  // in place of the NUL
+    return sequence;
 }
 
 int line_start(const std::string& text, int cursor) {

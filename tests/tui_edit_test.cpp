@@ -81,6 +81,20 @@ void test_layout_text() {
     assert(secretov::fit_hints(hints, 3) == "q quit");
 }
 
+void test_filter_and_copy() {
+    using secretov::contains_ignore_case;
+    assert(contains_ignore_case("dev/api/STRIPE_KEY", "stripe"));
+    assert(contains_ignore_case("dev/api/STRIPE_KEY", "API/s"));
+    assert(contains_ignore_case("anything", ""));
+    assert(contains_ignore_case("", ""));
+    assert(!contains_ignore_case("dev/api", "prod"));
+    assert(!contains_ignore_case("ab", "abc"));
+
+    assert(secretov::osc52_copy_sequence("hi") == "\x1b]52;c;aGk=\a");
+    assert(secretov::osc52_copy_sequence("") == "\x1b]52;c;\a");
+    assert(secretov::osc52_copy_sequence("a\nb") == "\x1b]52;c;YQpi\a");
+}
+
 }  // namespace
 
 int main() {
@@ -88,6 +102,7 @@ int main() {
     test_folder_prefix();
     test_readline_edits();
     test_layout_text();
+    test_filter_and_copy();
     std::printf("OK\n");
     return 0;
 }

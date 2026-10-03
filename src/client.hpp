@@ -2,11 +2,18 @@
 
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "paths.hpp"
 
 namespace secretov {
+
+// The daemon could not be asked at all: not running, busy past the reply
+// timeout, or hung up. Daemon-side errors stay plain std::runtime_error.
+struct DaemonUnreachable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // Talks to the daemon over a fresh connection per request (the daemon serves
 // one connection at a time and blocks on read, so a persistent connection
@@ -17,7 +24,8 @@ public:
     explicit DaemonClient(const Paths& paths);
 
     // Connect, send one request, return the parsed response. Throws
-    // std::runtime_error on transport failure or a malformed response.
+    // DaemonUnreachable on transport failure (including no reply within the
+    // timeout) and std::runtime_error on a malformed response.
     nlohmann::json send(const nlohmann::json& req) const;
 
     // Same, but throws the daemon's error message on a non-ok reply. Adds

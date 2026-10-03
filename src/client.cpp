@@ -32,6 +32,11 @@ constexpr std::size_t kMaxResponseBytes = 64 << 20;
 
 constexpr std::size_t kRecommendedMinPassphraseChars = 12;
 
+// The daemon serves one connection at a time, so a client that holds it would
+// otherwise hang every other client forever. rotate/passwd run Argon2id.
+constexpr int kReplyTimeoutSeconds = 5;
+constexpr int kKdfReplyTimeoutSeconds = 60;
+
 }  // namespace
 
 DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
@@ -46,8 +51,13 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     full["token"] = token_;
     std::optional<Connection> conn = connect_unix(socket_path_);
     if (!conn) {
-        throw std::runtime_error("daemon not running at " + socket_path_ + " ?");
+        throw DaemonUnreachable("daemon not running at " + socket_path_ + " ?");
     }
+    std::string op = req.value("op", std::string{});
+    int timeout_seconds = op == "rotate" || op == "passwd" ? kKdfReplyTimeoutSeconds : kReplyTimeoutSeconds;
+    conn->set_timeout(timeout_seconds);
+    std::string busy = "daemon busy: no reply within " + std::to_string(timeout_seconds) +
+                       " s (another client may be holding it)";
     // Authenticate the daemon end before the token or any passphrase leaves us.
     uid_t daemon_uid = conn->peer_uid();
     if (daemon_uid != ::getuid()) {
@@ -55,11 +65,11 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
                                  std::to_string(daemon_uid) + ", not ours; refusing to send");
     }
     if (!conn->write_line(full.dump())) {
-        throw std::runtime_error("failed to send request to daemon");
+        throw DaemonUnreachable(conn->timed_out() ? busy : "failed to send request to daemon");
     }
     auto line = conn->read_line(kMaxResponseBytes);
     if (!line) {
-        throw std::runtime_error("daemon closed connection without responding");
+        throw DaemonUnreachable(conn->timed_out() ? busy : "daemon closed connection without responding");
     }
     nlohmann::json resp;
     try {

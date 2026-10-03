@@ -26,10 +26,16 @@ public:
     bool write_line(const std::string& line);
     uid_t peer_uid() const;
 
+    // Bounds every later read/write call; a call that runs out fails, and
+    // timed_out() then reports it. Throws if the socket refuses the option.
+    void set_timeout(int seconds);
+    bool timed_out() const { return timed_out_; }
+
 private:
     int fd_;
     std::string buffer_;
     std::size_t scanned_ = 0;  // buffer_ prefix already searched for '\n'
+    bool timed_out_ = false;
 };
 
 // Unix socket listener. The only transport secretov has or plans to have.

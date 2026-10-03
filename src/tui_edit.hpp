@@ -21,6 +21,13 @@ std::optional<std::string> key_name_error(std::string_view name);
 // key "dev/api/KEY"; "" for a top-level key.
 std::string folder_prefix(std::string_view row_id);
 
+// Whether `text` contains `needle`, ASCII letters compared case-insensitively.
+bool contains_ignore_case(std::string_view text, std::string_view needle);
+
+// The OSC 52 escape that asks the terminal to put `value` on the clipboard
+// (base64, BEL-terminated). It encodes the secret, so the caller zeroes it.
+std::string osc52_copy_sequence(std::string_view value);
+
 // Readline-style edits on the line holding the cursor.
 void erase_to_line_start(std::string& text, int& cursor);  // Ctrl-U
 void erase_word_before(std::string& text, int& cursor);    // Ctrl-W

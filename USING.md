@@ -144,30 +144,62 @@ or pipe `get` straight into what needs it, or clear scrollback afterwards.
 ### The TUI
 
 `secretov tui` shows the store as a tree folded on `/`; values stay masked
-until you reveal them.
+until you reveal them, and a revealed value re-masks after 60 seconds (the
+status bar counts down). `?` (or F1) lists every key in every mode.
 
 | Where | Keys |
 |---|---|
-| tree | `j`/`k` or arrows move, `h`/`l` fold/unfold, Enter/Space reveal or fold, `r` reveal/hide, `J`/`K` scroll the detail pane, `a` add, `e` edit, `d` delete, `q`/Ctrl-C quit |
+| tree | `j`/`k` or arrows move, PgUp/PgDn page, `g`/`G` or Home/End top/bottom, `h`/Left fold or go to parent, `l`/Right unfold or go to first child, Enter/Space/`r` reveal or hide (on a folder Enter/Space fold), `c` copy the value, `J`/`K` scroll the detail pane, `/` filter, Esc clear filter and message, `a` add, `e` edit, `d` delete, `R` reload, `?`/F1 help, `q`/Ctrl-C quit; mouse: click selects (a folder also folds), wheel moves |
+| filter (`/`) | type to narrow, Backspace erase, Ctrl-U erase all, arrows/PgUp/PgDn move, Enter keep the filter, Esc clear it |
 | add/edit form | Enter: next field (add name) or save, Tab switch field, Esc cancel, Ctrl-R show/hide the value, Ctrl-U erase to line start, Ctrl-W erase previous word or path segment, Ctrl-A/Ctrl-E line start/end |
 | confirm (`[y/N]`) | `y` yes; Enter, Esc, or any other key no |
+
+`c` copies the selected secret's value without revealing it, through the
+OSC 52 clipboard escape on the controlling terminal. The terminal must allow
+OSC 52 (most do; under tmux, `set -g set-clipboard on`), and a clipboard
+manager may keep its own copy of anything copied.
+
+The filter narrows the tree to keys containing the typed text (any case) and
+opens every folder with a match; it stays on after Enter and shows in the
+status bar. Fold state lives only for the session — nothing about the store's
+layout (key names are encrypted at rest) is written to disk.
+
+Run from inside a project, the TUI reads the nearest `.secretov.yaml` with
+the same discovery and trust checks as `exec`, marks the keys it references
+with `◆`, and shows the env var name(s) each maps to in the detail pane. The
+whole store is still shown. A manifest that fails the trust check or does not
+parse marks nothing and says why in the status bar.
 
 The hint line above the status bar shows the keys for the current mode,
 dropping the least-used ones when the terminal is narrow. Long names are cut
 with `…` in the tree; the detail pane shows the full name and the revealed
 value wrapped (multi-line values keep their lines), and its title shows
 `first-last/total J/K scroll` when they don't fit. Below 80 columns the tree
-sits above the detail pane. The status bar shows the latest message first,
-then the key count, then the socket path when there is room.
+sits above the detail pane. The status bar shows the latest message first
+(info clears after a few seconds or the next key, errors at the next key),
+then a `daemon unreachable` marker, the active filter, the reveal countdown,
+the key count, and the socket path when there is room.
+
+The list is fetched at start and after the TUI's own changes; `R` reloads it
+after CLI changes. A key deleted elsewhere is noticed on reveal, copy or edit:
+the list reloads and the status bar says so. If the daemon stops, the last
+tree stays on screen marked `(stale)` until a request (`R`) succeeds again.
+Every daemon call gives up after 5 seconds with `daemon busy` (another client
+holding the daemon's single connection) — the CLI too; `rotate`/`passwd` wait
+60 seconds. At startup the TUI prints how to fix a missing token (`secretov
+init`) or a stopped daemon (`scripts/service start` or `secretov daemon`)
+before taking over the screen.
 
 Add starts the name at the selected folder (`dev/api/`); the name is trimmed
 and must not start or end with `/` or contain `//` or control characters.
-Adding a name that already exists asks before overwriting. Edit opens with the
-current value, masked. Both refuse an empty value. A multi-line value (a PEM
-key) can be pasted into the value field — newlines are kept, and the paste
-never submits the form; a paste outside a form is ignored. This relies on the
-terminal's bracketed paste, which all common terminals and tmux support; in
-one without it, pipe the value to `set` instead.
+Adding a name that already exists asks before overwriting. After saving, the
+new key's folders open and it is selected; after a delete the selection moves
+to the nearest key in the same folder. Edit opens with the current value,
+masked. Both refuse an empty value. A multi-line value (a PEM key) can be
+pasted into the value field — newlines are kept, and the paste never submits
+the form; a paste outside a form is ignored. This relies on the terminal's
+bracketed paste, which all common terminals and tmux support; in one without
+it, pipe the value to `set` instead.
 
 ## Non-secret config: `vars:`
 
@@ -267,6 +299,7 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | Message | Cause | Fix |
 |---|---|---|
 | `daemon not running at ... ?` | Daemon down | `scripts/service start`; check `scripts/service status` if it fails |
+| `daemon busy: no reply within 5 s` | Another client is holding the daemon's one connection | Find and stop the stuck client (`ss -xp \| grep secretov`), then retry |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |

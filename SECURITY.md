@@ -103,7 +103,9 @@ same UID; the acceptance covers only that case.
 Daemon serves one connection at a time; `read_line` has no timeout, so a
 client that connects and goes silent blocks all others. Same-UID-only
 nuisance; already marked in daemon.cpp for threading if a real client blocks
-another.
+another. 2026-10-03: clients now give up after 5 s (60 s for
+rotate/passwd) with `daemon busy` instead of hanging behind such a client;
+the daemon side is unchanged.
 
 ### 7. Unauthenticated header — `accepted`
 
@@ -387,10 +389,11 @@ bind-time re-check stops the second; same-UID only.
 See 9a. `exec` children are unaffected (execve resets the flag), and no
 RLIMIT_CORE is set outside the daemon, so children keep their core limit.
 
-### 25. TUI reveal never auto-hides; `get` output in scrollback (L11) — `open`
+### 25. TUI reveal never auto-hides; `get` output in scrollback (L11) — `done` (TUI part)
 
-A revealed value stays on screen until a keypress, selection change, or exit.
-Fix: re-mask after 15–30 s via `screen.Post` (pair with TUI UX work). `get`
+A revealed value stayed on screen until a keypress, selection change, or exit.
+Fixed 2026-10-03: a revealed value re-masks (and is zeroed) after 60 s, with a
+countdown in the status bar; selection change re-masks synchronously. `get`
 prints to the primary buffer, so values land in terminal scrollback;
 documented in USING.md (pipe it, or clear scrollback).
 
@@ -488,4 +491,4 @@ Done items are marked in the findings. Remaining, highest value first:
 4. TPM2 `systemd-creds` credential (15; needs systemd ≥ 256).
 5. LUKS or encrypted `/home` (15; also closes 2 on disk-swap hosts).
    Machine-level, high effort, biggest at-rest gain.
-6. TUI auto re-mask timer (25).
+6. ~~TUI auto re-mask timer (25).~~ Done 2026-10-03.

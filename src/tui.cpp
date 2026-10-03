@@ -1,17 +1,27 @@
 #include "tui.hpp"
 
+#include <fcntl.h>
 #include <sodium.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <ftxui/component/component.hpp>
@@ -23,18 +33,21 @@
 #include <nlohmann/json.hpp>
 
 #include "client.hpp"
+#include "manifest.hpp"
 #include "paths.hpp"
 #include "protocol.hpp"
 #include "tui_edit.hpp"
 
 // Secret hygiene ceiling: the revealed value, the form value buffer (Edit
-// prefills it with the current value) and the paste buffer are zeroed
-// (sodium_memzero, whole capacity) as soon as they are re-masked, submitted,
-// cancelled or the TUI exits. The detail pane wraps the revealed value as views
-// into it, but FTXUI copies buffer contents and those pieces into its own render
-// structures each frame, and a buffer that outgrows its reserve reallocates;
-// those copies are not zeroed. Best-effort — good enough for a local TUI, not
-// a hardened enclave. Upgrade path: a custom no-copy render element if it matters.
+// prefills it with the current value), the paste buffer and the copy buffers
+// are zeroed (sodium_memzero, whole capacity) as soon as they are re-masked (by
+// hand, on selection change or after kRevealFor), submitted, cancelled, written
+// to the terminal, or the TUI exits. The detail pane wraps the revealed value
+// as views into it, but FTXUI copies buffer contents and those pieces into its
+// own render structures each frame, and a buffer that outgrows its reserve
+// reallocates; those copies are not zeroed. Best-effort — good enough for a
+// local TUI, not a hardened enclave. Upgrade path: a custom no-copy render
+// element if it matters.
 
 namespace secretov {
 
@@ -55,6 +68,12 @@ constexpr std::size_t kSecretReserve = 4096;
 // Narrower terminals stack the list above the detail pane.
 constexpr int kStackedBelowColumns = 80;
 
+using Clock = std::chrono::steady_clock;
+constexpr auto kRevealFor = std::chrono::seconds(60);  // a revealed value re-masks after this
+constexpr auto kInfoFor = std::chrono::seconds(4);     // an info message clears after this; errors stay
+
+const char* const kStartDaemonHint = "start it with 'scripts/service start' (systemd user unit) or 'secretov daemon'";
+
 // Copies a daemon reply's value into `into` and wipes the reply's own copy.
 void take_value(nlohmann::json& resp, std::string& into) {
     auto found = resp.find("value");
@@ -71,7 +90,99 @@ bool has_control_char(const std::string& text) {
     });
 }
 
-enum class Mode { Normal, Add, Edit, ConfirmDelete, ConfirmOverwrite };
+// Puts the escape on the controlling terminal itself, past FTXUI's frame output.
+void write_to_terminal(const std::string& bytes) {
+    int fd = ::open("/dev/tty", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) throw std::runtime_error(std::string("open /dev/tty: ") + std::strerror(errno));
+    std::size_t written = 0;
+    while (written < bytes.size()) {
+        ssize_t n = ::write(fd, bytes.data() + written, bytes.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            int write_errno = errno;
+            ::close(fd);
+            throw std::runtime_error(std::string("write to terminal: ") + std::strerror(write_errno));
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+}
+
+// Store keys the cwd's .secretov.yaml references, found and vetted exactly as
+// the CLI does (find_manifest_upward + load_manifest).
+struct ProjectMarks {
+    std::string project;  // empty: nothing to mark
+    std::map<std::string, std::vector<std::string>> env_vars_by_key;  // "STRIPE_KEY (dev)"
+    std::string problem;  // why a manifest that was found marks nothing
+};
+
+ProjectMarks load_project_marks() {
+    ProjectMarks marks;
+    std::optional<std::string> manifest_path;
+    try {
+        manifest_path = find_manifest_upward(std::filesystem::current_path().string());
+        if (!manifest_path) return marks;
+        Manifest manifest = load_manifest(*manifest_path);
+        for (const auto& [env, entries] : manifest.envs) {
+            for (const SecretEntry& entry : entries) {
+                marks.env_vars_by_key[entry.key].push_back(entry.env_var + " (" + env + ")");
+            }
+        }
+        marks.project = manifest.project;
+    } catch (const std::exception& e) {
+        marks.env_vars_by_key.clear();
+        // The status bar is one line: name the manifest relative to the cwd so the reason fits.
+        std::string reason = e.what();
+        std::error_code relative_error;
+        std::string short_path =
+            manifest_path ? std::filesystem::relative(*manifest_path, relative_error).string() : "";
+        if (manifest_path && !relative_error) {
+            for (std::size_t at = reason.find(*manifest_path); at != std::string::npos;
+                 at = reason.find(*manifest_path, at + short_path.size())) {
+                reason.replace(at, manifest_path->size(), short_path);
+            }
+        }
+        marks.problem = "nothing marked: " + reason;
+    }
+    return marks;
+}
+
+enum class Mode { Normal, Filter, Help, Add, Edit, ConfirmDelete, ConfirmOverwrite };
+
+struct HelpLine {
+    const char* keys;  // nullptr: `text` is a section heading
+    const char* text;
+};
+
+// ponytail: the help overlay doesn't scroll; terminals under ~28 rows cut its bottom.
+const HelpLine kHelp[] = {
+    {nullptr, "tree"},
+    {"j/k ↑/↓ PgUp/PgDn", "move"},
+    {"g/G Home/End", "top / bottom"},
+    {"h/l ←/→", "fold or go to parent / unfold or go to first child"},
+    {"Enter Space r", "reveal or hide (folder: fold); re-masks after 60 s"},
+    {"c", "copy the value to the clipboard (OSC 52), unrevealed"},
+    {"J/K", "scroll the detail pane"},
+    {"/  Esc", "filter keys / clear the filter and the message"},
+    {"a  e  d", "add, edit, delete"},
+    {"R", "reload the list from the daemon"},
+    {"?  F1    q  Ctrl-C", "this help    quit"},
+    {"mouse", "click selects (a folder also folds), wheel moves"},
+    {"◆", "key used by this directory's .secretov.yaml"},
+    {nullptr, "filter (/)"},
+    {"type  Backspace", "narrow to keys containing it (any case) / erase"},
+    {"Ctrl-U", "erase the whole filter"},
+    {"↑/↓  Enter  Esc", "move / keep the filter / clear it"},
+    {nullptr, "add / edit form"},
+    {"Enter", "next field (add name) or save"},
+    {"Tab  Shift-Tab", "switch field (add only)"},
+    {"Ctrl-R", "show or hide the value"},
+    {"Ctrl-U  Ctrl-W", "erase to line start / previous word or path segment"},
+    {"Ctrl-A  Ctrl-E", "line start / end"},
+    {"Esc", "cancel"},
+    {nullptr, "confirm [y/N]"},
+    {"y", "yes; Enter, Esc or any other key: no"},
+};
 
 // One visible line of the key tree: a folder ("dev/proj/") or a secret.
 struct Row {
@@ -80,15 +191,18 @@ struct Row {
     int depth;
 };
 
-int run_ui(DaemonClient& daemon) {
+int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     using namespace ftxui;
 
     std::vector<std::string> keys;    // every key, sorted
     std::vector<Row> rows;            // visible tree rows
     std::vector<std::string> labels;  // each row's last path segment, parallel to rows
-    std::set<std::string> collapsed;  // folder ids currently folded
+    std::set<std::string> collapsed;  // folder ids currently folded; never written to disk
     int selected = 0;
+    std::string selection_id;             // row the reveal and the detail scroll belong to
     std::optional<std::string> revealed;  // fetched value for the selected key
+    Clock::time_point revealed_at;
+    std::string filter;  // keys shown must contain this; folders stay open while it is set
     std::string add_name;
     std::string add_value;
     int name_cursor = 0;  // byte offsets, shared with the FTXUI inputs
@@ -97,13 +211,25 @@ int run_ui(DaemonClient& daemon) {
     bool show_form_problem = false;  // set by a refused submit; then validation is live
     std::string paste_buffer;
     bool pasting = false;  // between bracketed-paste start and end markers
-    std::string status = "ready";
+    std::string status;
+    bool status_is_error = false;  // errors stay until the next key; info expires after kInfoFor
+    Clock::time_point status_at;
+    bool daemon_unreachable = false;  // the last call never reached the daemon; the tree is stale
     Mode mode = Mode::Normal;
     int active_tab = 0;  // 0 = key list, 1 = add/edit form
     int form_field = 0;  // 0 = name input, 1 = value input
     int detail_scroll = 0;     // first detail-pane line shown
-    std::string detail_row_id;  // row detail_scroll belongs to; a new row starts at the top
-    int list_text_width = 0;    // columns a list row may use, set each frame before the menu renders
+    int list_text_width = 0;   // columns a list row may use, set each frame before the menu renders
+
+    auto say = [&](std::string message) {
+        status = std::move(message);
+        status_is_error = false;
+        status_at = Clock::now();
+    };
+    auto complain = [&](std::string message) {
+        status = std::move(message);
+        status_is_error = true;
+    };
 
     auto remask = [&] {
         if (revealed) {
@@ -123,18 +249,50 @@ int run_ui(DaemonClient& daemon) {
     // current_key(), with a status message naming the blocked action.
     auto need_key = [&](const char* action) -> std::optional<std::string> {
         std::optional<std::string> key = current_key();
-        if (!key) status = std::string(rows.empty() ? "no secret to " : "select a secret to ") + action;
+        if (!key) say(std::string(rows.empty() ? "no secret to " : "select a secret to ") + action);
         return key;
     };
 
-    // Rebuild the visible rows from `keys` and `collapsed`. Keys are sorted,
-    // so a folder's members are contiguous and its row is emitted the first
-    // time the prefix appears. `select_id` re-selects a row by id afterwards.
+    // Runs before every event and every frame, so leaving a row re-masks its
+    // value before the next key acts: a quick 'j r' reveals the new row.
+    auto sync_selection = [&] {
+        std::string id = rows.empty() ? "" : row_at(selected).id;
+        if (id == selection_id) return;
+        selection_id = id;
+        remask();
+        detail_scroll = 0;
+    };
+
+    auto select_row = [&](const std::string& id) {
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].id == id) {
+                selected = static_cast<int>(i);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto is_folded = [&](const std::string& folder_id) { return filter.empty() && collapsed.count(folder_id) > 0; };
+
+    // Unfolds every folder above `id` so its row is visible.
+    auto expand_to = [&](const std::string& id) {
+        for (std::size_t slash = id.find('/'); slash != std::string::npos && slash + 1 < id.size();
+             slash = id.find('/', slash + 1)) {
+            collapsed.erase(id.substr(0, slash + 1));
+        }
+    };
+
+    // Rebuild the visible rows from `keys`, `filter` and `collapsed`. Keys are
+    // sorted, so a folder's members are contiguous and its row is emitted the
+    // first time the prefix appears. Returns whether `select_id` was found and
+    // selected; otherwise the selection keeps its index.
     auto rebuild_rows = [&](const std::string& select_id) {
         rows.clear();
         labels.clear();
         std::vector<std::string> branch;  // folder ids open along the current key
         for (const std::string& key : keys) {
+            if (!contains_ignore_case(key, filter)) continue;
             std::vector<std::string> folders;  // "a/", "a/b/", ... for this key
             for (std::size_t slash = key.find('/'); slash != std::string::npos;
                  slash = key.find('/', slash + 1)) {
@@ -147,16 +305,15 @@ int run_ui(DaemonClient& daemon) {
             }
             branch.resize(shared);
             bool hidden = false;
-            for (const std::string& f : branch) hidden = hidden || collapsed.count(f) > 0;
+            for (const std::string& f : branch) hidden = hidden || is_folded(f);
             for (std::size_t d = shared; d < folders.size(); ++d) {
                 branch.push_back(folders[d]);
-                bool folded = collapsed.count(folders[d]) > 0;
                 if (!hidden) {
                     std::size_t name_start = d == 0 ? 0 : folders[d - 1].size();
                     rows.push_back({folders[d], true, static_cast<int>(d)});
                     labels.push_back(folders[d].substr(name_start));
                 }
-                hidden = hidden || folded;
+                hidden = hidden || is_folded(folders[d]);
             }
             if (!hidden) {
                 std::size_t name_start = folders.empty() ? 0 : folders.back().size();
@@ -164,31 +321,69 @@ int run_ui(DaemonClient& daemon) {
                 labels.push_back(key.substr(name_start));
             }
         }
-        if (!select_id.empty()) {
-            for (std::size_t i = 0; i < rows.size(); ++i) {
-                if (rows[i].id == select_id) selected = static_cast<int>(i);
-            }
-        }
+        bool found = !select_id.empty() && select_row(select_id);
         if (selected >= static_cast<int>(rows.size())) selected = static_cast<int>(rows.size()) - 1;
         if (selected < 0) selected = 0;
+        return found;
     };
 
+    // Every daemon call goes through here so the unreachable indicator tracks
+    // the latest attempt.
+    // ponytail: calls block the UI thread, bounded by DaemonClient's 5 s reply
+    // timeout; move them to a worker thread if a busy daemon makes that bite.
+    auto call = [&](const std::string& op, const std::string& key,
+                    const std::optional<std::string>& value) -> json {
+        try {
+            json resp = daemon.request(op, key, value);
+            daemon_unreachable = false;
+            return resp;
+        } catch (const DaemonUnreachable&) {
+            daemon_unreachable = true;
+            throw;
+        } catch (...) {
+            daemon_unreachable = false;  // it answered, with an error
+            throw;
+        }
+    };
+
+    // On failure the last-known tree stays, marked stale when the daemon was unreachable.
     auto refresh = [&](const std::string& select_id) {
         remask();
         try {
-            json resp = daemon.request("list");
+            json resp = call("list", "", std::nullopt);
             keys = resp.value("keys", std::vector<std::string>{});
         } catch (const std::exception& e) {
-            status = e.what();
-            return;
+            complain(e.what());
+            return false;
         }
         std::sort(keys.begin(), keys.end());
         rebuild_rows(select_id);
+        return true;
+    };
+
+    // Reports a failed call on `key`; a key deleted elsewhere also reloads the list.
+    auto fail = [&](const std::exception& e, const std::string& key) {
+        if (std::string_view(e.what()) == "not found" && !key.empty()) {
+            refresh(key);
+            complain("'" + key + "' was removed elsewhere; list reloaded");
+            return;
+        }
+        complain(e.what());
+    };
+
+    auto reload = [&] {
+        if (refresh(rows.empty() ? "" : row_at(selected).id)) {
+            say("reloaded: " + std::to_string(keys.size()) + " key(s)");
+        }
     };
 
     // Fold state of the selected folder: nullopt toggles, true unfolds, false folds.
     auto fold = [&](std::optional<bool> open) {
         if (rows.empty() || !row_at(selected).dir) return;
+        if (!filter.empty()) {
+            say("folders stay open while filtering; Esc clears the filter");
+            return;
+        }
         std::string id = row_at(selected).id;  // copy: rebuild_rows invalidates rows
         bool folded = collapsed.count(id) > 0;
         bool want_folded = open ? !*open : !folded;
@@ -208,25 +403,77 @@ int run_ui(DaemonClient& daemon) {
         for (int i = selected - 1; i >= 0; --i) {
             if (row_at(i).dir && row_at(i).depth < depth) {
                 selected = i;
-                remask();
                 return;
             }
         }
     };
 
+    // Re-filters, keeping the selected row if it still matches, else the first match.
+    auto apply_filter = [&] {
+        if (rebuild_rows(rows.empty() ? "" : row_at(selected).id)) return;
+        auto first_secret = std::find_if(rows.begin(), rows.end(), [](const Row& row) { return !row.dir; });
+        if (first_secret != rows.end()) selected = static_cast<int>(first_secret - rows.begin());
+    };
+
+    auto clear_filter = [&] {
+        if (filter.empty()) return;
+        std::string id = rows.empty() ? "" : row_at(selected).id;
+        filter.clear();
+        expand_to(id);
+        rebuild_rows(id);
+    };
+
     auto reveal = [&] {
         std::optional<std::string> key = need_key("reveal");
         if (!key) return;
+        remask();
         try {
-            json resp = daemon.request("get", *key);
-            remask();
+            json resp = call("get", *key, std::nullopt);
             revealed.emplace();
             take_value(resp, *revealed);
-            status = "revealed " + *key;
+            revealed_at = Clock::now();
         } catch (const std::exception& e) {
             remask();
-            status = e.what();
+            fail(e, *key);
         }
+    };
+
+    auto toggle_reveal = [&] {
+        if (revealed) {
+            remask();
+        } else {
+            reveal();
+        }
+    };
+
+    // Copies without revealing: the value goes straight from the reply into an
+    // OSC 52 escape on the terminal, and both buffers are zeroed after.
+    auto copy_value = [&] {
+        std::optional<std::string> key = need_key("copy");
+        if (!key) return;
+        std::string value;
+        std::string sequence;
+        try {
+            json resp = call("get", *key, std::nullopt);
+            take_value(resp, value);
+            sequence = osc52_copy_sequence(value);
+            write_to_terminal(sequence);
+            say("copied " + *key + " (OSC 52); clipboard managers may keep a copy");
+        } catch (const std::exception& e) {
+            fail(e, *key);
+        }
+        zero(value);
+        zero(sequence);
+    };
+
+    // Expires the reveal and info messages; driven by a once-a-second tick.
+    auto expire = [&] {
+        Clock::time_point now = Clock::now();
+        if (revealed && now - revealed_at >= kRevealFor) {
+            remask();
+            say("value re-masked after 60 s");
+        }
+        if (!status_is_error && !status.empty() && now - status_at >= kInfoFor) status.clear();
     };
 
     auto close_form = [&] {
@@ -251,7 +498,7 @@ int run_ui(DaemonClient& daemon) {
         name_cursor = static_cast<int>(add_name.size());
         mode = Mode::Add;
         active_tab = 1;
-        status = "adding secret";
+        say("adding secret");
     };
 
     // Edit prefills the current value (masked until Ctrl-R) so a small fix
@@ -263,23 +510,23 @@ int run_ui(DaemonClient& daemon) {
         close_form();
         add_value.reserve(kSecretReserve);
         try {
-            json resp = daemon.request("get", *key);
+            json resp = call("get", *key, std::nullopt);
             take_value(resp, add_value);
         } catch (const std::exception& e) {
             zero(add_value);
-            status = e.what();
+            fail(e, *key);
             return;
         }
         value_cursor = static_cast<int>(add_value.size());
         mode = Mode::Edit;
         active_tab = 1;
         form_field = 1;
-        status = "editing " + *key;
+        say("editing " + *key);
     };
 
     auto cancel_form = [&] {
         close_form();
-        status = "cancelled";
+        say("cancelled");
     };
 
     // What stops the open form from saving, if anything. Add and Edit share
@@ -294,16 +541,19 @@ int run_ui(DaemonClient& daemon) {
 
     auto key_exists = [&](const std::string& key) { return std::binary_search(keys.begin(), keys.end(), key); };
 
-    // Writes the form value under `key`; the form stays open on failure.
+    // Writes the form value under `key` and selects it, unfolding its folders
+    // (and dropping a filter it doesn't match); the form stays open on failure.
     auto save_form = [&](const std::string& key, const std::string& verb) {
         try {
-            daemon.request("set", key, add_value);
+            call("set", key, add_value);
         } catch (const std::exception& e) {
-            status = e.what();
+            complain(e.what());
             return false;
         }
         close_form();
-        status = verb + " " + key;
+        say(verb + " " + key);
+        expand_to(key);
+        if (!contains_ignore_case(key, filter)) filter.clear();
         refresh(key);
         return true;
     };
@@ -311,15 +561,15 @@ int run_ui(DaemonClient& daemon) {
     auto submit_add = [&] {
         if (std::optional<std::string> problem = form_problem()) {
             show_form_problem = true;
-            status = *problem;
+            complain(*problem);
             return;
         }
         std::string name = trim_key_name(add_name);
-        std::string selected_id = rows.empty() ? "" : row_at(selected).id;
-        refresh(selected_id);  // the CLI may have added or removed this key meanwhile
+        // The CLI may have added or removed this key meanwhile.
+        if (!refresh(rows.empty() ? "" : row_at(selected).id)) return;
         if (key_exists(name)) {
             mode = Mode::ConfirmOverwrite;
-            status = "'" + name + "' already exists";
+            say("'" + name + "' already exists");
             return;
         }
         save_form(name, "added");
@@ -328,7 +578,7 @@ int run_ui(DaemonClient& daemon) {
     auto submit_edit = [&] {
         if (std::optional<std::string> problem = form_problem()) {
             show_form_problem = true;
-            status = *problem;
+            complain(*problem);
             return;
         }
         save_form(current_key().value_or(""), "updated");
@@ -338,10 +588,10 @@ int run_ui(DaemonClient& daemon) {
     // so a pasted newline can neither submit nor run Normal-mode keys.
     auto finish_paste = [&] {
         if (mode != Mode::Add && mode != Mode::Edit) {
-            status = "paste ignored: open a form with 'a' or 'e' first";
+            say("paste ignored: open a form with 'a' or 'e' first");
         } else if (form_field == 0) {
             if (has_control_char(paste_buffer)) {
-                status = "paste refused: a name is one line";
+                complain("paste refused: a name is one line");
             } else {
                 name_cursor = std::clamp(name_cursor, 0, static_cast<int>(add_name.size()));
                 add_name.insert(static_cast<std::size_t>(name_cursor), paste_buffer);
@@ -353,43 +603,89 @@ int run_ui(DaemonClient& daemon) {
             value_cursor += static_cast<int>(paste_buffer.size());
             bool ends_in_newline = !paste_buffer.empty() && paste_buffer.back() == '\n';
             auto line_count = std::count(paste_buffer.begin(), paste_buffer.end(), '\n') + (ends_in_newline ? 0 : 1);
-            status = "pasted " + std::to_string(line_count) + (line_count == 1 ? " line" : " lines");
+            say("pasted " + std::to_string(line_count) + (line_count == 1 ? " line" : " lines"));
         }
         zero(paste_buffer);
     };
 
-    auto do_delete = [&] {
-        std::string key = current_key().value_or("");
-        try {
-            daemon.request("delete", key, std::nullopt);
-            status = "deleted " + key;
-            refresh("");
-        } catch (const std::exception& e) {
-            status = e.what();
+    // Where the selection lands after deleting the selected row: the next
+    // sibling, else the previous one, else the nearest enclosing folder left,
+    // else the row above the emptied folders.
+    auto delete_landing = [&] {
+        std::vector<std::string> candidates;
+        int depth = row_at(selected).depth;
+        int row_count = static_cast<int>(rows.size());
+        for (int i = selected + 1; i < row_count && row_at(i).depth >= depth; ++i) {
+            if (row_at(i).depth == depth) {
+                candidates.push_back(row_at(i).id);
+                break;
+            }
         }
+        for (int i = selected - 1; i >= 0 && row_at(i).depth >= depth; --i) {
+            if (row_at(i).depth == depth) {
+                candidates.push_back(row_at(i).id);
+                break;
+            }
+        }
+        const std::string& deleted = row_at(selected).id;
+        for (std::string folder = folder_prefix(deleted); !folder.empty();
+             folder = folder_prefix(std::string_view(folder).substr(0, folder.size() - 1))) {
+            candidates.push_back(folder);
+        }
+        // Every enclosing folder emptied: the row above them.
+        for (int i = selected - 1; i >= 0; --i) {
+            if (deleted.compare(0, row_at(i).id.size(), row_at(i).id) != 0) {
+                candidates.push_back(row_at(i).id);
+                break;
+            }
+        }
+        return candidates;
+    };
+
+    auto do_delete = [&] {
         mode = Mode::Normal;
+        std::string key = current_key().value_or("");
+        std::vector<std::string> landing = delete_landing();
+        try {
+            call("delete", key, std::nullopt);
+        } catch (const std::exception& e) {
+            fail(e, key);
+            return;
+        }
+        say("deleted " + key);
+        if (!refresh("")) return;
+        for (const std::string& id : landing) {
+            if (select_row(id)) break;
+        }
     };
 
     refresh("");
+    if (!marks.problem.empty()) {
+        complain(marks.problem);
+    } else if (!marks.project.empty()) {
+        say("◆ marks keys used by project '" + marks.project + "'");
+    }
 
-    // Marker, indentation and fold glyph in front of a row's name. Every row
-    // puts its glyph at column 2*depth, so a top-level secret never lines up
-    // with a folder's children.
+    auto is_marked = [&](const Row& row) { return !row.dir && marks.env_vars_by_key.count(row.id) > 0; };
+
+    // Marker, indentation and glyph in front of a row's name. Every row puts
+    // its glyph at column 2*depth, so a top-level secret never lines up with
+    // a folder's children.
     auto row_prefix = [&](int i, bool is_selected) {
         const Row& row = row_at(i);
-        const char* glyph = !row.dir ? "· " : collapsed.count(row.id) > 0 ? "▸ " : "▾ ";
+        const char* glyph = !row.dir ? (is_marked(row) ? "◆ " : "· ") : is_folded(row.id) ? "▸ " : "▾ ";
         return std::string(is_selected ? "> " : "  ") + std::string(2 * static_cast<std::size_t>(row.depth), ' ') +
                glyph;
     };
 
     MenuOption menu_opt = MenuOption::Vertical();
-    menu_opt.on_change = remask;
     // Names are cut to the pane instead of letting the menu scroll sideways,
     // which would hide the marker and the tree structure.
     menu_opt.entries_option.transform = [&](const EntryState& entry) {
         std::string prefix = row_prefix(entry.index, entry.active);
         Element line = text(prefix + ellipsize(entry.label, list_text_width - text_columns(prefix)));
         if (row_at(entry.index).dir) line |= bold;
+        if (is_marked(row_at(entry.index))) line |= color(Color::Cyan);
         if (entry.active) line |= inverted;
         return line;
     };
@@ -417,6 +713,7 @@ int run_ui(DaemonClient& daemon) {
     };
 
     auto renderer = Renderer(tab, [&] {
+        sync_selection();
         // FTXUI sizes its screen only after Render, so a resize would lag a
         // frame behind screen.dimx(); ask the terminal directly.
         Dimensions terminal = Terminal::Size();
@@ -434,10 +731,14 @@ int run_ui(DaemonClient& daemon) {
             list_width = std::clamp(longest + 3, 24, terminal.dimx * 2 / 5);
         }
         list_text_width = list_width - 3;
-        Element list_pane = window(text(" secrets "),
-                                   rows.empty() ? (text("(empty)") | dim | center)
-                                                : (menu->Render() | vscroll_indicator | yframe)) |
-                            size(WIDTH, EQUAL, list_width) | size(HEIGHT, EQUAL, list_height);
+        std::string list_title = " secrets ";
+        if (!marks.project.empty()) list_title += "◆ " + marks.project + " ";
+        if (daemon_unreachable) list_title += "(stale) ";
+        Element list_body = !rows.empty()       ? (menu->Render() | vscroll_indicator | yframe)
+                            : !filter.empty()   ? (text("(no match)") | dim | center)
+                                                : (text("(empty)") | dim | center);
+        Element list_pane =
+            window(text(list_title), list_body) | size(WIDTH, EQUAL, list_width) | size(HEIGHT, EQUAL, list_height);
 
         int detail_width = stacked ? terminal.dimx : terminal.dimx - list_width;
         int detail_height = stacked ? panes_height - list_height : panes_height;
@@ -449,13 +750,8 @@ int run_ui(DaemonClient& daemon) {
                 detail_lines.push_back(text(std::string(piece)) | style);
             }
         };
-        std::string detail_id = rows.empty() ? "" : row_at(selected).id;
-        if (detail_id != detail_row_id) {
-            detail_row_id = detail_id;
-            detail_scroll = 0;
-        }
         if (rows.empty()) {
-            detail_lines.push_back(text("press 'a' to add a secret") | dim);
+            detail_lines.push_back(text(filter.empty() ? "press 'a' to add a secret" : "Esc clears the filter") | dim);
         } else if (row_at(selected).dir) {
             const std::string& folder = row_at(selected).id;
             std::size_t count = 0;
@@ -467,15 +763,21 @@ int run_ui(DaemonClient& daemon) {
             detail_lines.push_back(separator());
             detail_lines.push_back(text(std::to_string(count) + " secret(s)"));
         } else {
+            const std::string& key = row_at(selected).id;
             detail_lines.push_back(text("name:") | dim);
-            add_wrapped(row_at(selected).id, bold);
+            add_wrapped(key, bold);
+            auto mapped = marks.env_vars_by_key.find(key);
+            if (mapped != marks.env_vars_by_key.end()) {
+                detail_lines.push_back(text("env var in " + marks.project + "'s manifest:") | dim);
+                for (const std::string& env_var : mapped->second) add_wrapped(env_var, color(Color::Cyan));
+            }
             detail_lines.push_back(separator());
             detail_lines.push_back(text("value:") | dim);
             if (revealed) {
                 add_wrapped(*revealed, nothing);
             } else {
                 detail_lines.push_back(text("••••••••"));
-                detail_lines.push_back(text("(press 'r' to reveal)") | dim);
+                detail_lines.push_back(text("(Enter or r reveals, c copies)") | dim);
             }
         }
         int detail_line_count = static_cast<int>(detail_lines.size());
@@ -494,9 +796,20 @@ int run_ui(DaemonClient& daemon) {
 
         std::vector<std::string> hint_items;
         if (mode == Mode::Normal) {
-            hint_items = {"j/k move", revealed ? "r hide" : "r reveal"};
+            hint_items = {"j/k move"};
+            if (current_key()) {
+                hint_items.insert(hint_items.end(), {revealed ? "Enter/r hide" : "Enter/r reveal", "c copy"});
+            }
             if (detail_overflows) hint_items.push_back("J/K scroll");
-            hint_items.insert(hint_items.end(), {"h/l fold", "a add", "e edit", "d delete", "q quit"});
+            if (daemon_unreachable) hint_items.push_back("R retry");
+            if (!filter.empty()) hint_items.push_back("Esc clear filter");
+            hint_items.insert(hint_items.end(), {"h/l fold", "/ filter", "a add", "e edit", "d delete"});
+            if (!daemon_unreachable) hint_items.push_back("R reload");
+            hint_items.push_back("? help  q quit");
+        } else if (mode == Mode::Filter) {
+            hint_items = {"type to narrow", "↑/↓ move", "Enter keep filter", "Esc clear"};
+        } else if (mode == Mode::Help) {
+            hint_items = {"any key closes help"};
         } else if (mode == Mode::Add || mode == Mode::Edit) {
             bool in_name = mode == Mode::Add && form_field == 0;
             hint_items = {in_name ? "Enter next field" : "Enter save"};
@@ -510,13 +823,25 @@ int run_ui(DaemonClient& daemon) {
 
         // The message comes first and shrinks last; the socket path only shows when it fits.
         std::string message = " " + status + " ";
-        std::string key_count = " keys: " + std::to_string(keys.size()) + " ";
-        std::string socket = " " + daemon.socket_path() + " ";
-        Elements status_parts = {text(message) | flex, separator(), text(key_count)};
-        if (text_columns(message) + text_columns(key_count) + text_columns(socket) + 2 <= terminal.dimx) {
+        Elements status_parts = {status_is_error ? text(message) | bold | color(Color::Red) | flex
+                                                 : text(message) | flex};
+        int used_columns = text_columns(message);
+        auto add_part = [&](const std::string& part, Decorator style) {
             status_parts.push_back(separator());
-            status_parts.push_back(text(socket) | dim);
+            status_parts.push_back(text(part) | style);
+            used_columns += text_columns(part) + 1;
+        };
+        if (daemon_unreachable) add_part(" daemon unreachable: list stale ", bold | color(Color::Red));
+        if (mode == Mode::Filter || !filter.empty()) {
+            add_part(" filter: " + filter + (mode == Mode::Filter ? "▏" : "") + " ", bold);
         }
+        if (revealed) {
+            auto left = std::chrono::ceil<std::chrono::seconds>(kRevealFor - (Clock::now() - revealed_at));
+            add_part(" shown, hides in " + std::to_string(std::max<long long>(left.count(), 0)) + "s ", bold);
+        }
+        add_part(" keys: " + std::to_string(keys.size()) + " ", nothing);
+        std::string socket = " " + daemon.socket_path() + " ";
+        if (used_columns + text_columns(socket) + 1 <= terminal.dimx) add_part(socket, dim);
         Element status_bar = hbox(std::move(status_parts)) | inverted;
 
         Element panes = stacked ? vbox({list_pane, detail_pane}) : hbox({list_pane, detail_pane});
@@ -556,6 +881,17 @@ int run_ui(DaemonClient& daemon) {
             }
             root = dbox({root, modal(window(text(" confirm "), vbox(std::move(question_lines))))});
         }
+        if (mode == Mode::Help) {
+            Elements help_lines;
+            for (const HelpLine& line : kHelp) {
+                if (!line.keys) {
+                    help_lines.push_back(text(line.text) | bold);
+                } else {
+                    help_lines.push_back(hbox({text("  "), text(line.keys) | size(WIDTH, EQUAL, 20), text(line.text)}));
+                }
+            }
+            root = dbox({root, modal(window(text(" keys "), vbox(std::move(help_lines))))});
+        }
         return root;
     });
 
@@ -563,6 +899,16 @@ int run_ui(DaemonClient& daemon) {
     const Event paste_end = Event::Special("\x1b[201~");
 
     Component app = CatchEvent(renderer, [&](Event event) -> bool {
+        if (event == Event::Custom) {  // the once-a-second tick
+            expire();
+            return true;
+        }
+        sync_selection();
+        expire();
+        bool is_mouse_press = event.is_mouse() && event.mouse().motion == Mouse::Pressed;
+        // Any key or click ends the previous message, error or not.
+        if (!event.is_mouse() || is_mouse_press) status.clear();
+
         if (event == Event::CtrlC) {  // quit through Exit so the buffers below get zeroed
             screen.Exit();
             return true;
@@ -580,7 +926,7 @@ int run_ui(DaemonClient& daemon) {
             } else if (event == Event::Escape) {  // a lost end marker must not swallow input forever
                 pasting = false;
                 zero(paste_buffer);
-                status = "paste aborted";
+                say("paste aborted");
             } else if (event.is_character()) {
                 paste_buffer += event.character();
             } else if (event == Event::Return) {
@@ -590,9 +936,59 @@ int run_ui(DaemonClient& daemon) {
             }
             return true;
         }
+        if (mode == Mode::Help) {
+            if (!event.is_mouse()) mode = Mode::Normal;
+            return true;
+        }
+        if (mode == Mode::Filter) {
+            if (event == Event::Return) {
+                mode = Mode::Normal;
+            } else if (event == Event::Escape) {
+                clear_filter();
+                mode = Mode::Normal;
+            } else if (event == Event::Backspace) {
+                while (!filter.empty()) {
+                    char removed = filter.back();
+                    filter.pop_back();
+                    if ((static_cast<unsigned char>(removed) & 0xC0) != 0x80) break;  // whole code point gone
+                }
+                apply_filter();
+            } else if (event == Event::CtrlU) {
+                filter.clear();
+                apply_filter();
+            } else if (event.is_character()) {
+                filter += event.character();
+                apply_filter();
+            } else {
+                return false;  // arrows, PgUp/PgDn, Home/End and the mouse reach the menu
+            }
+            return true;
+        }
         if (mode == Mode::Normal) {
+            if (is_mouse_press && event.mouse().button == Mouse::Left) {
+                bool on_row = menu->OnEvent(event);
+                sync_selection();
+                if (on_row && !rows.empty() && row_at(selected).dir) fold(std::nullopt);
+                return true;
+            }
             if (event == Event::Character('q')) {
                 screen.Exit();
+                return true;
+            }
+            if (event == Event::Character('?') || event == Event::F1) {
+                mode = Mode::Help;
+                return true;
+            }
+            if (event == Event::Character('/')) {
+                mode = Mode::Filter;
+                return true;
+            }
+            if (event == Event::Escape) {
+                clear_filter();
+                return true;
+            }
+            if (event == Event::Character('R')) {
+                reload();
                 return true;
             }
             if (event == Event::Character('a')) {
@@ -603,13 +999,12 @@ int run_ui(DaemonClient& daemon) {
                 start_edit();
                 return true;
             }
+            if (event == Event::Character('c')) {
+                copy_value();
+                return true;
+            }
             if (event == Event::Character('r')) {
-                if (revealed) {
-                    remask();
-                    status = "hidden";
-                } else {
-                    reveal();
-                }
+                toggle_reveal();
                 return true;
             }
             if (event == Event::Character('d')) {
@@ -618,16 +1013,19 @@ int run_ui(DaemonClient& daemon) {
             }
             if (event == Event::Return || event == Event::Character(' ')) {
                 if (current_key()) {
-                    reveal();
+                    toggle_reveal();
                 } else {
                     fold(std::nullopt);
                 }
                 return true;
             }
+            if (event == Event::Character('g') || event == Event::Character('G')) {
+                selected = event == Event::Character('g') ? 0 : std::max(static_cast<int>(rows.size()) - 1, 0);
+                return true;
+            }
             if (event == Event::ArrowLeft || event == Event::Character('h')) {
-                bool open_folder = !rows.empty() && row_at(selected).dir &&
-                                   collapsed.count(row_at(selected).id) == 0;
-                if (open_folder) {
+                bool open_folder = !rows.empty() && row_at(selected).dir && !is_folded(row_at(selected).id);
+                if (open_folder && filter.empty()) {
                     fold(false);
                 } else {
                     go_parent();
@@ -635,14 +1033,21 @@ int run_ui(DaemonClient& daemon) {
                 return true;
             }
             if (event == Event::ArrowRight || event == Event::Character('l')) {
-                fold(true);
+                if (rows.empty() || !row_at(selected).dir) return true;
+                bool has_child_row = selected + 1 < static_cast<int>(rows.size()) &&
+                                     row_at(selected + 1).depth > row_at(selected).depth;
+                if (is_folded(row_at(selected).id)) {
+                    fold(true);
+                } else if (has_child_row) {
+                    ++selected;
+                }
                 return true;
             }
             if (event == Event::Character('J') || event == Event::Character('K')) {
                 detail_scroll += event == Event::Character('J') ? 1 : -1;  // the renderer clamps it
                 return true;
             }
-            return false;  // up/down and j/k fall through to the menu
+            return false;  // up/down, j/k, PgUp/PgDn, Home/End and the wheel fall through to the menu
         }
         if (mode == Mode::Add || mode == Mode::Edit) {
             if (event == Event::Escape) {
@@ -683,26 +1088,41 @@ int run_ui(DaemonClient& daemon) {
             }
             return false;  // typing falls through to the focused input
         }
-        // Confirm modes consume every key so nothing leaks to the menu or form.
+        // Confirm modes consume every event; only a key answers, so the mouse
+        // moving over the terminal can't cancel the question.
+        if (event.is_mouse()) return true;
         bool confirmed = event == Event::Character('y') || event == Event::Character('Y');
         if (mode == Mode::ConfirmOverwrite) {
             if (!confirmed || !save_form(trim_key_name(add_name), "updated")) mode = Mode::Add;
-            if (!confirmed) status = "not saved; edit the name or Esc";
+            if (!confirmed) say("not saved; edit the name or Esc");
             return true;
         }
         if (confirmed) {
             do_delete();
         } else {
             mode = Mode::Normal;
-            status = "cancelled";
+            say("cancelled");
         }
         return true;
+    });
+
+    // Drives the reveal countdown, the auto re-mask and message expiry.
+    std::mutex tick_mutex;
+    std::condition_variable_any tick_wakeup;
+    std::jthread ticker([&](std::stop_token stop) {
+        std::unique_lock lock(tick_mutex);
+        while (!tick_wakeup.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; })) {
+            if (stop.stop_requested()) return;
+            screen.PostEvent(Event::Custom);
+        }
     });
 
     screen.ForceHandleCtrlC(false);
     std::cout << "\x1b[?2004h" << std::flush;  // bracketed paste; FTXUI doesn't request it
     screen.Loop(app);
     std::cout << "\x1b[?2004l" << std::flush;
+    ticker.request_stop();
+    ticker.join();
 
     remask();
     zero(add_name);
@@ -720,12 +1140,24 @@ int run_tui() {
     }
 
     Paths paths = resolve_paths();
+    if (::access(paths.token.c_str(), F_OK) != 0) {
+        std::fprintf(stderr, "secretov: no API token at %s\n  run 'secretov init' to create the store and token\n",
+                     paths.token.c_str());
+        return 1;
+    }
     try {
         DaemonClient daemon(paths);
-        daemon.request("list");  // fail fast if unreachable/unauthorized
-        return run_ui(daemon);
+        daemon.request("list");  // fail fast if unreachable/unauthorized, before the screen goes fullscreen
+        return run_ui(daemon, load_project_marks());
+    } catch (const DaemonUnreachable& e) {
+        std::fprintf(stderr, "secretov: %s\n  %s\n", e.what(), kStartDaemonHint);
+        return 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "secretov: %s\n", e.what());
+        if (std::string_view(e.what()) == "invalid token") {
+            std::fprintf(stderr, "  %s differs from the token the daemon loaded at start; restart the daemon\n",
+                         paths.token.c_str());
+        }
         return 1;
     }
 }

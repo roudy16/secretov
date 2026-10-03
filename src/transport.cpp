@@ -3,6 +3,7 @@
 #include <sodium.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -51,7 +52,7 @@ Connection::~Connection() {
 }
 
 Connection::Connection(Connection&& other) noexcept
-    : fd_(other.fd_), buffer_(std::move(other.buffer_)), scanned_(other.scanned_) {
+    : fd_(other.fd_), buffer_(std::move(other.buffer_)), scanned_(other.scanned_), timed_out_(other.timed_out_) {
     other.fd_ = -1;
 }
 
@@ -64,6 +65,7 @@ Connection& Connection::operator=(Connection&& other) noexcept {
         fd_ = other.fd_;
         buffer_ = std::move(other.buffer_);
         scanned_ = other.scanned_;
+        timed_out_ = other.timed_out_;
         other.fd_ = -1;
     }
     return *this;
@@ -88,6 +90,7 @@ std::optional<std::string> Connection::read_line(std::size_t max_line_bytes) {
         char chunk[4096];
         ssize_t n = read_retry(fd_, chunk, sizeof(chunk));
         if (n < 0) {
+            timed_out_ = errno == EAGAIN || errno == EWOULDBLOCK;
             return std::nullopt;
         }
         if (n == 0) {
@@ -110,6 +113,7 @@ bool Connection::write_line(const std::string& line) {
             if (errno == EINTR) {
                 continue;
             }
+            timed_out_ = errno == EAGAIN || errno == EWOULDBLOCK;
             return false;
         }
         total += static_cast<size_t>(n);
@@ -124,6 +128,15 @@ uid_t Connection::peer_uid() const {
         throw_errno("getsockopt(SO_PEERCRED) failed");
     }
     return cred.uid;
+}
+
+void Connection::set_timeout(int seconds) {
+    struct timeval limit{};
+    limit.tv_sec = seconds;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit)) != 0 ||
+        ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof(limit)) != 0) {
+        throw_errno("setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) failed");
+    }
 }
 
 Listener::Listener(const std::string& path) : fd_(-1), path_(path) {
