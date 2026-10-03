@@ -445,7 +445,8 @@ is a portability limit on adding them, not this host's constraint.)
 ### 30. No passphrase floor; KDF params frozen at create (I1) — `done` (2026-10-03, afa8352, 8690859)
 
 `init` and `passwd` warn (not refuse) below 12 characters. `passwd` writes
-the current default Argon2id params (MODERATE), upgrading older stores;
+the stronger of the store's and the default Argon2id params (MODERATE),
+upgrading older stores and never downgrading;
 `rotate` keeps the store's params (`accepted`: changing them would cost a
 second Argon2id call).
 

@@ -425,12 +425,12 @@ void Store::change_passphrase(const std::string& old_pass, const std::string& ne
 
     // A fresh data key, not a re-wrap of the old one: an old copy of the file
     // plus the old passphrase must not unwrap the key protecting later writes.
-    // Current default KDF params, so passwd upgrades a store made with weaker
-    // ones.
+    // At least the current default KDF params, so passwd upgrades a store made
+    // with weaker ones and never downgrades a stronger one.
     Envelope next;
     randombytes_buf(next.salt, sizeof(next.salt));
-    next.opslimit = kDefaultOpslimit;
-    next.memlimit = kDefaultMemlimit;
+    next.opslimit = std::max<std::uint64_t>(env_.opslimit, kDefaultOpslimit);
+    next.memlimit = std::max<std::uint64_t>(env_.memlimit, kDefaultMemlimit);
     next.key_created_at = now;
     unsigned char* new_data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
     unsigned char* new_wrap_key = nullptr;

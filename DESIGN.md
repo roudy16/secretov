@@ -92,8 +92,8 @@ Two distinct operations, as in envelope-based managers:
   It does nothing for secrets already in the store (a reader of daemon memory
   has those too) and nothing against a leaked passphrase.
 - `passwd` — new wrapping key AND new data key. Fresh salt, derive from the
-  new passphrase at the current default Argon2id params (MODERATE, upgrading
-  a store created weaker), mint a data key, re-encrypt the payload under it,
+  new passphrase at the stronger of the store's and the default Argon2id
+  params (MODERATE: upgrades a weaker store, never downgrades), mint a data key, re-encrypt the payload under it,
   and reset key-created-at. This is the response to a leaked passphrase: an
   old copy plus the old passphrase opens only what that copy held. `rotate`
   keeps the store's KDF params (changing them would cost a second Argon2id).

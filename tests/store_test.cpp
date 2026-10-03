@@ -291,6 +291,12 @@ void test_passwd_upgrades_kdf_params() {
     assert(read_u64_le(upgraded, kMemlimitOff) == crypto_pwhash_MEMLIMIT_MODERATE);
     Store s = Store::open(path, "new pass");
     assert(s.get("secret").value() == "value");
+
+    std::string strong_path = store_path("s12b");
+    const std::uint64_t strong_ops = crypto_pwhash_OPSLIMIT_MODERATE + 1;
+    write_v2_store(strong_path, kPass, strong_ops, crypto_pwhash_MEMLIMIT_MODERATE);
+    Store::open(strong_path, kPass).change_passphrase(kPass, "new pass", kNow2);
+    assert(read_u64_le(read_raw(strong_path), kOpslimitOff) == strong_ops);
 }
 
 // 13. rotate and passwd whose write fails (read-only dir) leave memory
