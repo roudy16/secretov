@@ -213,7 +213,9 @@ void test_denied_env_names() {
                              "npm_config_script_shell", "LUA_INIT", "Ld_Preload", "SSLKEYLOGFILE",
                              "PYTHONWARNINGS", "BROWSER", "GLIBC_TUNABLES", "GOPROXY", "PIP_INDEX_URL",
                              "UV_INDEX_URL", "CARGO_BUILD_RUSTC_WRAPPER", "RUSTC_WRAPPER", "DOTNET_STARTUP_HOOKS",
-                             "NODE_TLS_REJECT_UNAUTHORIZED", "AWS_CA_BUNDLE", "SHELLOPTS"}) {
+                             "NODE_TLS_REJECT_UNAUTHORIZED", "AWS_CA_BUNDLE", "SHELLOPTS", "CC", "cxx", "GOWORK",
+                             "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "CARGO_REGISTRIES_X_INDEX", "UV_PUBLISH_URL",
+                             "CARGO_REGISTRIES__TOKEN"}) {
         std::string as_var = std::string("name: p\nenv:\n  dev:\n    vars:\n      ") + name + ": x\n";
         assert(throws_with([&] { parse_manifest(as_var, "t"); }, "cannot be set from a manifest"));
         std::string as_secret =
@@ -223,6 +225,14 @@ void test_denied_env_names() {
     // Look-alikes pass: deny entries are exact names or prefixes.
     Manifest m = parse_manifest("name: p\nenv:\n  dev:\n    vars:\n      PATHS: /x\n      ENVIRONMENT: y\n      no_proxy: z\n      PROXY: w\n      GOOGLE_API_KEY: k\n", "t");
     assert(m.vars.at("dev").size() == 5);
+    // Registry credentials under a denied prefix are secrets, not loader paths.
+    Manifest creds = parse_manifest(
+        "name: p\nenv:\n  dev:\n    secrets:\n"
+        "      a: {env_var_name: CARGO_REGISTRY_TOKEN}\n      b: {env_var_name: CARGO_REGISTRIES_MY_CO_TOKEN}\n"
+        "      c: {env_var_name: UV_PUBLISH_TOKEN}\n      d: {env_var_name: UV_PUBLISH_PASSWORD}\n"
+        "      e: {env_var_name: UV_PUBLISH_USERNAME}\n",
+        "t");
+    assert(creds.envs.at("dev").size() == 5);
 }
 
 

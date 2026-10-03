@@ -60,21 +60,7 @@ DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
     }
 }
 
-nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
-    std::optional<Connection> conn = connect_unix(socket_path_);
-    if (!conn) {
-        throw DaemonUnreachable("daemon not running at " + socket_path_ + " ?", DaemonUnreachable::Stage::NotRunning);
-    }
-    std::string op = req.value("op", std::string{});
-    int timeout_seconds = op == "rotate" || op == "passwd" ? kKdfReplyTimeoutSeconds : kReplyTimeoutSeconds;
-    conn->set_timeout(timeout_seconds);
-    std::string no_reply = "no reply within " + std::to_string(timeout_seconds) + " s";
-    // Authenticate the daemon end before the token or any passphrase leaves us.
-    uid_t daemon_uid = conn->peer_uid();
-    if (daemon_uid != ::getuid()) {
-        throw std::runtime_error("socket " + socket_path_ + " is served by uid " +
-                                 std::to_string(daemon_uid) + ", not ours; refusing to send");
-    }
+std::string DaemonClient::serialize(const nlohmann::json& req) const {
     nlohmann::json full = req;
     full["token"] = token_;
     std::string request_line;
@@ -92,6 +78,25 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
         throw std::runtime_error("value too large: the request is " + std::to_string(request_bytes) +
                                  " bytes, the daemon's limit is " + std::to_string(kMaxRequestBytes));
     }
+    return request_line;
+}
+
+nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
+    std::optional<Connection> conn = connect_unix(socket_path_);
+    if (!conn) {
+        throw DaemonUnreachable("daemon not running at " + socket_path_ + " ?", DaemonUnreachable::Stage::NotRunning);
+    }
+    std::string op = req.value("op", std::string{});
+    int timeout_seconds = op == "rotate" || op == "passwd" ? kKdfReplyTimeoutSeconds : kReplyTimeoutSeconds;
+    conn->set_timeout(timeout_seconds);
+    std::string no_reply = "no reply within " + std::to_string(timeout_seconds) + " s";
+    // Authenticate the daemon end before the token or any passphrase leaves us.
+    uid_t daemon_uid = conn->peer_uid();
+    if (daemon_uid != ::getuid()) {
+        throw std::runtime_error("socket " + socket_path_ + " is served by uid " +
+                                 std::to_string(daemon_uid) + ", not ours; refusing to send");
+    }
+    std::string request_line = serialize(req);
     bool sent = conn->write_line(request_line);
     scrub(request_line);
     if (!sent) {
@@ -127,11 +132,33 @@ nlohmann::json DaemonClient::request_raw(const nlohmann::json& req) const {
     return resp;
 }
 
-nlohmann::json DaemonClient::request(const std::string& op, const std::string& key,
-                                     std::optional<std::string_view> value) const {
+namespace {
+
+nlohmann::json make_request(const std::string& op, const std::string& key, std::optional<std::string_view> value) {
     nlohmann::json req{{"op", op}};
     if (!key.empty()) req["key"] = key;
     if (value) req["value"] = std::string(*value);
+    return req;
+}
+
+}  // namespace
+
+void DaemonClient::check_request(const std::string& op, const std::string& key,
+                                 std::optional<std::string_view> value) const {
+    nlohmann::json req = make_request(op, key, value);
+    try {
+        std::string request_line = serialize(req);
+        scrub(request_line);
+    } catch (...) {
+        scrub_secret_fields(req);
+        throw;
+    }
+    scrub_secret_fields(req);
+}
+
+nlohmann::json DaemonClient::request(const std::string& op, const std::string& key,
+                                     std::optional<std::string_view> value) const {
+    nlohmann::json req = make_request(op, key, value);
     try {
         nlohmann::json resp = request_raw(req);
         scrub_secret_fields(req);
@@ -638,15 +665,14 @@ int cmd_import(int argc, char** argv) {
             throw std::runtime_error("already in store (pass --overwrite to replace):" + list);
         }
 
-        // A value over the daemon's request cap would fail midway through the
-        // sets below, leaving earlier keys stored and no manifest. JSON escaping
-        // can still push a value just under the cap over it; the loop names
-        // what was stored then.
+        // A request send() would refuse (over the daemon's cap once escaped, or
+        // invalid UTF-8) would fail midway through the sets below, leaving
+        // earlier keys stored and no manifest.
         for (const auto& [var, value] : pairs) {
-            if (value.size() + scoped_key(env, project, var).size() >= kMaxRequestBytes) {
-                throw std::runtime_error(var + "'s value is " + std::to_string(value.size()) +
-                                         " bytes, over the daemon's request limit of " +
-                                         std::to_string(kMaxRequestBytes) + "; nothing imported");
+            try {
+                client.check_request("set", scoped_key(env, project, var), value);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(var + ": " + e.what() + "; nothing imported");
             }
         }
 

@@ -653,9 +653,10 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 name_cursor += static_cast<int>(paste_buffer.size());
             }
         } else {
+            // Like `set`: a token copied with its line ending must not store it.
+            if (!paste_buffer.empty() && paste_buffer.back() == '\n') paste_buffer.pop_back();
             insert_into_value(paste_buffer);
-            bool ends_in_newline = !paste_buffer.empty() && paste_buffer.back() == '\n';
-            auto line_count = std::count(paste_buffer.begin(), paste_buffer.end(), '\n') + (ends_in_newline ? 0 : 1);
+            auto line_count = std::count(paste_buffer.begin(), paste_buffer.end(), '\n') + 1;
             say("pasted " + std::to_string(line_count) + (line_count == 1 ? " line" : " lines"));
         }
         zero(paste_buffer);
@@ -1024,15 +1025,25 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             root = dbox({root, modal(window(text(title), vbox(std::move(lines))) | size(WIDTH, EQUAL, overlay_width))});
         }
         if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmOverwrite) {
-            std::string question = mode == Mode::ConfirmDelete
-                                       ? "Delete '" + current_key().value_or("") + "'? [y/N]"
-                                       : "Overwrite '" + trim_key_name(add_name) + "'? [y/N]";
-            question = printable(question);
+            std::string name = printable(mode == Mode::ConfirmDelete ? current_key().value_or("")
+                                                                     : trim_key_name(add_name));
+            std::string verb = mode == Mode::ConfirmDelete ? "Delete '" : "Overwrite '";
+            constexpr std::string_view kAsk = "'? [y/N]";
+            std::string question = verb + name + std::string(kAsk);
             // Side by side, dimx - 8 keeps a visible segment of the pane borders
             // outside the modal's margin. Stacked, the modal spans the full width
             // like the form, so no pane text shows beside it.
             int question_width = stacked ? std::max(terminal.dimx - 4, 10)
                                          : std::min(text_columns(question), std::max(terminal.dimx - 8, 10));
+            // Taller than the room above the hint line (4: the modal's blank margin
+            // and the border), the name loses its middle so the [y/N] tail and the
+            // hints stay on screen.
+            int question_rows = std::max(terminal.dimy - 2 * rows_below_panes - 4, 1);
+            if (static_cast<int>(wrap_lines(question, question_width).size()) > question_rows) {
+                int fixed_columns = text_columns(verb) + text_columns(kAsk);
+                question = verb + ellipsize_middle(name, question_rows * question_width - fixed_columns) +
+                           std::string(kAsk);
+            }
             Elements question_lines;
             for (std::string_view piece : wrap_lines(question, question_width)) {
                 question_lines.push_back(text(std::string(piece)));

@@ -109,6 +109,10 @@ void test_wrapping_and_printable() {
 
     assert(secretov::printable("dev/NL\nKEY\x1b[2J\x7f") == "dev/NL?KEY?[2J?");
     assert(secretov::printable("ok/é") == "ok/é");
+    assert(secretov::printable("a\xc2\x9b" "b\xc2\x85") == "a?b?");
+    assert(secretov::ellipsize_middle("dev/api/KEY", 20) == "dev/api/KEY");
+    assert(secretov::ellipsize_middle("dev/api/LONGKEY", 9) == "dev/…GKEY");
+    assert(secretov::ellipsize_middle("dev/é/x", 3) == "d…x");
     assert(secretov::printable_value("a\tb\r\nc\x7f\xc2\x85" "d é") == "a→b?\nc??d é");
 }
 

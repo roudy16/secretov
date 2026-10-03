@@ -391,6 +391,13 @@ boundary stays ceiling #1 (running `exec` in a checkout runs its code).
 directory before storing anything, and updates a symlinked manifest at its
 target instead of replacing the link.
 
+Fifth pass: the prefixes also caught the registry credentials those tools
+read, which then refused a whole manifest mapping one; `CARGO_REGISTRY_TOKEN`,
+`CARGO_REGISTRIES_<NAME>_TOKEN` and `UV_PUBLISH_TOKEN`/`_PASSWORD`/`_USERNAME`
+are now allowed. Also denied: `CC`, `CXX` (run by cc-rs, cgo, sdist builds),
+`GOWORK` (`replace` swaps in local modules), `MAKEFLAGS`, `MFLAGS`,
+`GNUMAKEFLAGS` (`SHELL=...` runs every recipe).
+
 ### 22. Client never authenticated the daemon end (L8) — `done` (2026-10-03, afa8352)
 
 Clients sent the token (and on rotate/passwd the passphrases) to whatever

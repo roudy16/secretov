@@ -57,13 +57,25 @@ bool is_denied_env_name(const std::string& name) {
         "PHP_INI_SCAN_DIR", "GLIBC_TUNABLES", "LOCPATH",        "NLSPATH",    "SHELLOPTS",
         "BASHOPTS",      "R_PROFILE_USER", "JULIA_LOAD_PATH", "TCLLIBPATH", "ERL_AFLAGS",
         "ELIXIR_ERL_OPTIONS", "RUSTC",   "RUSTDOC",           "RUSTFLAGS",  "RUSTDOCFLAGS",
-        "GOENV",         "GOROOT",       "GOTOOLCHAIN",
+        "GOENV",         "GOROOT",       "GOTOOLCHAIN",       "GOWORK",     "CC",
+        "CXX",           "MAKEFLAGS",    "MFLAGS",            "GNUMAKEFLAGS",
         // Package indexes and module proxies choose the code a build fetches.
         "GOPROXY",       "GONOPROXY",    "GOPRIVATE",         "GOSUMDB",    "GONOSUMDB",
         "GONOSUMCHECK",  "GOINSECURE",
         // CA overrides and key logs let a manifest read the child's secret-bearing requests.
         "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",    "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
         "SSLKEYLOGFILE", "NODE_TLS_REJECT_UNAUTHORIZED", "AWS_CA_BUNDLE", "PYTHONHTTPSVERIFY"};
+    // Credentials under a denied prefix: they hold a secret, not a loader path.
+    static const char* const kCredentialNames[] = {"CARGO_REGISTRY_TOKEN", "UV_PUBLISH_TOKEN", "UV_PUBLISH_PASSWORD",
+                                                   "UV_PUBLISH_USERNAME"};
+    for (const char* credential : kCredentialNames) {
+        if (upper == credential) return false;
+    }
+    constexpr std::string_view kRegistries = "CARGO_REGISTRIES_", kTokenSuffix = "_TOKEN";
+    if (upper.size() > kRegistries.size() + kTokenSuffix.size() && upper.compare(0, kRegistries.size(), kRegistries) == 0 &&
+        upper.compare(upper.size() - kTokenSuffix.size(), kTokenSuffix.size(), kTokenSuffix) == 0) {
+        return false;
+    }
     for (const char* prefix : kDeniedPrefixes) {
         if (upper.compare(0, std::strlen(prefix), prefix) == 0) return true;
     }

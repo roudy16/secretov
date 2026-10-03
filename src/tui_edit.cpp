@@ -25,6 +25,12 @@ std::size_t prefix_bytes(std::string_view text, int width) {
     return text.size();
 }
 
+// A C1 control (U+0080..U+009F) encoded as UTF-8 starts at text[i].
+bool is_c1_at(std::string_view text, std::size_t i) {
+    return static_cast<unsigned char>(text[i]) == 0xC2 && i + 1 < text.size() &&
+           static_cast<unsigned char>(text[i + 1]) >= 0x80 && static_cast<unsigned char>(text[i + 1]) <= 0x9F;
+}
+
 std::size_t clamped(const std::string& text, int cursor) {
     return static_cast<std::size_t>(std::clamp(cursor, 0, static_cast<int>(text.size())));
 }
@@ -115,6 +121,16 @@ std::string ellipsize(std::string_view text, int width) {
     return std::string(text.substr(0, prefix_bytes(text, width - 1))) + "…";
 }
 
+std::string ellipsize_middle(std::string_view text, int width) {
+    int columns = text_columns(text);
+    if (columns <= width) return std::string(text);
+    if (width <= 0) return "";
+    int head = (width - 1) / 2;
+    int tail = width - 1 - head;
+    return std::string(text.substr(0, prefix_bytes(text, head))) + "…" +
+           std::string(text.substr(prefix_bytes(text, columns - tail)));
+}
+
 std::vector<std::string_view> wrap_lines(std::string_view text, int width) {
     width = std::max(width, 1);
     std::vector<std::string_view> pieces;
@@ -182,10 +198,16 @@ std::vector<std::string> help_row_lines(std::string_view keys, std::string_view 
 }
 
 std::string printable(std::string_view text) {
-    std::string shown(text);
-    for (char& c : shown) {
-        auto byte = static_cast<unsigned char>(c);
-        if (byte < 0x20 || byte == 0x7f) c = '?';
+    std::string shown;
+    shown.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        auto byte = static_cast<unsigned char>(text[i]);
+        if (is_c1_at(text, i)) {
+            shown += '?';
+            ++i;
+        } else {
+            shown += byte < 0x20 || byte == 0x7f ? '?' : text[i];
+        }
     }
     return shown;
 }
@@ -197,11 +219,9 @@ std::string printable_value(std::string_view value) {
     shown.reserve(value.size() + tabs * (kTabGlyph.size() - 1));  // exact: no reallocation leaves a copy
     for (std::size_t i = 0; i < value.size(); ++i) {
         auto byte = static_cast<unsigned char>(value[i]);
-        bool c1 = byte == 0xC2 && i + 1 < value.size() && static_cast<unsigned char>(value[i + 1]) >= 0x80 &&
-                  static_cast<unsigned char>(value[i + 1]) <= 0x9F;
         if (byte == '\t') {
             shown += kTabGlyph;
-        } else if (c1) {
+        } else if (is_c1_at(value, i)) {
             shown += '?';
             ++i;
         } else if ((byte < 0x20 && byte != '\n') || byte == 0x7f) {

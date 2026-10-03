@@ -41,6 +41,10 @@ int text_columns(std::string_view text);
 // `text` cut to at most `width` columns, ending in "…" when something was cut.
 std::string ellipsize(std::string_view text, int width);
 
+// `text` cut to at most `width` columns by replacing its middle with "…",
+// so both ends (a key's scope and its last segment) stay visible.
+std::string ellipsize_middle(std::string_view text, int width);
+
 // `text` split at newlines, then each line cut into pieces of at most `width`
 // columns. Views into `text`, so wrapping a revealed value copies nothing.
 std::vector<std::string_view> wrap_lines(std::string_view text, int width);
@@ -54,7 +58,7 @@ std::vector<std::string> word_wrap(std::string_view text, int width);
 // text under 16 columns, the keys (if any) take a line of their own instead.
 std::vector<std::string> help_row_lines(std::string_view keys, std::string_view text, int keys_width, int width);
 
-// `text` with each control byte (C0, DEL) shown as '?'. FTXUI drops most of
+// `text` with each control character (C0, DEL, C1) shown as '?'. FTXUI drops most of
 // them when drawing but keeps '\n' as a line break, so a key name holding one
 // would break the row; and widths must count what is drawn.
 std::string printable(std::string_view text);

@@ -181,7 +181,8 @@ value wrapped (multi-line values keep their lines), and its title shows
 `first-last/total J/K scroll` when they don't fit. A revealed value shows a
 tab as `→` and any other control character as `?`. Below 80 columns the tree
 sits above the detail pane and the add/edit form and the `[y/N]` question
-take the full width. The
+take the full width; a name too long for the question on screen loses its
+middle (`…`) there. The
 status bar shows the latest message first (info clears after a few seconds or
 the next key, errors at the next key), then a `daemon unreachable` (or
 `daemon busy`) marker, the
@@ -221,7 +222,8 @@ the value in the detail pane to see them. Long lines scroll sideways in the
 form with the cursor, which shifts every line while the cursor is on a long
 one; a value taller than the input shows `line N/total` in the form title. Both refuse an empty value.
 A multi-line value (a PEM key) can be pasted into the value field — newlines
-are kept, and the paste never submits the form; a paste into the filter is
+are kept but one trailing newline is dropped, as `set` does, and the paste
+never submits the form; a paste into the filter is
 added to it if it is one line, and any other paste outside a form is ignored.
 With the terminal's bracketed paste (all common terminals and tmux) the paste
 arrives whole. Without it, an Enter or Tab in the value followed within 50 ms
@@ -303,8 +305,11 @@ one that nobody else can change:
   `PHPRC`, `PHP_INI_SCAN_DIR`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`,
   `SHELLOPTS`, `BASHOPTS`, `R_PROFILE_USER`, `JULIA_LOAD_PATH`, `TCLLIBPATH`,
   `ERL_AFLAGS`, `ELIXIR_ERL_OPTIONS`, `RUSTC`, `RUSTDOC`, `RUSTFLAGS`,
-  `RUSTDOCFLAGS`, `GOENV`, `GOROOT`, `GOTOOLCHAIN`, or any `PIP_*`, `UV_*`,
-  `CARGO_*`, `RUSTUP_*`, `RUSTC_*`, `DOTNET_*`, `CORECLR_*` — they make the
+  `RUSTDOCFLAGS`, `GOENV`, `GOROOT`, `GOTOOLCHAIN`, `GOWORK`, `CC`, `CXX`,
+  `MAKEFLAGS`, `MFLAGS`, `GNUMAKEFLAGS`, or any `PIP_*`, `UV_*`, `CARGO_*`,
+  `RUSTUP_*`, `RUSTC_*`, `DOTNET_*`, `CORECLR_*` (except the credentials
+  `CARGO_REGISTRY_TOKEN`, `CARGO_REGISTRIES_<NAME>_TOKEN`, `UV_PUBLISH_TOKEN`,
+  `UV_PUBLISH_PASSWORD`, `UV_PUBLISH_USERNAME`) — they make the
   child (or anything it runs) load code or config the manifest picks — nor
   any `*_PROXY` but `NO_PROXY`, `GOPROXY`, `GONOPROXY`, `GOPRIVATE`,
   `GOSUMDB`, `GONOSUMDB`, `GONOSUMCHECK`, `GOINSECURE`, nor `SSL_CERT_FILE`,
@@ -344,8 +349,8 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `daemon busy: no reply within 5 s` | Another client is holding the daemon's one connection | Find and stop the stuck client: `ss -xp \| grep secretov.sock` shows the peer inode last, `ss -xp \| grep <that inode>` names the holder; then retry |
 | `daemon busy: request sent but no reply within 5 s; it may still be applied` | Same, but the request was already queued: a `set`/`delete` lands once the daemon is free | Stop the stuck client, check with `list`/`get` before retrying (an `import` rerun then needs `--overwrite`) |
 | `value too large: the request is N bytes, the daemon's limit is 1048576` | A value near or over 1 MiB (JSON escaping counts) | Keep large files out of the store; store a path or a smaller secret |
-| `import: VAR's value is N bytes, over the daemon's request limit ...; nothing imported` | A `.env` value over 1 MiB; checked before anything is stored | Remove or shrink it, then rerun |
-| `import: VAR: value too large ...; manifest not updated; already stored ...` | A value just under 1 MiB that JSON escaping pushed over; the keys listed were stored | Fix the value, then rerun with `--overwrite` |
+| `import: VAR: value too large ...; nothing imported` | A `.env` value over 1 MiB once JSON-escaped (a control character counts 6 bytes); every value is checked before anything is stored | Remove or shrink it, then rerun |
+| `import: VAR: [json.exception.type_error.316] ...; nothing imported` | A `.env` value that is not valid UTF-8 | Fix the value's encoding, then rerun |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |

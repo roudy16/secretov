@@ -43,10 +43,18 @@ public:
     // Same, but for a caller-built request (e.g. passwd's extra fields);
     // adds the token.
     nlohmann::json request_raw(const nlohmann::json& req) const;
+    // Throws what request() would before connecting: invalid UTF-8, or a
+    // request over the daemon's size cap once serialized.
+    void check_request(const std::string& op, const std::string& key,
+                       std::optional<std::string_view> value = std::nullopt) const;
 
     const std::string& socket_path() const { return socket_path_; }
 
 private:
+    // `req` plus the token as one request line; throws (zeroing its copies)
+    // on invalid UTF-8 or a line over the daemon's request cap.
+    std::string serialize(const nlohmann::json& req) const;
+
     std::string socket_path_;
     std::string token_;
 };
