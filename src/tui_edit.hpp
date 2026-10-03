@@ -45,6 +45,20 @@ std::string ellipsize(std::string_view text, int width);
 // columns. Views into `text`, so wrapping a revealed value copies nothing.
 std::vector<std::string_view> wrap_lines(std::string_view text, int width);
 
+// `text` split at spaces into lines of at most `width` columns; a word wider
+// than `width` is cut. Runs of spaces collapse. Always at least one line.
+std::vector<std::string> word_wrap(std::string_view text, int width);
+
+// A help row fitted to `width` columns: two spaces, `keys` padded to
+// `keys_width`, then `text` word-wrapped beside them. When that leaves the
+// text under 16 columns, the keys (if any) take a line of their own instead.
+std::vector<std::string> help_row_lines(std::string_view keys, std::string_view text, int keys_width, int width);
+
+// `text` with each control byte (C0, DEL) shown as '?'. FTXUI drops most of
+// them when drawing but keeps '\n' as a line break, so a key name holding one
+// would break the row; and widths must count what is drawn.
+std::string printable(std::string_view text);
+
 // `hints` joined by two spaces, dropping hints before the last one (from the
 // back) until the line fits `width`; the last hint is always kept.
 std::string fit_hints(const std::vector<std::string>& hints, int width);

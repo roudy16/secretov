@@ -12,6 +12,7 @@
 #include <map>
 #include <ostream>
 #include <stdexcept>
+#include <string_view>
 #include <yaml-cpp/yaml.h>
 
 #include "paths.hpp"
@@ -33,7 +34,12 @@ bool is_identifier(const std::string& s) {
 // every grandchild's programs, HOME/XDG_* pick their config); anything not
 // listed here still passes. Upgrade path is an allow-list per project if this leaks.
 bool is_denied_env_name(const std::string& name) {
-    static const char* const kDeniedPrefixes[] = {"LD_", "DYLD_", "SECRETOV_", "GIT_", "XDG_"};
+    // Compared upper-cased: Python lowercases every *_proxy it reads and npm
+    // reads npm_config_* in any case, so an exact-case list misses spellings.
+    std::string upper = name;
+    for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    static const char* const kDeniedPrefixes[] = {"LD_",  "DYLD_",       "SECRETOV_", "GIT_", "XDG_",
+                                                  "NPM_CONFIG_", "BUNDLE_", "GEM_",      "LUA_"};
     static const char* const kDeniedNames[] = {
         "PATH",          "HOME",         "BASH_ENV",          "ENV",        "IFS",
         "PROMPT_COMMAND", "PS1",         "PS4",               "ZDOTDIR",    "PAGER",
@@ -42,18 +48,21 @@ bool is_denied_env_name(const std::string& name) {
         "PYTHONPATH",    "PYTHONHOME",   "PERL5OPT",          "PERL5LIB",   "RUBYOPT",
         "RUBYLIB",       "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "PERLLIB",
         "PYTHONUSERBASE", "PSQLRC",       "SSH_ASKPASS",       "SSH_ASKPASS_REQUIRE",   "KUBECONFIG",
-        "AWS_CONFIG_FILE",
-        // Proxy and CA overrides let a manifest intercept the child's secret-bearing requests.
-        "HTTP_PROXY",    "http_proxy",    "HTTPS_PROXY",       "https_proxy",           "ALL_PROXY",
-        "all_proxy",     "SSL_CERT_FILE", "SSL_CERT_DIR",      "CURL_CA_BUNDLE",        "REQUESTS_CA_BUNDLE",
-        "NODE_EXTRA_CA_CERTS"};
+        "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES",
+        "GOFLAGS",       "CLASSPATH",    "MAVEN_OPTS",        "GRADLE_OPTS", "DOCKER_HOST",
+        // CA overrides and key logs let a manifest read the child's secret-bearing requests.
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",    "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+        "SSLKEYLOGFILE"};
     for (const char* prefix : kDeniedPrefixes) {
-        if (name.compare(0, std::strlen(prefix), prefix) == 0) return true;
+        if (upper.compare(0, std::strlen(prefix), prefix) == 0) return true;
     }
     for (const char* denied : kDeniedNames) {
-        if (name == denied) return true;
+        if (upper == denied) return true;
     }
-    return false;
+    // Any proxy redirects the child's traffic; NO_PROXY can only bypass one.
+    constexpr std::string_view kProxySuffix = "_PROXY";
+    return upper != "NO_PROXY" && upper.size() >= kProxySuffix.size() &&
+           upper.compare(upper.size() - kProxySuffix.size(), kProxySuffix.size(), kProxySuffix) == 0;
 }
 
 // `what` names the offending entry for the error, e.g. "var 'X' (env dev)".
@@ -328,6 +337,18 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
 
 void require_trusted_manifest_dir(const std::string& manifest_path) {
     require_trusted_dir(std::filesystem::path(manifest_path).parent_path());
+}
+
+void require_creatable_manifest_dir(const std::string& manifest_path) {
+    std::filesystem::path dir = std::filesystem::path(manifest_path).parent_path();
+    std::string dir_path = dir.empty() ? "." : dir.string();
+    struct stat st{};
+    if (::stat(dir_path.c_str(), &st) != 0) throw std::runtime_error("stat '" + dir_path + "': " + std::strerror(errno));
+    if (!S_ISDIR(st.st_mode)) throw std::runtime_error("manifest directory '" + dir_path + "' is not a directory");
+    require_trusted(dir_path, st, true);
+    if (::access(dir_path.c_str(), W_OK) != 0) {
+        throw std::runtime_error("cannot create a manifest in '" + dir_path + "': " + std::strerror(errno));
+    }
 }
 
 std::string read_manifest_text(const std::string& path) {

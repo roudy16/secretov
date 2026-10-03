@@ -105,7 +105,10 @@ client that connects and goes silent blocks all others. Same-UID-only
 nuisance; already marked in daemon.cpp for threading if a real client blocks
 another. 2026-10-03: clients now give up after 5 s (60 s for
 rotate/passwd) with `daemon busy` instead of hanging behind such a client;
-the daemon side is unchanged.
+the daemon side is unchanged. The request is already queued in the socket by
+then and still runs once the daemon is free, so a timed-out `set`/`delete`
+now says it "may still be applied" (the TUI marks the outcome unknown) rather
+than reporting a plain failure.
 
 ### 7. Unauthenticated header — `accepted`
 
@@ -364,6 +367,17 @@ those names, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` in both cases,
 `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
 `NODE_EXTRA_CA_CERTS`. `NO_PROXY` stays allowed: it can only bypass a proxy,
 not redirect traffic.
+
+Third pass: `OPENSSL_CONF` (an engine/provider `.so` loaded inside curl,
+Python ssl, libpq), `GOFLAGS=-toolexec`, and a mixed-case `Https_Proxy`
+(Python lowercases every `*_proxy`) still passed. Names are now compared
+upper-cased; denied as well: any `*_PROXY` but `NO_PROXY`, the `NPM_CONFIG_`,
+`BUNDLE_`, `GEM_` and `LUA_` prefixes, `OPENSSL_CONF`/`_ENGINES`/`_MODULES`,
+`GOFLAGS`, `CLASSPATH`, `MAVEN_OPTS`, `GRADLE_OPTS`, `SSLKEYLOGFILE`,
+`AWS_SHARED_CREDENTIALS_FILE`, `DOCKER_HOST`. Still a deny list (ceiling).
+`import` now also requires the manifest's directory to be a writable
+directory before storing anything, and updates a symlinked manifest at its
+target instead of replacing the link.
 
 ### 22. Client never authenticated the daemon end (L8) — `done` (2026-10-03, afa8352)
 

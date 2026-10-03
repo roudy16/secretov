@@ -95,6 +95,22 @@ void test_filter_and_copy() {
     assert(secretov::osc52_copy_sequence("a\nb") == "\x1b]52;c;YQpi\a");
 }
 
+void test_wrapping_and_printable() {
+    using V = std::vector<std::string>;
+    assert(secretov::word_wrap("fold or go to parent", 10) == (V{"fold or go", "to parent"}));
+    assert(secretov::word_wrap("abcdefghij k", 4) == (V{"abcd", "efgh", "ij k"}));
+    assert(secretov::word_wrap("a  b", 10) == (V{"a b"}));
+    assert(secretov::word_wrap("", 5) == (V{""}));
+
+    assert(secretov::help_row_lines("c", "copy the value now", 4, 22) == (V{"  c   copy the value", "      now"}));
+    assert(secretov::help_row_lines("", "aaaa bbbb cccc dddd", 0, 20) == (V{"  aaaa bbbb cccc", "  dddd"}));
+    // Too narrow for a text column: the keys get their own line.
+    assert(secretov::help_row_lines("Ctrl-U", "erase all", 20, 30) == (V{"  Ctrl-U", "    erase all"}));
+
+    assert(secretov::printable("dev/NL\nKEY\x1b[2J\x7f") == "dev/NL?KEY?[2J?");
+    assert(secretov::printable("ok/é") == "ok/é");
+}
+
 }  // namespace
 
 int main() {
@@ -103,6 +119,7 @@ int main() {
     test_readline_edits();
     test_layout_text();
     test_filter_and_copy();
+    test_wrapping_and_printable();
     std::printf("OK\n");
     return 0;
 }

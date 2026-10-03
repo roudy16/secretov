@@ -103,8 +103,10 @@ std::optional<std::string> Connection::read_line(std::size_t max_line_bytes) {
 }
 
 bool Connection::write_line(const std::string& line) {
-    std::string out = line;
-    out.push_back('\n');
+    // Reserved up front: a reallocation would leave an unzeroed copy of the line.
+    std::string out;
+    out.reserve(line.size() + 1);
+    out.append(line).push_back('\n');
 
     size_t total = 0;
     while (total < out.size()) {
@@ -114,10 +116,12 @@ bool Connection::write_line(const std::string& line) {
                 continue;
             }
             timed_out_ = errno == EAGAIN || errno == EWOULDBLOCK;
+            sodium_memzero(out.data(), out.size());
             return false;
         }
         total += static_cast<size_t>(n);
     }
+    sodium_memzero(out.data(), out.size());
     return true;
 }
 

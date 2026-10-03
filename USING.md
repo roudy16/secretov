@@ -145,12 +145,14 @@ or pipe `get` straight into what needs it, or clear scrollback afterwards.
 
 `secretov tui` shows the store as a tree folded on `/`; values stay masked
 until you reveal them, and a revealed value re-masks after 60 seconds (the
-status bar counts down). `?` (or F1) lists every key in every mode.
+status bar counts down). `?` (or F1) lists every key in every mode, plus the
+socket path and any project-manifest problem; `j`/`k`, arrows, PgUp/PgDn or
+the wheel scroll it on a short terminal, any other key closes it.
 
 | Where | Keys |
 |---|---|
-| tree | `j`/`k` or arrows move, PgUp/PgDn page, `g`/`G` or Home/End top/bottom, `h`/Left fold or go to parent, `l`/Right unfold or go to first child, Enter/Space/`r` reveal or hide (on a folder Enter/Space fold), `c` copy the value, `J`/`K` scroll the detail pane, `/` filter, Esc clear filter and message, `a` add, `e` edit, `d` delete, `R` reload, `?`/F1 help, `q`/Ctrl-C quit; mouse: click selects (a folder also folds), wheel moves |
-| filter (`/`) | type to narrow, Backspace erase, Ctrl-U erase all, arrows/PgUp/PgDn move, Enter keep the filter, Esc clear it |
+| tree | `j`/`k` or arrows move, PgUp/PgDn page, `g`/`G` or Home/End top/bottom, `h`/Left fold or go to parent, `l`/Right unfold or go to first child, Enter/Space/`r` reveal or hide (on a folder Enter/Space fold), `c` copy the value, `J`/`K` scroll the detail pane, `/` filter, Esc clear filter and message, `a` add, `e` edit, `d` delete, `R` reload, `?`/F1 help, `q`/Ctrl-C quit (Ctrl-Z does not suspend: resuming would leave safe paste off); mouse: click selects (a folder also folds), wheel moves |
+| filter (`/`) | type or paste to narrow, Backspace erase, Ctrl-U erase all, arrows/PgUp/PgDn move, Enter keep the filter, Esc clear it |
 | add/edit form | Enter: next field (add name) or save, Tab switch field, Esc cancel, Ctrl-R show/hide the value, Ctrl-U erase to line start, Ctrl-W erase previous word or path segment, Ctrl-A/Ctrl-E line start/end |
 | confirm (`[y/N]`) | `y` yes; Enter, Esc, or any other key no |
 
@@ -168,38 +170,50 @@ Run from inside a project, the TUI reads the nearest `.secretov.yaml` with
 the same discovery and trust checks as `exec`, marks the keys it references
 with `◆`, and shows the env var name(s) each maps to in the detail pane. The
 whole store is still shown. A manifest that fails the trust check or does not
-parse marks nothing and says why in the status bar.
+parse marks nothing, says why in the status bar at start, and keeps
+`◆ manifest refused, see ?` in the list title with the full reason in `?`.
 
 The hint line above the status bar shows the keys for the current mode,
 dropping the least-used ones when the terminal is narrow. Long names are cut
 with `…` in the tree; the detail pane shows the full name and the revealed
 value wrapped (multi-line values keep their lines), and its title shows
 `first-last/total J/K scroll` when they don't fit. Below 80 columns the tree
-sits above the detail pane. The status bar shows the latest message first
-(info clears after a few seconds or the next key, errors at the next key),
-then a `daemon unreachable` marker, the active filter, the reveal countdown,
-the key count, and the socket path when there is room.
+sits above the detail pane and the add/edit form takes the full width. The
+status bar shows the latest message first (info clears after a few seconds or
+the next key, errors at the next key), then a `daemon unreachable` marker, the
+active filter, the reveal countdown, the key count, and the socket path. The
+message is never cut: short of room, the socket and key count drop and the
+others shorten (`stale`, `/filter`, `60s`), and a message still too long gets
+up to three rows of its own above them.
 
 The list is fetched at start and after the TUI's own changes; `R` reloads it
 after CLI changes. A key deleted elsewhere is noticed on reveal, copy or edit:
 the list reloads and the status bar says so. If the daemon stops, the last
-tree stays on screen marked `(stale)` until a request (`R`) succeeds again.
-Every daemon call gives up after 5 seconds with `daemon busy` (another client
-holding the daemon's single connection) — the CLI too; `rotate`/`passwd` wait
-60 seconds. At startup the TUI prints how to fix a missing token (`secretov
-init`) or a stopped daemon (`scripts/service start` or `secretov daemon`)
-before taking over the screen.
+tree stays on screen marked `(stale)`, and the status bar says how to start
+it, until a request (`R`) succeeds again. Every daemon call gives up after 5
+seconds with `daemon busy` (another client holding the daemon's single
+connection) — the CLI too; `rotate`/`passwd` wait 60 seconds. The request is
+already queued by then, so the daemon may still carry out a save or delete
+once it is free: the TUI says the key "may still be saved/deleted" and `R`
+shows what happened. At startup the TUI prints how to fix a missing token
+(`secretov init`), a stopped daemon (`scripts/service start` or `secretov
+daemon`) or a busy one before taking over the screen.
 
 Add starts the name at the selected folder (`dev/api/`); the name is trimmed
 and must not start or end with `/` or contain `//` or control characters.
 Adding a name that already exists asks before overwriting. After saving, the
 new key's folders open and it is selected; after a delete the selection moves
 to the nearest key in the same folder. Edit opens with the current value,
-masked. Both refuse an empty value. A multi-line value (a PEM key) can be
-pasted into the value field — newlines are kept, and the paste never submits
-the form; a paste outside a form is ignored. This relies on the terminal's
-bracketed paste, which all common terminals and tmux support; in one without
-it, pipe the value to `set` instead.
+masked (one bullet per character, so its length shows; the detail pane does
+not show it); long lines scroll sideways in the form. Both refuse an empty value.
+A multi-line value (a PEM key) can be pasted into the value field — newlines
+are kept, and the paste never submits the form; a paste into the filter is
+added to it if it is one line, and any other paste outside a form is ignored.
+With the terminal's bracketed paste (all common terminals and tmux) the paste
+arrives whole. Without it, an Enter followed within 50 ms by more input is
+kept as a newline, and keys arriving within 100 ms of a submit are dropped
+(`input right after it ignored`), so the rest of a paste never runs as
+commands. Control characters in key names show as `?`.
 
 ## Non-secret config: `vars:`
 
@@ -252,25 +266,30 @@ one that nobody else can change:
   `set -p/-e`, `import`, `--dry-run`, including `-p` registry lookups)
   refuses with the fix, e.g.
   `refusing manifest directory '/path': writable by group or others; fix with: chmod g-w,o-w '/path'`.
-  An `import` that would create the manifest checks its directory the same
-  way before storing anything. A default umask of 0002 makes new project dirs
+  An `import` that would create or change the manifest checks the same way,
+  and that the directory exists and is writable, before storing anything; a
+  symlinked manifest is updated at its target. A default umask of 0002 makes new project dirs
   group-writable; run the `chmod` it prints.
 - **Discovery** walks up from the current directory only through directories
   you own, so a manifest in `/tmp`, `/home`, or `/` is never picked up. A bad
   nearer manifest is an error; secretov never falls back to one further up.
-- **Denied names.** `vars:` keys and `env_var_name` cannot be `LD_*`,
-  `DYLD_*`, `SECRETOV_*`, `GIT_*`, `XDG_*`, `PATH`, `HOME`, `BASH_ENV`, `ENV`,
+- **Denied names** (compared ignoring case). `vars:` keys and `env_var_name`
+  cannot be `LD_*`, `DYLD_*`, `SECRETOV_*`, `GIT_*`, `XDG_*`, `NPM_CONFIG_*`,
+  `BUNDLE_*`, `GEM_*`, `LUA_*`, `PATH`, `HOME`, `BASH_ENV`, `ENV`,
   `IFS`, `PROMPT_COMMAND`, `PS1`, `PS4`, `ZDOTDIR`, `PAGER`, `PSQL_PAGER`,
   `MANPAGER`, `LESSOPEN`, `LESSCLOSE`, `EDITOR`, `VISUAL`, `GCONV_PATH`,
   `NODE_OPTIONS`, `NODE_PATH`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`,
   `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`, `JAVA_TOOL_OPTIONS`,
   `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `PYTHONUSERBASE`, `PSQLRC`,
-  `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `KUBECONFIG`, or `AWS_CONFIG_FILE` —
-  they make the child (or anything it runs) load code or config the manifest
-  picks — nor the proxy and CA overrides `HTTP_PROXY`, `HTTPS_PROXY`,
-  `ALL_PROXY` (either case), `SSL_CERT_FILE`, `SSL_CERT_DIR`,
-  `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, or `NODE_EXTRA_CA_CERTS`, which
-  would let it intercept the child's requests. `--secret KEY=VAR` on your own command line is not filtered.
+  `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `KUBECONFIG`, `AWS_CONFIG_FILE`,
+  `AWS_SHARED_CREDENTIALS_FILE`, `OPENSSL_CONF`, `OPENSSL_ENGINES`,
+  `OPENSSL_MODULES`, `GOFLAGS`, `CLASSPATH`, `MAVEN_OPTS`, `GRADLE_OPTS`, or
+  `DOCKER_HOST` — they make the child (or anything it runs) load code or
+  config the manifest picks — nor any `*_PROXY` but `NO_PROXY`, nor
+  `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS`, or `SSLKEYLOGFILE`, which would let it intercept or
+  read the child's requests. It is a deny list, so a tool with its own
+  loader variable can still slip through. `--secret KEY=VAR` on your own command line is not filtered.
 - **Program lookup.** `exec` finds the command on *your* `PATH` (a manifest
   cannot set `PATH`).
 
@@ -300,6 +319,7 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 |---|---|---|
 | `daemon not running at ... ?` | Daemon down | `scripts/service start`; check `scripts/service status` if it fails |
 | `daemon busy: no reply within 5 s` | Another client is holding the daemon's one connection | Find and stop the stuck client (`ss -xp \| grep secretov`), then retry |
+| `daemon busy: request sent but no reply within 5 s; it may still be applied` | Same, but the request was already queued: a `set`/`delete` lands once the daemon is free | Stop the stuck client, check with `list`/`get` before retrying (an `import` rerun then needs `--overwrite`) |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |

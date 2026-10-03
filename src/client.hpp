@@ -4,15 +4,22 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "paths.hpp"
 
 namespace secretov {
 
-// The daemon could not be asked at all: not running, busy past the reply
-// timeout, or hung up. Daemon-side errors stay plain std::runtime_error.
+// No reply from the daemon: not running, busy past the reply timeout, or hung
+// up. Daemon-side errors stay plain std::runtime_error.
 struct DaemonUnreachable : std::runtime_error {
-    using std::runtime_error::runtime_error;
+    enum class Stage {
+        NotRunning,  // nothing listens at the socket
+        NotSent,     // connected, but the request never left
+        Sent,        // the request is in the daemon's queue: it may still be applied
+    };
+    DaemonUnreachable(const std::string& what, Stage at) : std::runtime_error(what), stage(at) {}
+    Stage stage;
 };
 
 // Talks to the daemon over a fresh connection per request (the daemon serves
@@ -30,8 +37,9 @@ public:
 
     // Same, but throws the daemon's error message on a non-ok reply. Adds
     // token/op/key/value to the request.
+    // The value's copies in the request are zeroed once it is sent.
     nlohmann::json request(const std::string& op, const std::string& key = "",
-                           const std::optional<std::string>& value = std::nullopt) const;
+                           std::optional<std::string_view> value = std::nullopt) const;
     // Same, but for a caller-built request (e.g. passwd's extra fields);
     // adds the token.
     nlohmann::json request_raw(const nlohmann::json& req) const;

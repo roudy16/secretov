@@ -37,6 +37,20 @@ constexpr std::size_t kRecommendedMinPassphraseChars = 12;
 constexpr int kReplyTimeoutSeconds = 5;
 constexpr int kKdfReplyTimeoutSeconds = 60;
 
+void scrub(std::string& text) {
+    text.resize(text.capacity());
+    sodium_memzero(text.data(), text.size());
+    text.clear();
+}
+
+// Request fields that carry a secret value or passphrase.
+void scrub_secret_fields(nlohmann::json& message) {
+    for (const char* field : {"value", "old", "new", "token"}) {
+        auto found = message.find(field);
+        if (found != message.end() && found->is_string()) scrub(found->get_ref<std::string&>());
+    }
+}
+
 }  // namespace
 
 DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
@@ -47,36 +61,48 @@ DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
 }
 
 nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
-    nlohmann::json full = req;
-    full["token"] = token_;
     std::optional<Connection> conn = connect_unix(socket_path_);
     if (!conn) {
-        throw DaemonUnreachable("daemon not running at " + socket_path_ + " ?");
+        throw DaemonUnreachable("daemon not running at " + socket_path_ + " ?", DaemonUnreachable::Stage::NotRunning);
     }
     std::string op = req.value("op", std::string{});
     int timeout_seconds = op == "rotate" || op == "passwd" ? kKdfReplyTimeoutSeconds : kReplyTimeoutSeconds;
     conn->set_timeout(timeout_seconds);
-    std::string busy = "daemon busy: no reply within " + std::to_string(timeout_seconds) +
-                       " s (another client may be holding it)";
+    std::string no_reply = "no reply within " + std::to_string(timeout_seconds) + " s";
     // Authenticate the daemon end before the token or any passphrase leaves us.
     uid_t daemon_uid = conn->peer_uid();
     if (daemon_uid != ::getuid()) {
         throw std::runtime_error("socket " + socket_path_ + " is served by uid " +
                                  std::to_string(daemon_uid) + ", not ours; refusing to send");
     }
-    if (!conn->write_line(full.dump())) {
-        throw DaemonUnreachable(conn->timed_out() ? busy : "failed to send request to daemon");
+    nlohmann::json full = req;
+    full["token"] = token_;
+    std::string request_line = full.dump();
+    scrub_secret_fields(full);
+    bool sent = conn->write_line(request_line);
+    scrub(request_line);
+    if (!sent) {
+        throw DaemonUnreachable(conn->timed_out() ? "daemon busy: " + no_reply + " (another client may be holding it)"
+                                                  : "failed to send request to daemon",
+                                DaemonUnreachable::Stage::NotSent);
     }
     auto line = conn->read_line(kMaxResponseBytes);
     if (!line) {
-        throw DaemonUnreachable(conn->timed_out() ? busy : "daemon closed connection without responding");
+        // The daemon reads a queued request once it is free, so a write may land after we give up.
+        bool read_only = op == "get" || op == "list" || op == "getprefix";
+        std::string why = conn->timed_out() ? "daemon busy: request sent but " + no_reply
+                                            : "daemon closed the connection without a reply";
+        if (!read_only) why += "; it may still be applied (check with list/get)";
+        throw DaemonUnreachable(why, DaemonUnreachable::Stage::Sent);
     }
     nlohmann::json resp;
     try {
         resp = nlohmann::json::parse(*line);
     } catch (const nlohmann::json::exception&) {
+        scrub(*line);
         throw std::runtime_error("malformed response from daemon");
     }
+    scrub(*line);
     return resp;
 }
 
@@ -89,11 +115,18 @@ nlohmann::json DaemonClient::request_raw(const nlohmann::json& req) const {
 }
 
 nlohmann::json DaemonClient::request(const std::string& op, const std::string& key,
-                                     const std::optional<std::string>& value) const {
+                                     std::optional<std::string_view> value) const {
     nlohmann::json req{{"op", op}};
     if (!key.empty()) req["key"] = key;
-    if (value) req["value"] = *value;
-    return request_raw(req);
+    if (value) req["value"] = std::string(*value);
+    try {
+        nlohmann::json resp = request_raw(req);
+        scrub_secret_fields(req);
+        return resp;
+    } catch (...) {
+        scrub_secret_fields(req);
+        throw;
+    }
 }
 
 namespace {
@@ -558,6 +591,8 @@ int cmd_import(int argc, char** argv) {
         }
         std::optional<Manifest> manifest;
         std::string manifest_text;
+        // A symlinked manifest is updated at its target (vetted by read_manifest_text), not replaced.
+        std::string write_path = manifest_path;
         // symlink_status: a dangling link must fail in read_manifest_text, not be
         // replaced. It throws on any error other than "not found".
         if (std::filesystem::exists(std::filesystem::symlink_status(manifest_path))) {
@@ -568,10 +603,7 @@ int cmd_import(int argc, char** argv) {
                                          "', not '" + project + "'");
             }
             project = manifest->project;
-        } else {
-            // Check now: storing first and then writing an untrusted manifest
-            // would leave secrets that every later exec/import refuses.
-            require_trusted_manifest_dir(manifest_path);
+            write_path = std::filesystem::canonical(manifest_path).string();
         }
         std::string env = resolve_env(scope, manifest ? &*manifest : nullptr);
 
@@ -595,11 +627,14 @@ int cmd_import(int argc, char** argv) {
 
         // Prove the manifest edit before touching the store.
         std::string new_text = manifest_with_entries(manifest_text, project, env, name_to_var);
+        // Storing first and then failing to write the manifest (or writing one
+        // every later exec/import refuses) would orphan the secrets.
+        if (new_text != manifest_text) require_creatable_manifest_dir(write_path);
 
         for (const auto& [var, value] : pairs) {
             client.request("set", scoped_key(env, project, var), value);
         }
-        if (new_text != manifest_text) write_file_atomic(manifest_path, new_text, 0644);
+        if (new_text != manifest_text) write_file_atomic(write_path, new_text, 0644);
 
         std::cout << "imported " << pairs.size() << " secret(s) into " << scope_prefix(env, project);
         if (!collisions.empty()) std::cout << " (" << collisions.size() << " overwritten)";

@@ -209,7 +209,8 @@ void test_manifest_trust() {
 void test_denied_env_names() {
     for (const char* name : {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "NODE_OPTIONS", "SECRETOV_ENV",
                              "PAGER", "GIT_CONFIG_COUNT", "XDG_RUNTIME_DIR", "PATH", "HOME", "PSQLRC",
-                             "https_proxy"}) {
+                             "https_proxy", "Https_Proxy", "FTP_PROXY", "OPENSSL_CONF", "GOFLAGS",
+                             "npm_config_script_shell", "LUA_INIT", "Ld_Preload", "SSLKEYLOGFILE"}) {
         std::string as_var = std::string("name: p\nenv:\n  dev:\n    vars:\n      ") + name + ": x\n";
         assert(throws_with([&] { parse_manifest(as_var, "t"); }, "cannot be set from a manifest"));
         std::string as_secret =
@@ -217,8 +218,8 @@ void test_denied_env_names() {
         assert(throws_with([&] { parse_manifest(as_secret, "t"); }, "cannot be set from a manifest"));
     }
     // Look-alikes pass: deny entries are exact names or prefixes.
-    Manifest m = parse_manifest("name: p\nenv:\n  dev:\n    vars:\n      PATHS: /x\n      ENVIRONMENT: y\n", "t");
-    assert(m.vars.at("dev").size() == 2);
+    Manifest m = parse_manifest("name: p\nenv:\n  dev:\n    vars:\n      PATHS: /x\n      ENVIRONMENT: y\n      no_proxy: z\n      PROXY: w\n", "t");
+    assert(m.vars.at("dev").size() == 4);
 }
 
 
