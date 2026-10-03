@@ -111,6 +111,9 @@ add_test(NAME manifest_test COMMAND manifest_test)
 add_executable(paths_test tests/paths_test.cpp)
 target_link_libraries(paths_test PRIVATE secretov_core)
 add_test(NAME paths_test COMMAND paths_test)
+add_executable(tui_edit_test tests/tui_edit_test.cpp)
+target_link_libraries(tui_edit_test PRIVATE secretov_core)
+add_test(NAME tui_edit_test COMMAND tui_edit_test)
 
 add_test(NAME smoke_test
   COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_test.sh $<TARGET_FILE:secretov>)

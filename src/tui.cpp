@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <set>
@@ -22,12 +23,15 @@
 #include "client.hpp"
 #include "paths.hpp"
 #include "protocol.hpp"
+#include "tui_edit.hpp"
 
-// Secret hygiene ceiling: revealed values and the add-form value buffer are
-// zeroed (sodium_memzero) as soon as they are re-masked/submitted/cancelled.
-// FTXUI copies buffer contents into its own render structures each frame; those
-// copies are not zeroed. Best-effort — good enough for a local TUI, not a
-// hardened enclave. Upgrade path: a custom no-copy render element if it matters.
+// Secret hygiene ceiling: the revealed value, the form value buffer (Edit
+// prefills it with the current value) and the paste buffer are zeroed
+// (sodium_memzero, whole capacity) as soon as they are re-masked, submitted,
+// cancelled or the TUI exits. FTXUI copies buffer contents into its own render
+// structures each frame, and a buffer that outgrows its reserve reallocates;
+// those copies are not zeroed. Best-effort — good enough for a local TUI, not
+// a hardened enclave. Upgrade path: a custom no-copy render element if it matters.
 
 namespace secretov {
 
@@ -35,12 +39,33 @@ namespace {
 
 using nlohmann::json;
 
+// Wipes past size() too: erase/backspace leave old bytes in the capacity tail.
 void zero(std::string& s) {
-    if (!s.empty()) sodium_memzero(s.data(), s.size());
+    s.resize(s.capacity());
+    sodium_memzero(s.data(), s.size());
     s.clear();
 }
 
-enum class Mode { Normal, Add, Edit, ConfirmDelete };
+// ponytail: values longer than this reallocate and leave an unzeroed copy behind.
+constexpr std::size_t kSecretReserve = 4096;
+
+// Copies a daemon reply's value into `into` and wipes the reply's own copy.
+void take_value(nlohmann::json& resp, std::string& into) {
+    auto found = resp.find("value");
+    if (found == resp.end() || !found->is_string()) throw std::runtime_error("daemon reply has no value");
+    std::string& held = found->get_ref<std::string&>();
+    into.assign(held);
+    zero(held);
+}
+
+bool has_control_char(const std::string& text) {
+    return std::any_of(text.begin(), text.end(), [](char c) {
+        auto byte = static_cast<unsigned char>(c);
+        return byte < 0x20 || byte == 0x7f;
+    });
+}
+
+enum class Mode { Normal, Add, Edit, ConfirmDelete, ConfirmOverwrite };
 
 // One visible line of the key tree: a folder ("dev/proj/") or a secret.
 struct Row {
@@ -60,6 +85,12 @@ int run_ui(DaemonClient& daemon) {
     std::optional<std::string> revealed;  // fetched value for the selected key
     std::string add_name;
     std::string add_value;
+    int name_cursor = 0;  // byte offsets, shared with the FTXUI inputs
+    int value_cursor = 0;
+    bool value_masked = true;
+    bool show_form_problem = false;  // set by a refused submit; then validation is live
+    std::string paste_buffer;
+    bool pasting = false;  // between bracketed-paste start and end markers
     std::string status = "ready";
     Mode mode = Mode::Normal;
     int active_tab = 0;  // 0 = key list, 1 = add/edit form
@@ -181,30 +212,57 @@ int run_ui(DaemonClient& daemon) {
         try {
             json resp = daemon.request("get", *key);
             remask();
-            revealed = resp.value("value", std::string{});
+            revealed.emplace();
+            take_value(resp, *revealed);
             status = "revealed " + *key;
         } catch (const std::exception& e) {
+            remask();
             status = e.what();
         }
     };
 
-    auto start_add = [&] {
+    auto close_form = [&] {
         zero(add_name);
         zero(add_value);
+        name_cursor = 0;
+        value_cursor = 0;
+        value_masked = true;
+        show_form_problem = false;
+        mode = Mode::Normal;
+        active_tab = 0;
+        form_field = 0;
+    };
+
+    // The add name starts at the selected folder, so 'a' on dev/api/ or on a
+    // key inside it only needs the KEY typed.
+    auto start_add = [&] {
+        remask();
+        close_form();
+        add_value.reserve(kSecretReserve);
+        if (!rows.empty()) add_name = folder_prefix(row_at(selected).id);
+        name_cursor = static_cast<int>(add_name.size());
         mode = Mode::Add;
         active_tab = 1;
-        form_field = 0;
         status = "adding secret";
     };
 
-    // Edit reuses the add form's value buffer; the key is fixed to the
-    // selection and the old value is never fetched into the input (a blank
-    // field is one fewer plaintext copy, and 'r' already reveals on demand).
+    // Edit prefills the current value (masked until Ctrl-R) so a small fix
+    // doesn't mean retyping a token; the buffer is zeroed on every way out.
     auto start_edit = [&] {
         std::optional<std::string> key = need_key("edit");
         if (!key) return;
         remask();
-        zero(add_value);
+        close_form();
+        add_value.reserve(kSecretReserve);
+        try {
+            json resp = daemon.request("get", *key);
+            take_value(resp, add_value);
+        } catch (const std::exception& e) {
+            zero(add_value);
+            status = e.what();
+            return;
+        }
+        value_cursor = static_cast<int>(add_value.size());
         mode = Mode::Edit;
         active_tab = 1;
         form_field = 1;
@@ -212,50 +270,84 @@ int run_ui(DaemonClient& daemon) {
     };
 
     auto cancel_form = [&] {
-        zero(add_name);
-        zero(add_value);
-        mode = Mode::Normal;
-        active_tab = 0;
-        form_field = 0;
+        close_form();
         status = "cancelled";
     };
 
-    auto submit_add = [&] {
-        if (add_name.empty()) {
-            status = "name required";
-            return;
+    // What stops the open form from saving, if anything. Add and Edit share
+    // the empty-value rule.
+    auto form_problem = [&]() -> std::optional<std::string> {
+        if (mode == Mode::Add) {
+            if (std::optional<std::string> error = key_name_error(trim_key_name(add_name))) return error;
         }
-        std::string name = add_name;
+        if (add_value.empty()) return "value required";
+        return std::nullopt;
+    };
+
+    auto key_exists = [&](const std::string& key) { return std::binary_search(keys.begin(), keys.end(), key); };
+
+    // Writes the form value under `key`; the form stays open on failure.
+    auto save_form = [&](const std::string& key, const std::string& verb) {
         try {
-            daemon.request("set", name, add_value);
-            status = "added " + name;
-            zero(add_name);
-            zero(add_value);
-            mode = Mode::Normal;
-            active_tab = 0;
-            refresh(name);
+            daemon.request("set", key, add_value);
         } catch (const std::exception& e) {
             status = e.what();
+            return false;
         }
+        close_form();
+        status = verb + " " + key;
+        refresh(key);
+        return true;
+    };
+
+    auto submit_add = [&] {
+        if (std::optional<std::string> problem = form_problem()) {
+            show_form_problem = true;
+            status = *problem;
+            return;
+        }
+        std::string name = trim_key_name(add_name);
+        std::string selected_id = rows.empty() ? "" : row_at(selected).id;
+        refresh(selected_id);  // the CLI may have added or removed this key meanwhile
+        if (key_exists(name)) {
+            mode = Mode::ConfirmOverwrite;
+            status = "'" + name + "' already exists";
+            return;
+        }
+        save_form(name, "added");
     };
 
     auto submit_edit = [&] {
-        if (add_value.empty()) {
-            status = "value required";
+        if (std::optional<std::string> problem = form_problem()) {
+            show_form_problem = true;
+            status = *problem;
             return;
         }
-        std::string key = current_key().value_or("");
-        try {
-            daemon.request("set", key, add_value);
-            status = "updated " + key;
-            zero(add_value);
-            mode = Mode::Normal;
-            active_tab = 0;
-            form_field = 0;
-            refresh(key);
-        } catch (const std::exception& e) {
-            status = e.what();
+        save_form(current_key().value_or(""), "updated");
+    };
+
+    // Bracketed paste arrives whole here; it only ever lands in a form input,
+    // so a pasted newline can neither submit nor run Normal-mode keys.
+    auto finish_paste = [&] {
+        if (mode != Mode::Add && mode != Mode::Edit) {
+            status = "paste ignored: open a form with 'a' or 'e' first";
+        } else if (form_field == 0) {
+            if (has_control_char(paste_buffer)) {
+                status = "paste refused: a name is one line";
+            } else {
+                name_cursor = std::clamp(name_cursor, 0, static_cast<int>(add_name.size()));
+                add_name.insert(static_cast<std::size_t>(name_cursor), paste_buffer);
+                name_cursor += static_cast<int>(paste_buffer.size());
+            }
+        } else {
+            value_cursor = std::clamp(value_cursor, 0, static_cast<int>(add_value.size()));
+            add_value.insert(static_cast<std::size_t>(value_cursor), paste_buffer);
+            value_cursor += static_cast<int>(paste_buffer.size());
+            bool ends_in_newline = !paste_buffer.empty() && paste_buffer.back() == '\n';
+            auto line_count = std::count(paste_buffer.begin(), paste_buffer.end(), '\n') + (ends_in_newline ? 0 : 1);
+            status = "pasted " + std::to_string(line_count) + (line_count == 1 ? " line" : " lines");
         }
+        zero(paste_buffer);
     };
 
     auto do_delete = [&] {
@@ -276,11 +368,17 @@ int run_ui(DaemonClient& daemon) {
     menu_opt.on_change = remask;
     Component menu = Menu(&labels, &selected, menu_opt);
 
-    Component name_input = Input(&add_name, "name");
+    InputOption name_opt;
+    name_opt.multiline = false;
+    name_opt.cursor_position = &name_cursor;
+    Component name_input = Input(&add_name, "env/project/KEY", name_opt);
     InputOption value_opt;
-    value_opt.password = true;
-    Component value_input = Input(&add_value, "value", value_opt);
-    Component form = Container::Vertical({name_input, value_input}, &form_field);
+    value_opt.password = &value_masked;
+    value_opt.cursor_position = &value_cursor;
+    Component value_input = Input(&add_value, "type or paste", value_opt);
+    // Edit draws no name input, so it must not be focusable there either.
+    Component form =
+        Container::Vertical({Maybe(name_input, [&] { return mode == Mode::Add; }), value_input}, &form_field);
 
     Component tab = Container::Tab({menu, form}, &active_tab);
 
@@ -343,38 +441,78 @@ int run_ui(DaemonClient& daemon) {
             status_bar,
         });
 
-        if (mode == Mode::Add) {
-            Element overlay = window(text(" add secret "),
-                                     vbox({
-                                         hbox({text("name:  "), name_input->Render()}),
-                                         hbox({text("value: "), value_input->Render()}),
-                                         separator(),
-                                         text("Enter submit   Esc cancel") | dim,
-                                     })) |
-                              size(WIDTH, GREATER_THAN, 44) | clear_under | center;
+        if (mode == Mode::Add || mode == Mode::Edit || mode == Mode::ConfirmOverwrite) {
+            bool adding = mode != Mode::Edit;
+            Elements lines;
+            if (adding) {
+                lines.push_back(hbox({text("name:  "), name_input->Render()}));
+                std::string name = trim_key_name(add_name);
+                if (key_exists(name)) {
+                    lines.push_back(text("       exists: saving will ask to overwrite") | color(Color::Yellow));
+                }
+            } else {
+                lines.push_back(hbox({text("name:  "), text(current_key().value_or("")) | bold}));
+            }
+            // ponytail: 8 visible lines; taller values scroll with the cursor.
+            lines.push_back(hbox({text("value: "), value_input->Render() | size(HEIGHT, LESS_THAN, 8)}));
+            std::optional<std::string> problem = show_form_problem ? form_problem() : std::nullopt;
+            if (problem) lines.push_back(text("       " + *problem) | color(Color::Red));
+            lines.push_back(separator());
+            std::string enter_action = adding && form_field == 0 ? "next field" : "save";
+            lines.push_back(text("Enter " + enter_action + (adding ? "   Tab switch field" : "") +
+                                 "   Esc cancel") |
+                            dim);
+            lines.push_back(text(std::string("Ctrl-R ") + (value_masked ? "show" : "hide") +
+                                 " value   Ctrl-U/Ctrl-W erase   Ctrl-A/Ctrl-E line start/end") |
+                            dim);
+            int overlay_width = std::clamp(screen.dimx() - 4, 20, 72);
+            Element overlay = window(text(adding ? " add secret " : " edit secret "), vbox(std::move(lines))) |
+                              size(WIDTH, EQUAL, overlay_width) | clear_under | center;
             root = dbox({root, overlay});
-        } else if (mode == Mode::Edit) {
-            Element overlay =
-                window(text(" edit secret "),
-                       vbox({
-                           hbox({text("name:  "), text(current_key().value_or("")) | bold}),
-                           hbox({text("value: "), value_input->Render()}),
-                           separator(),
-                           text("Enter save   Esc cancel") | dim,
-                       })) |
-                size(WIDTH, GREATER_THAN, 44) | clear_under | center;
-            root = dbox({root, overlay});
-        } else if (mode == Mode::ConfirmDelete) {
-            std::string msg = "Delete '" + current_key().value_or("") + "'?";
-            Element overlay =
-                window(text(" confirm "), vbox({text(msg), separator(), text("y / n") | dim})) |
-                clear_under | center;
+        }
+        if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmOverwrite) {
+            std::string question = mode == Mode::ConfirmDelete
+                                       ? "Delete '" + current_key().value_or("") + "'? [y/N]"
+                                       : "Overwrite '" + trim_key_name(add_name) + "'? [y/N]";
+            Element overlay = window(text(" confirm "), vbox({text(question), separator(),
+                                                              text("y yes   Enter/Esc/any other key no") | dim})) |
+                              clear_under | center;
             root = dbox({root, overlay});
         }
         return root;
     });
 
+    const Event paste_start = Event::Special("\x1b[200~");
+    const Event paste_end = Event::Special("\x1b[201~");
+
     Component app = CatchEvent(renderer, [&](Event event) -> bool {
+        if (event == Event::CtrlC) {  // quit through Exit so the buffers below get zeroed
+            screen.Exit();
+            return true;
+        }
+        if (event == paste_start) {
+            pasting = true;
+            zero(paste_buffer);
+            paste_buffer.reserve(kSecretReserve);
+            return true;
+        }
+        if (pasting) {
+            if (event == paste_end) {
+                pasting = false;
+                finish_paste();
+            } else if (event == Event::Escape) {  // a lost end marker must not swallow input forever
+                pasting = false;
+                zero(paste_buffer);
+                status = "paste aborted";
+            } else if (event.is_character()) {
+                paste_buffer += event.character();
+            } else if (event == Event::Return) {
+                paste_buffer += '\n';
+            } else if (event == Event::Tab) {
+                paste_buffer += '\t';
+            }
+            return true;
+        }
         if (mode == Mode::Normal) {
             if (event == Event::Character('q')) {
                 screen.Exit();
@@ -431,17 +569,47 @@ int run_ui(DaemonClient& daemon) {
                 return true;
             }
             if (event == Event::Return) {
-                if (mode == Mode::Add) {
+                if (mode == Mode::Add && form_field == 0) {
+                    form_field = 1;
+                } else if (mode == Mode::Add) {
                     submit_add();
                 } else {
                     submit_edit();
                 }
                 return true;
             }
+            if (event == Event::CtrlR) {
+                value_masked = !value_masked;
+                return true;
+            }
+            std::string& text_in_focus = form_field == 0 ? add_name : add_value;
+            int& cursor_in_focus = form_field == 0 ? name_cursor : value_cursor;
+            if (event == Event::CtrlU) {
+                erase_to_line_start(text_in_focus, cursor_in_focus);
+                return true;
+            }
+            if (event == Event::CtrlW) {
+                erase_word_before(text_in_focus, cursor_in_focus);
+                return true;
+            }
+            if (event == Event::CtrlA) {
+                cursor_in_focus = line_start(text_in_focus, cursor_in_focus);
+                return true;
+            }
+            if (event == Event::CtrlE) {
+                cursor_in_focus = line_end(text_in_focus, cursor_in_focus);
+                return true;
+            }
             return false;  // typing falls through to the focused input
         }
-        // Confirm-delete mode: consume every key so nothing leaks to the menu.
-        if (event == Event::Character('y') || event == Event::Character('Y')) {
+        // Confirm modes consume every key so nothing leaks to the menu or form.
+        bool confirmed = event == Event::Character('y') || event == Event::Character('Y');
+        if (mode == Mode::ConfirmOverwrite) {
+            if (!confirmed || !save_form(trim_key_name(add_name), "updated")) mode = Mode::Add;
+            if (!confirmed) status = "not saved; edit the name or Esc";
+            return true;
+        }
+        if (confirmed) {
             do_delete();
         } else {
             mode = Mode::Normal;
@@ -450,11 +618,15 @@ int run_ui(DaemonClient& daemon) {
         return true;
     });
 
+    screen.ForceHandleCtrlC(false);
+    std::cout << "\x1b[?2004h" << std::flush;  // bracketed paste; FTXUI doesn't request it
     screen.Loop(app);
+    std::cout << "\x1b[?2004l" << std::flush;
 
     remask();
     zero(add_name);
     zero(add_value);
+    zero(paste_buffer);
     return 0;
 }
 

@@ -141,6 +141,26 @@ or pipe `get` straight into what needs it, or clear scrollback afterwards.
 `delete` still take a raw full key (`env/project/KEY`) — only `set`, `list`,
 `exec`, and `import` accept `-p`/`-e`.
 
+### The TUI
+
+`secretov tui` shows the store as a tree folded on `/`; values stay masked
+until you reveal them.
+
+| Where | Keys |
+|---|---|
+| tree | `j`/`k` or arrows move, `h`/`l` fold/unfold, Enter/Space reveal or fold, `r` reveal/hide, `a` add, `e` edit, `d` delete, `q`/Ctrl-C quit |
+| add/edit form | Enter: next field (add name) or save, Tab switch field, Esc cancel, Ctrl-R show/hide the value, Ctrl-U erase to line start, Ctrl-W erase previous word or path segment, Ctrl-A/Ctrl-E line start/end |
+| confirm (`[y/N]`) | `y` yes; Enter, Esc, or any other key no |
+
+Add starts the name at the selected folder (`dev/api/`); the name is trimmed
+and must not start or end with `/` or contain `//` or control characters.
+Adding a name that already exists asks before overwriting. Edit opens with the
+current value, masked. Both refuse an empty value. A multi-line value (a PEM
+key) can be pasted into the value field — newlines are kept, and the paste
+never submits the form; a paste outside a form is ignored. This relies on the
+terminal's bracketed paste, which all common terminals and tmux support; in
+one without it, pipe the value to `set` instead.
+
 ## Non-secret config: `vars:`
 
 Not everything a project needs is a secret. A log level, a public API URL, a
