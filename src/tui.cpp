@@ -218,6 +218,8 @@ struct Row {
 // terminals alike; every background sets its own foreground. Below 256 colors
 // the slate backgrounds would map to clashing ANSI pairs, so inverse, bold and
 // dim carry the selection, status bar and idle headers, as with NO_COLOR.
+// At 256 colors the nearest slate is violet and the nearest dark brown is
+// gray, so those two take explicit palette entries.
 struct Frame {  // a pane or modal outline and the header chip on it
     ftxui::Color line;
     ftxui::Decorator chip;
@@ -234,9 +236,8 @@ struct Theme {
     Frame focused;  // the pane or form that takes keys, and help
     Frame hot;      // the detail pane while a value is revealed
     Frame danger;   // delete and overwrite confirms
-    ftxui::Color rule;
-    ftxui::Decorator card;  // modal background
-    ftxui::Decorator folder, secret, project_mark, tree_glyph, selection, selection_mark;
+    ftxui::Decorator rule, card;  // separator lines; modal background
+    ftxui::Decorator folder, secret, project_mark, tree_glyph, selection, selection_mark, tag_project, tag_warning;
     ftxui::Decorator label, label_focused, muted, masked, revealed_value, revealed_label, warning, error;
     ftxui::Decorator status_bar, status_error, status_dim, chip_stale, chip_busy, chip_filter, chip_countdown;
     ftxui::Decorator key_name, key_hint, help_heading, field, field_focused;
@@ -244,18 +245,19 @@ struct Theme {
 
 Theme make_theme() {
     using namespace ftxui;
-    constexpr uint32_t kSlate = 0x52637a, kSlateText = 0xd5dee8, kRule = 0x3a4757;
-    constexpr uint32_t kTeal = 0x2ba1b4, kSteel = 0x5f8fc0, kViolet = 0x9783d9;
+    constexpr uint32_t kSlate = 0x52637a, kSlateText = 0xd5dee8, kRule = 0x4a5a6e;
+    constexpr uint32_t kTeal = 0x2ba1b4, kSteel = 0x5785ba, kViolet = 0x856dce;
     constexpr uint32_t kMuted = 0x7f8a96, kFaint = 0x626c78, kInk = 0x0e1820;
     constexpr uint32_t kSelection = 0x23506e, kSelectionText = 0xf0f6fb, kSelectionViolet = 0xc3b4f0;
     constexpr uint32_t kBar = 0x253241, kBarText = 0xb9c6d3, kBarDim = 0x909ca8, kHint = 0x8c949e;
     constexpr uint32_t kCard = 0x222a33, kCardText = 0xd5dde6;
     constexpr uint32_t kField = 0x161c23, kFieldText = 0xc5d0db, kFieldFocused = 0x2d3c4c, kFieldFocusedText = 0xeef3f8;
     constexpr uint32_t kAmber = 0xd07a22, kHotText = 0xffdcaa, kHotBackground = 0x33271a;
-    constexpr uint32_t kRed = 0xe0605a, kRedOnBar = 0xff8f87, kYellow = 0xd8c25a;
+    constexpr uint32_t kRed = 0xe0605a, kRedOnBar = 0xff8f87, kYellow = 0xd8c25a, kOchre = 0xb08a1a;
 
     bool has_color = Terminal::ColorSupport() != Terminal::Color::Palette1;
     bool shades = Terminal::ColorSupport() >= Terminal::Color::Palette256;
+    bool palette256 = Terminal::ColorSupport() == Terminal::Color::Palette256;
     auto rgb = [](uint32_t hex) {
         return Color::RGB(static_cast<uint8_t>(hex >> 16), static_cast<uint8_t>(hex >> 8), static_cast<uint8_t>(hex));
     };
@@ -263,34 +265,44 @@ Theme make_theme() {
     auto fg_on = [&](uint32_t foreground, uint32_t background) { return fg(foreground) | bgcolor(rgb(background)); };
     Decorator bold_inverse = Decorator(bold) | inverted;  // a chip takes its frame's color as background
     auto chip = [&](uint32_t background) { return has_color ? fg_on(kInk, background) | bold : bold_inverse; };
+    // The status bar's inverse swaps a chip's colors at 16 colors, so they go in swapped.
+    auto bar_chip = [&](uint32_t background) {
+        return shades || !has_color ? chip(background) : fg_on(background, kInk) | bold;
+    };
+    Color slate = palette256 ? Color(Color::Palette256(59)) : rgb(kSlate);
+    Color hot_background = palette256 ? Color(Color::Palette256(58)) : rgb(kHotBackground);
+    Decorator project_mark = shades ? fg(kViolet) : color(Color::Magenta);  // violet maps to blue, the folders' hue
+    Decorator warning = fg(kOchre);
     return Theme{
-        .calm = {rgb(kSlate), shades ? fg_on(kSlateText, kSlate) | bold : bold_inverse},
+        .calm = {slate, shades ? fg(kSlateText) | bgcolor(slate) | bold : bold_inverse},
         .focused = {rgb(kTeal), chip(kTeal)},
         .hot = {rgb(kAmber), chip(kAmber)},
         .danger = {rgb(kRed), chip(kRed)},
-        .rule = rgb(kRule),
+        .rule = shades ? fg(kRule) : nothing,  // a colored rule on the inverted status bar is a solid block
         .card = shades ? fg_on(kCardText, kCard) : nothing,
         .folder = fg(kSteel) | bold,
         .secret = nothing,
-        .project_mark = shades ? fg(kViolet) : color(Color::Magenta),  // violet would map to blue, the folders' hue
+        .project_mark = project_mark,
         .tree_glyph = fg(kFaint),
         .selection = shades ? fg_on(kSelectionText, kSelection) | bold : bold_inverse,
         .selection_mark = shades ? fg_on(kSelectionViolet, kSelection) | bold : bold_inverse,
+        .tag_project = project_mark | bold,
+        .tag_warning = warning | bold,
         .label = fg(kMuted),
         .label_focused = fg(kTeal) | bold,
         .muted = shades ? fg(kMuted) : dim,
         .masked = fg(kFaint),
-        .revealed_value = shades ? fg_on(kHotText, kHotBackground) : bold,
+        .revealed_value = shades ? fg(kHotText) | bgcolor(hot_background) : bold,
         .revealed_label = fg(kAmber) | bold,
-        .warning = fg(kYellow),
+        .warning = warning,
         .error = fg(kRed) | bold,
         .status_bar = shades ? fg_on(kBarText, kBar) : inverted,
-        .status_error = fg(kRedOnBar) | bold,
+        .status_error = (shades ? fg(kRedOnBar) : color(Color::Red)) | bold,
         .status_dim = shades ? fg(kBarDim) : dim,
-        .chip_stale = chip(kRed),
-        .chip_busy = chip(kYellow),
-        .chip_filter = chip(kTeal),
-        .chip_countdown = chip(kAmber),
+        .chip_stale = bar_chip(kRed),
+        .chip_busy = bar_chip(kYellow),
+        .chip_filter = bar_chip(kTeal),
+        .chip_countdown = bar_chip(kAmber),
         .key_name = fg(kSteel) | bold,
         .key_hint = shades ? fg(kHint) : dim,
         .help_heading = fg(kTeal) | bold,
@@ -872,6 +884,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     auto field_style = [&](InputState state) {
         if (state.is_placeholder) state.element |= theme.muted;
+        if (state.hovered && !state.focused) state.element |= underlined;
         return state.element | (state.focused ? theme.field_focused : theme.field);
     };
     InputOption name_opt;
@@ -880,7 +893,10 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     name_opt.cursor_position = &name_cursor;
     Component name_input = Input(&add_name, "env/project/KEY", name_opt);
     InputOption value_opt;
-    value_opt.transform = field_style;
+    value_opt.transform = [&](InputState state) {
+        if (!value_masked && !state.is_placeholder) state.element |= theme.revealed_value;  // inner colors win
+        return field_style(state);
+    };
     value_opt.password = &value_masked;
     value_opt.cursor_position = &value_cursor;
     Component value_input = Input(&add_value, "type or paste", value_opt);
@@ -971,7 +987,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         for (const StatusPart& part : parts) {
             const std::string& shown = part.compacted ? part.compact : part.full;
             if (shown.empty()) continue;
-            parts_row.push_back(separator() | color(theme.rule));
+            parts_row.push_back(separator() | theme.rule);
             parts_row.push_back(text(shown) | part.style);
         }
         status_rows.push_back(hbox(std::move(parts_row)) | theme.status_bar);
@@ -981,8 +997,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         int panes_height = std::max(terminal.dimy - 1 - status_height, 6);  // minus the hint line
         const std::string list_title = " secrets ";
         std::vector<TitleTag> list_tags;
-        if (!marks.project.empty()) list_tags.push_back({"◆ " + marks.project, theme.project_mark | bold});
-        if (!marks.problem.empty()) list_tags.push_back({"◆ refused, see ?", theme.warning | bold});
+        if (!marks.project.empty()) list_tags.push_back({"◆ " + marks.project, theme.tag_project});
+        if (!marks.problem.empty()) list_tags.push_back({"◆ refused, see ?", theme.tag_warning});
         if (daemon_state == DaemonState::Unreachable) list_tags.push_back({"(stale)", theme.error});
         int list_width = terminal.dimx;
         int list_height = stacked ? panes_height / 2 : panes_height;
@@ -1028,7 +1044,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             }
             detail_lines.push_back(text("folder:") | theme.label);
             add_wrapped(printable(folder), theme.folder);
-            detail_lines.push_back(separator() | color(theme.rule));
+            detail_lines.push_back(separator() | theme.rule);
             detail_lines.push_back(text(std::to_string(count) + " secret(s)"));
         } else {
             const std::string& key = row_at(selected).id;
@@ -1039,7 +1055,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 detail_lines.push_back(text("env var in " + marks.project + "'s manifest:") | theme.label);
                 for (const std::string& env_var : mapped->second) add_wrapped(env_var, theme.project_mark);
             }
-            detail_lines.push_back(separator() | color(theme.rule));
+            detail_lines.push_back(separator() | theme.rule);
             value_label_line = static_cast<int>(detail_lines.size());
             detail_lines.push_back(text("value:") | (revealed ? theme.revealed_label : theme.label));
             if (revealed) {
@@ -1173,7 +1189,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 form_tags.push_back(
                     {"line " + std::to_string(cursor_line) + "/" + std::to_string(value_lines), theme.muted});
             }
-            root = dbox({root, modal(framed(theme.focused, title, form_tags, vbox(std::move(lines))) |
+            const Frame& form_frame = value_masked ? theme.focused : theme.hot;
+            root = dbox({root, modal(framed(form_frame, title, form_tags, vbox(std::move(lines))) |
                                      size(WIDTH, EQUAL, overlay_width))});
         }
         if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmOverwrite) {
@@ -1256,9 +1273,11 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 const HelpText& row = help_text[static_cast<std::size_t>(i)];
                 if (row.is_heading) {
                     help_lines.push_back(hbox({text(row.line + " ") | theme.help_heading,
-                                               separator() | color(theme.rule) | flex}));
+                                               separator() | theme.rule | flex, text(" ")}));
                 } else {
-                    help_lines.push_back(hbox({text(row.line.substr(0, row.key_bytes)) | theme.key_name,
+                    std::string row_keys = row.line.substr(0, row.key_bytes);
+                    Decorator keys_style = row_keys.find("◆") != std::string::npos ? theme.project_mark : theme.key_name;
+                    help_lines.push_back(hbox({text(std::move(row_keys)) | keys_style,
                                                text(row.line.substr(row.key_bytes))}));
                 }
             }
