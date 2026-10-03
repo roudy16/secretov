@@ -638,14 +638,38 @@ int cmd_import(int argc, char** argv) {
             throw std::runtime_error("already in store (pass --overwrite to replace):" + list);
         }
 
+        // A value over the daemon's request cap would fail midway through the
+        // sets below, leaving earlier keys stored and no manifest. JSON escaping
+        // can still push a value just under the cap over it; the loop names
+        // what was stored then.
+        for (const auto& [var, value] : pairs) {
+            if (value.size() + scoped_key(env, project, var).size() >= kMaxRequestBytes) {
+                throw std::runtime_error(var + "'s value is " + std::to_string(value.size()) +
+                                         " bytes, over the daemon's request limit of " +
+                                         std::to_string(kMaxRequestBytes) + "; nothing imported");
+            }
+        }
+
         // Prove the manifest edit before touching the store.
         std::string new_text = manifest_with_entries(manifest_text, project, env, name_to_var);
         // Storing first and then failing to write the manifest (or writing one
         // every later exec/import refuses) would orphan the secrets.
         if (new_text != manifest_text) require_creatable_manifest_dir(write_path);
 
+        std::vector<std::string> stored;
         for (const auto& [var, value] : pairs) {
-            client.request("set", scoped_key(env, project, var), value);
+            std::string key = scoped_key(env, project, var);
+            try {
+                client.request("set", key, value);
+            } catch (const std::exception& e) {
+                std::string list;
+                for (const auto& k : stored) list += "\n  " + k;
+                throw std::runtime_error(var + ": " + e.what() +
+                                         (stored.empty() ? ""
+                                                         : "; manifest not updated; already stored (rerun with "
+                                                           "--overwrite once fixed):" + list));
+            }
+            stored.push_back(std::move(key));
         }
         if (new_text != manifest_text) write_file_atomic(write_path, new_text, 0644);
 

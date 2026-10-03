@@ -59,6 +59,11 @@ std::vector<std::string> help_row_lines(std::string_view keys, std::string_view 
 // would break the row; and widths must count what is drawn.
 std::string printable(std::string_view text);
 
+// A revealed value as the detail pane draws it: newlines kept, a tab shown as
+// '→' and any other control character (C0, DEL, C1) as '?', which FTXUI would
+// otherwise draw as nothing. The result holds the secret: the caller zeroes it.
+std::string printable_value(std::string_view value);
+
 // `hints` joined by two spaces, dropping hints before the last one (from the
 // back) until the line fits `width`; the last hint is always kept.
 std::string fit_hints(const std::vector<std::string>& hints, int width);

@@ -375,6 +375,18 @@ upper-cased; denied as well: any `*_PROXY` but `NO_PROXY`, the `NPM_CONFIG_`,
 `BUNDLE_`, `GEM_` and `LUA_` prefixes, `OPENSSL_CONF`/`_ENGINES`/`_MODULES`,
 `GOFLAGS`, `CLASSPATH`, `MAVEN_OPTS`, `GRADLE_OPTS`, `SSLKEYLOGFILE`,
 `AWS_SHARED_CREDENTIALS_FILE`, `DOCKER_HOST`. Still a deny list (ceiling).
+
+Fourth pass: `PYTHONWARNINGS=...:antigravity...` with `BROWSER` ran a shell
+command from any Python child, and more loader, interception and
+package-index names passed (`PYTHONBREAKPOINT`, `PERL5DB`, `PHPRC`,
+`DOTNET_STARTUP_HOOKS`, `RUSTC_WRAPPER`, `GLIBC_TUNABLES`, `SHELLOPTS`,
+`GOPROXY`, `PIP_INDEX_URL`, `NODE_TLS_REJECT_UNAUTHORIZED`, `AWS_CA_BUNDLE`,
+...). Now denied: those names and their siblings, and the `PIP_`, `UV_`,
+`CARGO_`, `RUSTUP_`, `RUSTC_`, `DOTNET_` and `CORECLR_` prefixes (full list
+in manifest.cpp and USING.md). Four passes in, the list keeps lagging each
+tool's next loader or index variable: it is recorded as a lagging ceiling,
+not a guarantee. An allow list would break ordinary app config; the real
+boundary stays ceiling #1 (running `exec` in a checkout runs its code).
 `import` now also requires the manifest's directory to be a writable
 directory before storing anything, and updates a symlinked manifest at its
 target instead of replacing the link.

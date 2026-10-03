@@ -38,8 +38,11 @@ bool is_denied_env_name(const std::string& name) {
     // reads npm_config_* in any case, so an exact-case list misses spellings.
     std::string upper = name;
     for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    static const char* const kDeniedPrefixes[] = {"LD_",  "DYLD_",       "SECRETOV_", "GIT_", "XDG_",
-                                                  "NPM_CONFIG_", "BUNDLE_", "GEM_",      "LUA_"};
+    // ponytail: a deny list lags every tool's next loader or index variable
+    // (SECURITY.md #21); an allow list would break ordinary app config.
+    static const char* const kDeniedPrefixes[] = {
+        "LD_",  "DYLD_",  "SECRETOV_", "GIT_",   "XDG_",    "NPM_CONFIG_", "BUNDLE_",  "GEM_",
+        "LUA_", "PIP_",   "UV_",       "CARGO_", "RUSTUP_", "RUSTC_",      "DOTNET_",  "CORECLR_"};
     static const char* const kDeniedNames[] = {
         "PATH",          "HOME",         "BASH_ENV",          "ENV",        "IFS",
         "PROMPT_COMMAND", "PS1",         "PS4",               "ZDOTDIR",    "PAGER",
@@ -50,9 +53,17 @@ bool is_denied_env_name(const std::string& name) {
         "PYTHONUSERBASE", "PSQLRC",       "SSH_ASKPASS",       "SSH_ASKPASS_REQUIRE",   "KUBECONFIG",
         "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES",
         "GOFLAGS",       "CLASSPATH",    "MAVEN_OPTS",        "GRADLE_OPTS", "DOCKER_HOST",
+        "PYTHONWARNINGS", "PYTHONBREAKPOINT", "BROWSER",        "PERL5DB",    "PHPRC",
+        "PHP_INI_SCAN_DIR", "GLIBC_TUNABLES", "LOCPATH",        "NLSPATH",    "SHELLOPTS",
+        "BASHOPTS",      "R_PROFILE_USER", "JULIA_LOAD_PATH", "TCLLIBPATH", "ERL_AFLAGS",
+        "ELIXIR_ERL_OPTIONS", "RUSTC",   "RUSTDOC",           "RUSTFLAGS",  "RUSTDOCFLAGS",
+        "GOENV",         "GOROOT",       "GOTOOLCHAIN",
+        // Package indexes and module proxies choose the code a build fetches.
+        "GOPROXY",       "GONOPROXY",    "GOPRIVATE",         "GOSUMDB",    "GONOSUMDB",
+        "GONOSUMCHECK",  "GOINSECURE",
         // CA overrides and key logs let a manifest read the child's secret-bearing requests.
         "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",    "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-        "SSLKEYLOGFILE"};
+        "SSLKEYLOGFILE", "NODE_TLS_REJECT_UNAUTHORIZED", "AWS_CA_BUNDLE", "PYTHONHTTPSVERIFY"};
     for (const char* prefix : kDeniedPrefixes) {
         if (upper.compare(0, std::strlen(prefix), prefix) == 0) return true;
     }

@@ -175,18 +175,23 @@ parse marks nothing, says why in the status bar at start, and keeps
 
 The hint line above the status bar shows the keys for the current mode,
 dropping the least-used ones when the terminal is narrow. Long names are cut
-with `…` in the tree; the detail pane shows the full name and the revealed
+with `…` in the tree, and very deep folders stop indenting where the name
+would no longer fit; the detail pane shows the full name and the revealed
 value wrapped (multi-line values keep their lines), and its title shows
-`first-last/total J/K scroll` when they don't fit. Below 80 columns the tree
-sits above the detail pane and the add/edit form takes the full width. The
+`first-last/total J/K scroll` when they don't fit. A revealed value shows a
+tab as `→` and any other control character as `?`. Below 80 columns the tree
+sits above the detail pane and the add/edit form and the `[y/N]` question
+take the full width. The
 status bar shows the latest message first (info clears after a few seconds or
-the next key, errors at the next key), then a `daemon unreachable` marker, the
+the next key, errors at the next key), then a `daemon unreachable` (or
+`daemon busy`) marker, the
 active filter, the reveal countdown, the key count, and the socket path. The
 message comes first: short of room, the socket and key count drop and the
-others shorten (`stale`, `/filter`, `60s`), and a message still too long gets
+others shorten (`stale` or `busy`, `/filter`, `60s`), and a message still too long gets
 up to three rows of its own above them (longer ones end in `…`; warnings such
 as the clipboard note come before the key name, so a long name is what gets
-cut). Revealing a value on a short detail pane scrolls it into view.
+cut). A revealed value stays in view on a short detail pane, even when a
+long message or a resize shrinks it, until you scroll with `J`/`K`.
 
 The list is fetched at start and after the TUI's own changes; `R` reloads it
 after CLI changes. A key deleted elsewhere is noticed on reveal, copy or edit:
@@ -194,7 +199,8 @@ the list reloads and the status bar says so. If the daemon stops, the last
 tree stays on screen marked `(stale)`, and the status bar says how to start
 it, until a request (`R`) succeeds again. Every daemon call gives up after 5
 seconds with `daemon busy` (another client holding the daemon's single
-connection) — the CLI too; `rotate`/`passwd` wait 60 seconds. The request is
+connection; the status bar then keeps `daemon busy`, and the tree is not
+marked stale) — the CLI too; `rotate`/`passwd` wait 60 seconds. The request is
 already queued by then, so the daemon may still carry out a save or delete
 once it is free: the TUI says the key "may still be saved/deleted" and `R`
 shows what happened (also when the daemon hangs up without replying). A value
@@ -209,8 +215,11 @@ Adding a name that already exists asks before overwriting. After saving, the
 new key's folders open and it is selected; after a delete the selection moves
 to the nearest key in the same folder. Edit opens with the current value,
 masked (one bullet per character, so its length shows; the detail pane does
-not show it); long lines scroll sideways in the form, and a value taller than
-the input shows `line N/total` in the form title. Both refuse an empty value.
+not show it), at its end, or at its top if it has several lines. Tabs and
+other control characters draw nothing in the form, not even a bullet; reveal
+the value in the detail pane to see them. Long lines scroll sideways in the
+form with the cursor, which shifts every line while the cursor is on a long
+one; a value taller than the input shows `line N/total` in the form title. Both refuse an empty value.
 A multi-line value (a PEM key) can be pasted into the value field — newlines
 are kept, and the paste never submits the form; a paste into the filter is
 added to it if it is one line, and any other paste outside a form is ignored.
@@ -289,12 +298,20 @@ one that nobody else can change:
   `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `PYTHONUSERBASE`, `PSQLRC`,
   `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `KUBECONFIG`, `AWS_CONFIG_FILE`,
   `AWS_SHARED_CREDENTIALS_FILE`, `OPENSSL_CONF`, `OPENSSL_ENGINES`,
-  `OPENSSL_MODULES`, `GOFLAGS`, `CLASSPATH`, `MAVEN_OPTS`, `GRADLE_OPTS`, or
-  `DOCKER_HOST` — they make the child (or anything it runs) load code or
-  config the manifest picks — nor any `*_PROXY` but `NO_PROXY`, nor
-  `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
-  `NODE_EXTRA_CA_CERTS`, or `SSLKEYLOGFILE`, which would let it intercept or
-  read the child's requests. It is a deny list, so a tool with its own
+  `OPENSSL_MODULES`, `GOFLAGS`, `CLASSPATH`, `MAVEN_OPTS`, `GRADLE_OPTS`,
+  `DOCKER_HOST`, `PYTHONWARNINGS`, `PYTHONBREAKPOINT`, `BROWSER`, `PERL5DB`,
+  `PHPRC`, `PHP_INI_SCAN_DIR`, `GLIBC_TUNABLES`, `LOCPATH`, `NLSPATH`,
+  `SHELLOPTS`, `BASHOPTS`, `R_PROFILE_USER`, `JULIA_LOAD_PATH`, `TCLLIBPATH`,
+  `ERL_AFLAGS`, `ELIXIR_ERL_OPTIONS`, `RUSTC`, `RUSTDOC`, `RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `GOENV`, `GOROOT`, `GOTOOLCHAIN`, or any `PIP_*`, `UV_*`,
+  `CARGO_*`, `RUSTUP_*`, `RUSTC_*`, `DOTNET_*`, `CORECLR_*` — they make the
+  child (or anything it runs) load code or config the manifest picks — nor
+  any `*_PROXY` but `NO_PROXY`, `GOPROXY`, `GONOPROXY`, `GOPRIVATE`,
+  `GOSUMDB`, `GONOSUMDB`, `GONOSUMCHECK`, `GOINSECURE`, nor `SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`,
+  or `SSLKEYLOGFILE`, which would let it intercept or read the child's
+  requests or fetch code from an index the manifest picks. It is a deny list, so a tool with its own
   loader variable can still slip through. `--secret KEY=VAR` on your own command line is not filtered.
 - **Program lookup.** `exec` finds the command on *your* `PATH` (a manifest
   cannot set `PATH`).
@@ -327,6 +344,8 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `daemon busy: no reply within 5 s` | Another client is holding the daemon's one connection | Find and stop the stuck client: `ss -xp \| grep secretov.sock` shows the peer inode last, `ss -xp \| grep <that inode>` names the holder; then retry |
 | `daemon busy: request sent but no reply within 5 s; it may still be applied` | Same, but the request was already queued: a `set`/`delete` lands once the daemon is free | Stop the stuck client, check with `list`/`get` before retrying (an `import` rerun then needs `--overwrite`) |
 | `value too large: the request is N bytes, the daemon's limit is 1048576` | A value near or over 1 MiB (JSON escaping counts) | Keep large files out of the store; store a path or a smaller secret |
+| `import: VAR's value is N bytes, over the daemon's request limit ...; nothing imported` | A `.env` value over 1 MiB; checked before anything is stored | Remove or shrink it, then rerun |
+| `import: VAR: value too large ...; manifest not updated; already stored ...` | A value just under 1 MiB that JSON escaping pushed over; the keys listed were stored | Fix the value, then rerun with `--overwrite` |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |

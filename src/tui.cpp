@@ -45,7 +45,8 @@
 // to the terminal, or the TUI exits. DaemonClient zeroes its request json, the
 // request line, the socket write copy and the raw reply line. Not zeroed: the
 // FTXUI render structures that copy buffer contents (and the detail pane's
-// wrapped pieces) each frame, a buffer that outgrows its reserve and
+// wrapped pieces) each frame, FTXUI's input parser and the Event objects that
+// carry each typed or pasted character, a buffer that outgrows its reserve and
 // reallocates, nlohmann's serializer growth copies while it writes the request
 // line, and its parser scratch while it reads a reply — DESIGN.md's
 // client-process copies ceiling. Best-effort — good enough for a local TUI, not
@@ -74,8 +75,9 @@ using Clock = std::chrono::steady_clock;
 constexpr auto kRevealFor = std::chrono::seconds(60);  // a revealed value re-masks after this
 constexpr auto kInfoFor = std::chrono::seconds(4);     // an info message clears after this; errors stay
 // A paste without bracketed-paste markers arrives as a burst of keys, which
-// FTXUI reads 128 bytes a frame (~17 ms apart): an Enter followed this soon by
-// more input is a pasted newline, and keys this soon after a save are dropped.
+// FTXUI reads 128 bytes a frame (~17 ms apart): an Enter or Tab followed this
+// soon by more input is a pasted newline or tab, and keys this soon after a
+// save are dropped.
 constexpr auto kPasteBurst = std::chrono::milliseconds(50);
 constexpr auto kAfterSubmitQuiet = std::chrono::milliseconds(100);
 
@@ -228,19 +230,22 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     bool show_form_problem = false;  // set by a refused submit; then validation is live
     std::string paste_buffer;
     bool pasting = false;  // between bracketed-paste start and end markers
-    std::optional<Clock::time_point> submit_pending_since;  // Enter held back for kPasteBurst
-    Clock::time_point ignore_keys_until;                     // kAfterSubmitQuiet after a submit
-    Clock::time_point last_key_at;                           // spots an unbracketed paste
+    std::optional<Clock::time_point> held_key_since;  // a form Enter, or a Tab in the value, held for kPasteBurst
+    bool held_key_is_tab = false;
+    Clock::time_point ignore_keys_until;  // kAfterSubmitQuiet after a submit
     int help_scroll = 0;
     std::string status;
     bool status_is_error = false;  // errors stay until the next key; info expires after kInfoFor
     Clock::time_point status_at;
-    bool daemon_unreachable = false;  // the last call never reached the daemon; the tree is stale
+    // Of the last call: Unreachable (not running, hung up) leaves the tree stale;
+    // Busy means another client held the daemon past the reply timeout.
+    enum class DaemonState { Ok, Busy, Unreachable };
+    DaemonState daemon_state = DaemonState::Ok;
     Mode mode = Mode::Normal;
     int active_tab = 0;  // 0 = key list, 1 = add/edit form
     int form_field = 0;  // 0 = name input, 1 = value input
     int detail_scroll = 0;     // first detail-pane line shown
-    bool scroll_to_value = false;  // set by a reveal: bring the value into the detail pane
+    bool keep_value_in_view = false;  // set by a reveal, cleared by J/K: the detail pane follows the value
     int list_text_width = 0;   // columns a list row may use, set each frame before the menu renders
 
     auto say = [&](std::string message) {
@@ -356,17 +361,17 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     auto call = [&](const std::string& op, const std::string& key, std::optional<std::string_view> value) -> json {
         try {
             json resp = daemon.request(op, key, value);
-            daemon_unreachable = false;
+            daemon_state = DaemonState::Ok;
             return resp;
         } catch (const DaemonUnreachable& e) {
-            daemon_unreachable = true;
+            daemon_state = is_busy(e) ? DaemonState::Busy : DaemonState::Unreachable;
             // The socket path would push the fix off the status bar; ? shows it.
             if (e.stage == DaemonUnreachable::Stage::NotRunning) {
                 throw DaemonUnreachable("daemon not running: start it (scripts/service start), then R", e.stage);
             }
             throw;
         } catch (...) {
-            daemon_unreachable = false;  // it answered, with an error
+            daemon_state = DaemonState::Ok;  // it answered, with an error
             throw;
         }
     };
@@ -458,7 +463,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             revealed.emplace();
             take_value(resp, *revealed);
             revealed_at = Clock::now();
-            scroll_to_value = true;
+            keep_value_in_view = true;
         } catch (const std::exception& e) {
             remask();
             fail(e, *key);
@@ -544,11 +549,15 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             fail(e, *key);
             return;
         }
-        value_cursor = static_cast<int>(add_value.size());
+        // A multi-line value opens at its top: FTXUI's input centres the cursor,
+        // so a cursor on the last line would shift every line sideways once
+        // any line is wider than the input. A one-line value opens at its end.
+        bool multi_line = add_value.find('\n') != std::string::npos;
+        value_cursor = multi_line ? 0 : static_cast<int>(add_value.size());
         mode = Mode::Edit;
         active_tab = 1;
         form_field = 1;
-        say("editing " + *key);
+        say("editing");  // the form shows the name
     };
 
     auto cancel_form = [&] {
@@ -720,11 +729,15 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     // Marker, indentation and glyph in front of a row's name. Every row puts
     // its glyph at column 2*depth, so a top-level secret never lines up with
     // a folder's children.
+    // ponytail: the indent stops where the marker, glyph and kMinLabelColumns
+    // of name still fit, so deeper levels share one column; the detail pane
+    // shows the full path.
+    constexpr int kMinLabelColumns = 6;
     auto row_prefix = [&](int i, bool is_selected) {
         const Row& row = row_at(i);
         const char* glyph = !row.dir ? (is_marked(row) ? "◆ " : "· ") : is_folded(row.id) ? "▸ " : "▾ ";
-        return std::string(is_selected ? "> " : "  ") + std::string(2 * static_cast<std::size_t>(row.depth), ' ') +
-               glyph;
+        int indent = std::clamp(list_text_width - 4 - kMinLabelColumns, 0, 2 * row.depth);
+        return std::string(is_selected ? "> " : "  ") + std::string(static_cast<std::size_t>(indent), ' ') + glyph;
     };
 
     MenuOption menu_opt = MenuOption::Vertical();
@@ -778,7 +791,11 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             bool compacted = false;
         };
         std::vector<StatusPart> parts;
-        if (daemon_unreachable) parts.push_back({" daemon unreachable: list stale ", " stale ", bold | color(Color::Red)});
+        if (daemon_state == DaemonState::Unreachable) {
+            parts.push_back({" daemon unreachable: list stale ", " stale ", bold | color(Color::Red)});
+        } else if (daemon_state == DaemonState::Busy) {
+            parts.push_back({" daemon busy ", " busy ", bold | color(Color::Yellow)});
+        }
         if (mode == Mode::Filter || !filter.empty()) {
             std::string shown = printable(filter) + (mode == Mode::Filter ? "▏" : "");
             parts.push_back({" filter: " + shown + " ", " /" + ellipsize(shown, 12) + " ", bold});
@@ -840,14 +857,14 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         std::string list_title = " secrets ";
         if (!marks.project.empty()) list_title += "◆ " + marks.project + " ";
         if (!marks.problem.empty()) list_title += "◆ refused, see ? ";
-        if (daemon_unreachable) list_title += "(stale) ";
+        if (daemon_state == DaemonState::Unreachable) list_title += "(stale) ";
         int list_width = terminal.dimx;
         int list_height = stacked ? panes_height / 2 : panes_height;
         if (!stacked) {
             int longest = 0;
             for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
-                longest = std::max(longest, text_columns(row_prefix(i, false)) +
-                                                text_columns(labels[static_cast<std::size_t>(i)]));
+                // Marker, uncapped indent, glyph, name.
+                longest = std::max(longest, 4 + 2 * row_at(i).depth + text_columns(labels[static_cast<std::size_t>(i)]));
             }
             // +3: borders and scroll indicator. At most 2/5 so the detail pane keeps room for a value.
             int widest = terminal.dimx * 2 / 5;
@@ -897,7 +914,9 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             value_label_line = static_cast<int>(detail_lines.size());
             detail_lines.push_back(text("value:") | dim);
             if (revealed) {
-                add_wrapped(*revealed, nothing);
+                std::string shown_value = printable_value(*revealed);
+                add_wrapped(shown_value, nothing);
+                zero(shown_value);
             } else {
                 detail_lines.push_back(text("••••••••"));
                 detail_lines.push_back(text("(Enter or r reveals, c copies)") | dim);
@@ -905,11 +924,11 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         }
         int detail_line_count = static_cast<int>(detail_lines.size());
         bool detail_overflows = detail_line_count > detail_text_height;
-        // A short pane (stacked, or a long name) would leave a just-revealed value below the fold.
-        if (scroll_to_value && revealed && value_label_line + 2 > detail_scroll + detail_text_height) {
+        // A short pane (stacked, a long name, or squeezed by a long message or
+        // a resize) would leave a revealed value below the fold.
+        if (keep_value_in_view && revealed && value_label_line + 2 > detail_scroll + detail_text_height) {
             detail_scroll = value_label_line;
         }
-        scroll_to_value = false;
         detail_scroll = std::clamp(detail_scroll, 0, std::max(0, detail_line_count - detail_text_height));
         int detail_last = std::min(detail_line_count, detail_scroll + detail_text_height);
         std::string detail_title = " detail ";
@@ -924,17 +943,17 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
         std::vector<std::string> hint_items;
         if (mode == Mode::Normal && keys.empty()) {
-            hint_items = {"a add", daemon_unreachable ? "R retry" : "R reload", "? help  q quit"};
+            hint_items = {"a add", daemon_state != DaemonState::Ok ? "R retry" : "R reload", "? help  q quit"};
         } else if (mode == Mode::Normal) {
             hint_items = {"j/k move"};
             if (current_key()) {
                 hint_items.insert(hint_items.end(), {revealed ? "Enter/r hide" : "Enter/r reveal", "c copy"});
             }
             if (detail_overflows) hint_items.push_back("J/K scroll");
-            if (daemon_unreachable) hint_items.push_back("R retry");
+            if (daemon_state != DaemonState::Ok) hint_items.push_back("R retry");
             if (!filter.empty()) hint_items.push_back("Esc clear filter");
             hint_items.insert(hint_items.end(), {"h/l fold", "/ filter", "a add", "e edit", "d delete"});
-            if (!daemon_unreachable) hint_items.push_back("R reload");
+            if (daemon_state == DaemonState::Ok) hint_items.push_back("R reload");
             hint_items.push_back("? help  q quit");
         } else if (mode == Mode::Filter) {
             hint_items = {"type to narrow", "↑/↓ move", "Enter keep filter", "Esc clear"};
@@ -948,7 +967,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             if (mode == Mode::Add) hint_items.push_back("Tab switch field");
             hint_items.insert(hint_items.end(), {"Ctrl-U/W erase", "Ctrl-A/E line start/end", "Esc cancel"});
         } else {
-            hint_items = {"y yes", "Enter/Esc/any other key no"};
+            hint_items = {"y yes  other keys no"};
         }
         Element hints = text(" " + fit_hints(hint_items, terminal.dimx - 2) + " ") | dim | center;
 
@@ -986,8 +1005,12 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             int value_rows = std::clamp(terminal.dimy - 2 * rows_below_panes - 4 - line_rows, 1, 8);
             // ponytail: the masked input draws a bullet per character (FTXUI's
             // password mode), so length and line shape show; a fixed placeholder
-            // would hide typing feedback. Long lines scroll sideways with the
-            // cursor (FTXUI's Input can't soft-wrap); the detail pane wraps them.
+            // would hide typing feedback. FTXUI draws no glyph (and no bullet) for
+            // a tab or other control character, and its Input has no display
+            // hook; the detail pane shows them. Long lines scroll sideways with
+            // the cursor, which FTXUI keeps centred, so once any line is wider
+            // than the input every line shifts and loses its start (FTXUI's
+            // Input can't soft-wrap); the detail pane wraps them.
             lines.push_back(hbox({text("value: "), value_input->Render() | size(HEIGHT, LESS_THAN, value_rows)}));
             if (problem) lines.push_back(text("       " + *problem) | color(Color::Red));
             std::string title = adding ? " add secret: env/project/KEY " : " edit secret ";
@@ -1005,13 +1028,18 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                                        ? "Delete '" + current_key().value_or("") + "'? [y/N]"
                                        : "Overwrite '" + trim_key_name(add_name) + "'? [y/N]";
             question = printable(question);
-            // dimx - 8: the pane borders keep a visible segment outside the modal's margin.
-            int question_width = std::min(text_columns(question), std::max(terminal.dimx - 8, 10));
+            // Side by side, dimx - 8 keeps a visible segment of the pane borders
+            // outside the modal's margin. Stacked, the modal spans the full width
+            // like the form, so no pane text shows beside it.
+            int question_width = stacked ? std::max(terminal.dimx - 4, 10)
+                                         : std::min(text_columns(question), std::max(terminal.dimx - 8, 10));
             Elements question_lines;
             for (std::string_view piece : wrap_lines(question, question_width)) {
                 question_lines.push_back(text(std::string(piece)));
             }
-            root = dbox({root, modal(window(text(" confirm "), vbox(std::move(question_lines))))});
+            Element dialog = window(text(" confirm "), vbox(std::move(question_lines)));
+            if (stacked) dialog |= size(WIDTH, EQUAL, question_width + 2);
+            root = dbox({root, modal(std::move(dialog))});
         }
         if (mode == Mode::Help) {
             // Rows are pre-formatted to the overlay width so FTXUI never shrinks the keys column.
@@ -1079,8 +1107,13 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         tick_wakeup.notify_one();
     };
 
-    auto submit_held_enter = [&] {
-        submit_pending_since.reset();
+    // No more input came within kPasteBurst: the held key was typed, so it acts.
+    auto release_held_key = [&] {
+        held_key_since.reset();
+        if (held_key_is_tab) {
+            if (mode == Mode::Add) form_field = 0;
+            return;
+        }
         if (mode == Mode::Add) {
             submit_add();
         } else if (mode == Mode::Edit) {
@@ -1090,26 +1123,21 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     };
 
     Component app = CatchEvent(renderer, [&](Event event) -> bool {
-        if (event == Event::Custom) {  // the once-a-second tick, or the held Enter's deadline
-            if (submit_pending_since && Clock::now() - *submit_pending_since >= kPasteBurst) submit_held_enter();
+        if (event == Event::Custom) {  // the once-a-second tick, or the held key's deadline
+            if (held_key_since && Clock::now() - *held_key_since >= kPasteBurst) release_held_key();
             expire();
             return true;
         }
         sync_selection();
         expire();
-        bool in_key_burst = false;  // this key came hard on the previous one: part of a paste
-        if (!event.is_mouse()) {
-            in_key_burst = Clock::now() - last_key_at < kPasteBurst;
-            last_key_at = Clock::now();
-        }
-        if (submit_pending_since && !event.is_mouse()) {
-            bool pasted_newline = Clock::now() - *submit_pending_since < kPasteBurst &&
-                                  (event.is_character() || event == Event::Return || event == Event::Tab);
-            if (pasted_newline) {
-                submit_pending_since.reset();
-                insert_into_value("\n");
+        if (held_key_since && !event.is_mouse()) {
+            bool pasted = Clock::now() - *held_key_since < kPasteBurst &&
+                          (event.is_character() || event == Event::Return || event == Event::Tab);
+            if (pasted) {
+                held_key_since.reset();
+                insert_into_value(held_key_is_tab ? "\t" : "\n");
             } else {
-                submit_held_enter();
+                release_held_key();
             }
         }
         bool is_mouse_press = event.is_mouse() && event.mouse().motion == Mouse::Pressed;
@@ -1280,6 +1308,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             }
             if (event == Event::Character('J') || event == Event::Character('K')) {
                 detail_scroll += event == Event::Character('J') ? 1 : -1;  // the renderer clamps it
+                keep_value_in_view = false;
                 return true;
             }
             return false;  // up/down, j/k, PgUp/PgDn, Home/End and the wheel fall through to the menu
@@ -1294,7 +1323,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                     form_field = 1;
                 } else {
                     // Held back: more input right behind it means a paste, and the Enter was a newline.
-                    submit_pending_since = Clock::now();
+                    held_key_since = Clock::now();
+                    held_key_is_tab = false;
                     request_quick_tick();
                 }
                 return true;
@@ -1303,13 +1333,12 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 value_masked = !value_masked;
                 return true;
             }
-            // A pasted tab would otherwise move focus and send the rest of the value into the name.
+            // Held back like Enter: a pasted tab would otherwise move focus and
+            // send the rest of the value into the name.
             if (event == Event::Tab && form_field == 1) {
-                if (in_key_burst) {
-                    insert_into_value("\t");
-                } else if (mode == Mode::Add) {
-                    form_field = 0;
-                }
+                held_key_since = Clock::now();
+                held_key_is_tab = true;
+                request_quick_tick();
                 return true;
             }
             std::string& text_in_focus = form_field == 0 ? add_name : add_value;
@@ -1350,7 +1379,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         return true;
     });
 
-    // Drives the reveal countdown, the auto re-mask, message expiry and the held Enter.
+    // Drives the reveal countdown, the auto re-mask, message expiry and the held key.
     std::jthread ticker([&](std::stop_token stop) {
         std::unique_lock lock(tick_mutex);
         while (!stop.stop_requested()) {

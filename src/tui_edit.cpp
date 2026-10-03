@@ -190,6 +190,29 @@ std::string printable(std::string_view text) {
     return shown;
 }
 
+std::string printable_value(std::string_view value) {
+    constexpr std::string_view kTabGlyph = "→";
+    auto tabs = static_cast<std::size_t>(std::count(value.begin(), value.end(), '\t'));
+    std::string shown;
+    shown.reserve(value.size() + tabs * (kTabGlyph.size() - 1));  // exact: no reallocation leaves a copy
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        auto byte = static_cast<unsigned char>(value[i]);
+        bool c1 = byte == 0xC2 && i + 1 < value.size() && static_cast<unsigned char>(value[i + 1]) >= 0x80 &&
+                  static_cast<unsigned char>(value[i + 1]) <= 0x9F;
+        if (byte == '\t') {
+            shown += kTabGlyph;
+        } else if (c1) {
+            shown += '?';
+            ++i;
+        } else if ((byte < 0x20 && byte != '\n') || byte == 0x7f) {
+            shown += '?';
+        } else {
+            shown += value[i];
+        }
+    }
+    return shown;
+}
+
 std::string fit_hints(const std::vector<std::string>& hints, int width) {
     std::vector<std::string> kept = hints;
     auto joined = [&] {
