@@ -21,6 +21,10 @@ constexpr unsigned char kMagic[4] = {'S', 'C', 'T', 'V'};
 constexpr unsigned char kVersion1 = 1;
 constexpr unsigned char kVersion2 = 2;
 
+// Used at create, and by passwd to upgrade a store made with weaker params.
+constexpr std::uint64_t kDefaultOpslimit = crypto_pwhash_OPSLIMIT_MODERATE;
+constexpr std::uint64_t kDefaultMemlimit = crypto_pwhash_MEMLIMIT_MODERATE;
+
 constexpr std::size_t kHeaderSizeV1 = sizeof(kMagic) + 1 + crypto_pwhash_SALTBYTES + 8 + 8 + 8 +
                                       crypto_secretbox_NONCEBYTES;
 constexpr std::size_t kHeaderSizeV2 = sizeof(kMagic) + 1 + crypto_pwhash_SALTBYTES + 8 + 8 + 8 +
@@ -106,13 +110,13 @@ Store::Unwrapped Store::unwrap(const std::string& passphrase, const char* fail_m
     unsigned char* data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
     unsigned char* wrap_key = nullptr;
     try {
-        wrap_key = derive_kdf_key(passphrase, salt_, opslimit_, memlimit_);
+        wrap_key = derive_kdf_key(passphrase, env_.salt, env_.opslimit, env_.memlimit);
     } catch (...) {
         free_guarded(data_key, crypto_secretbox_KEYBYTES);
         throw;
     }
-    if (crypto_secretbox_open_easy(data_key, wrapped_key_, sizeof(wrapped_key_), wrap_nonce_,
-                                   wrap_key) != 0) {
+    if (crypto_secretbox_open_easy(data_key, env_.wrapped_key, sizeof(env_.wrapped_key),
+                                   env_.wrap_nonce, wrap_key) != 0) {
         free_guarded(wrap_key, crypto_secretbox_KEYBYTES);
         free_guarded(data_key, crypto_secretbox_KEYBYTES);
         throw std::runtime_error(fail_msg);
@@ -120,10 +124,20 @@ Store::Unwrapped Store::unwrap(const std::string& passphrase, const char* fail_m
     return {wrap_key, data_key};
 }
 
-// Encrypts `data` under the current data key and writes the whole file.
-// Callers that mutate the map pass a candidate and adopt it only after this
-// returns, so a failed write never leaves memory ahead of disk.
-void Store::persist(const nlohmann::json& data) const {
+void Store::mint_data_key(unsigned char* data_key, const unsigned char* wrap_key,
+                          Envelope& envelope) {
+    randombytes_buf(data_key, crypto_secretbox_KEYBYTES);
+    randombytes_buf(envelope.wrap_nonce, sizeof(envelope.wrap_nonce));
+    crypto_secretbox_easy(envelope.wrapped_key, data_key, crypto_secretbox_KEYBYTES,
+                          envelope.wrap_nonce, wrap_key);
+}
+
+// Encrypts `data` under `data_key` and writes the whole file with `envelope`
+// as its header. Callers that change the map, the key, or the envelope pass
+// candidates and adopt them only after this returns, so a failed write never
+// leaves memory ahead of disk.
+void Store::persist(const nlohmann::json& data, const unsigned char* data_key,
+                    const Envelope& envelope) const {
     std::string plaintext = data.dump();
 
     unsigned char payload_nonce[crypto_secretbox_NONCEBYTES];
@@ -132,18 +146,19 @@ void Store::persist(const nlohmann::json& data) const {
     std::vector<unsigned char> ciphertext(plaintext.size() + crypto_secretbox_MACBYTES);
     crypto_secretbox_easy(ciphertext.data(),
                           reinterpret_cast<const unsigned char*>(plaintext.data()),
-                          plaintext.size(), payload_nonce, key_);
+                          plaintext.size(), payload_nonce, data_key);
 
     std::vector<unsigned char> out;
     out.reserve(kHeaderSizeV2 + ciphertext.size());
     out.insert(out.end(), kMagic, kMagic + sizeof(kMagic));
     out.push_back(kVersion2);
-    out.insert(out.end(), salt_, salt_ + crypto_pwhash_SALTBYTES);
-    put_u64_le(out, opslimit_);
-    put_u64_le(out, memlimit_);
-    put_u64_le(out, key_created_at_);
-    out.insert(out.end(), wrap_nonce_, wrap_nonce_ + sizeof(wrap_nonce_));
-    out.insert(out.end(), wrapped_key_, wrapped_key_ + sizeof(wrapped_key_));
+    out.insert(out.end(), envelope.salt, envelope.salt + sizeof(envelope.salt));
+    put_u64_le(out, envelope.opslimit);
+    put_u64_le(out, envelope.memlimit);
+    put_u64_le(out, envelope.key_created_at);
+    out.insert(out.end(), envelope.wrap_nonce, envelope.wrap_nonce + sizeof(envelope.wrap_nonce));
+    out.insert(out.end(), envelope.wrapped_key,
+               envelope.wrapped_key + sizeof(envelope.wrapped_key));
     out.insert(out.end(), payload_nonce, payload_nonce + sizeof(payload_nonce));
     out.insert(out.end(), ciphertext.begin(), ciphertext.end());
 
@@ -158,27 +173,24 @@ Store Store::create(const std::string& path, const std::string& passphrase, std:
 
     Store s;
     s.path_ = path;
-    randombytes_buf(s.salt_, sizeof(s.salt_));
-    s.opslimit_ = crypto_pwhash_OPSLIMIT_MODERATE;
-    s.memlimit_ = crypto_pwhash_MEMLIMIT_MODERATE;
-    s.key_created_at_ = now;
+    randombytes_buf(s.env_.salt, sizeof(s.env_.salt));
+    s.env_.opslimit = kDefaultOpslimit;
+    s.env_.memlimit = kDefaultMemlimit;
+    s.env_.key_created_at = now;
 
     unsigned char* data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
     unsigned char* wrap_key = nullptr;
     try {
-        wrap_key = derive_kdf_key(passphrase, s.salt_, s.opslimit_, s.memlimit_);
+        wrap_key = derive_kdf_key(passphrase, s.env_.salt, s.env_.opslimit, s.env_.memlimit);
     } catch (...) {
         free_guarded(data_key, crypto_secretbox_KEYBYTES);
         throw;
     }
-    randombytes_buf(data_key, crypto_secretbox_KEYBYTES);
-    randombytes_buf(s.wrap_nonce_, sizeof(s.wrap_nonce_));
-    crypto_secretbox_easy(s.wrapped_key_, data_key, crypto_secretbox_KEYBYTES, s.wrap_nonce_,
-                          wrap_key);
+    mint_data_key(data_key, wrap_key, s.env_);
     free_guarded(wrap_key, crypto_secretbox_KEYBYTES);
 
     s.key_ = data_key;
-    s.persist(s.data_);
+    s.persist(s.data_, s.key_, s.env_);
     return s;
 }
 
@@ -256,8 +268,8 @@ Store Store::open(const std::string& path, const std::string& passphrase) {
         unsigned char* data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
         V1Decoded decoded;
         try {
-            decoded = decode_v1(buf, passphrase, s.salt_, s.opslimit_, s.memlimit_,
-                                s.key_created_at_);
+            decoded = decode_v1(buf, passphrase, s.env_.salt, s.env_.opslimit, s.env_.memlimit,
+                                s.env_.key_created_at);
         } catch (...) {
             free_guarded(data_key, crypto_secretbox_KEYBYTES);
             throw;
@@ -267,14 +279,11 @@ Store Store::open(const std::string& path, const std::string& passphrase) {
         // Migrate: mint a fresh data key, wrap it under the same
         // passphrase-derived key with a fresh wrap nonce; salt/params/
         // key_created_at are kept.
-        randombytes_buf(data_key, crypto_secretbox_KEYBYTES);
-        randombytes_buf(s.wrap_nonce_, sizeof(s.wrap_nonce_));
-        crypto_secretbox_easy(s.wrapped_key_, data_key, crypto_secretbox_KEYBYTES, s.wrap_nonce_,
-                              decoded.key);
+        mint_data_key(data_key, decoded.key, s.env_);
         free_guarded(decoded.key, crypto_secretbox_KEYBYTES);
 
         s.key_ = data_key;
-        s.persist(s.data_);
+        s.persist(s.data_, s.key_, s.env_);
         return s;
     }
 
@@ -288,25 +297,25 @@ Store Store::open(const std::string& path, const std::string& passphrase) {
     Store s;
     s.path_ = path;
     std::size_t off = sizeof(kMagic) + 1;
-    std::memcpy(s.salt_, buf.data() + off, crypto_pwhash_SALTBYTES);
-    off += crypto_pwhash_SALTBYTES;
-    s.opslimit_ = get_u64_le(buf.data() + off);
+    std::memcpy(s.env_.salt, buf.data() + off, sizeof(s.env_.salt));
+    off += sizeof(s.env_.salt);
+    s.env_.opslimit = get_u64_le(buf.data() + off);
     off += 8;
-    s.memlimit_ = get_u64_le(buf.data() + off);
+    s.env_.memlimit = get_u64_le(buf.data() + off);
     off += 8;
-    s.key_created_at_ = get_u64_le(buf.data() + off);
+    s.env_.key_created_at = get_u64_le(buf.data() + off);
     off += 8;
-    std::memcpy(s.wrap_nonce_, buf.data() + off, sizeof(s.wrap_nonce_));
-    off += sizeof(s.wrap_nonce_);
-    std::memcpy(s.wrapped_key_, buf.data() + off, sizeof(s.wrapped_key_));
-    off += sizeof(s.wrapped_key_);
+    std::memcpy(s.env_.wrap_nonce, buf.data() + off, sizeof(s.env_.wrap_nonce));
+    off += sizeof(s.env_.wrap_nonce);
+    std::memcpy(s.env_.wrapped_key, buf.data() + off, sizeof(s.env_.wrapped_key));
+    off += sizeof(s.env_.wrapped_key);
     const unsigned char* payload_nonce = buf.data() + off;
     off += crypto_secretbox_NONCEBYTES;
 
     const unsigned char* ct = buf.data() + off;
     std::size_t ct_len = buf.size() - off;
 
-    check_kdf_params(s.opslimit_, s.memlimit_);
+    check_kdf_params(s.env_.opslimit, s.env_.memlimit);
 
     Unwrapped keys = s.unwrap(passphrase, "wrong passphrase or corrupted store");
     free_guarded(keys.wrap_key, crypto_secretbox_KEYBYTES);
@@ -342,7 +351,7 @@ std::optional<std::string> Store::get(const std::string& key) const {
 void Store::set(const std::string& key, const std::string& value) {
     nlohmann::json next = data_;
     next[key] = value;
-    persist(next);
+    persist(next, key_, env_);
     data_ = std::move(next);
 }
 
@@ -350,7 +359,7 @@ bool Store::remove(const std::string& key) {
     if (!data_.contains(key)) return false;
     nlohmann::json next = data_;
     next.erase(key);
-    persist(next);
+    persist(next, key_, env_);
     data_ = std::move(next);
     return true;
 }
@@ -374,9 +383,19 @@ std::map<std::string, std::string> Store::get_prefix(const std::string& prefix) 
     return out;
 }
 
+void Store::commit_new_key(unsigned char* new_data_key, const Envelope& next) {
+    try {
+        persist(data_, new_data_key, next);
+    } catch (...) {
+        free_guarded(new_data_key, crypto_secretbox_KEYBYTES);
+        throw;
+    }
+    free_guarded(key_, crypto_secretbox_KEYBYTES);
+    key_ = new_data_key;
+    env_ = next;
+}
+
 void Store::rotate(const std::string& passphrase, std::uint64_t now) {
-    // Everything into locals first; only after it all succeeds do we touch
-    // members, so a throw here leaves the store fully intact.
     unsigned char* new_data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
     Unwrapped keys;
     try {
@@ -386,67 +405,51 @@ void Store::rotate(const std::string& passphrase, std::uint64_t now) {
         throw;
     }
     free_guarded(keys.data_key, crypto_secretbox_KEYBYTES);  // we already hold it in key_
-    unsigned char* wrap_key = keys.wrap_key;
 
-    // Mint a fresh data key and wrap it under the same wrapping key (same
-    // salt/params, fresh wrap nonce).
-    randombytes_buf(new_data_key, crypto_secretbox_KEYBYTES);
-    unsigned char new_wrap_nonce[crypto_secretbox_NONCEBYTES];
-    randombytes_buf(new_wrap_nonce, sizeof(new_wrap_nonce));
-    unsigned char new_wrapped_key[crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES];
-    crypto_secretbox_easy(new_wrapped_key, new_data_key, crypto_secretbox_KEYBYTES,
-                          new_wrap_nonce, wrap_key);
-    free_guarded(wrap_key, crypto_secretbox_KEYBYTES);
-
-    // Commit: nothing below throws before persist except persist itself,
-    // and persist leaves the object in a well-defined (new) state either way.
-    unsigned char* old_key = key_;
-    key_ = new_data_key;
-    std::memcpy(wrap_nonce_, new_wrap_nonce, sizeof(wrap_nonce_));
-    std::memcpy(wrapped_key_, new_wrapped_key, sizeof(wrapped_key_));
-    key_created_at_ = now;
-    free_guarded(old_key, crypto_secretbox_KEYBYTES);
-    persist(data_);
+    // Same wrapping key (salt/params unchanged); fresh data key and wrap nonce.
+    Envelope next = env_;
+    next.key_created_at = now;
+    mint_data_key(new_data_key, keys.wrap_key, next);
+    free_guarded(keys.wrap_key, crypto_secretbox_KEYBYTES);
+    commit_new_key(new_data_key, next);
 }
 
-void Store::change_passphrase(const std::string& old_pass, const std::string& new_pass) {
+void Store::change_passphrase(const std::string& old_pass, const std::string& new_pass,
+                              std::uint64_t now) {
     if (new_pass.empty()) {
         throw std::runtime_error("empty passphrase");
     }
-    // Verify the old passphrase against the current wrapped blob.
     Unwrapped check = unwrap(old_pass, "wrong passphrase");
     free_guarded(check.wrap_key, crypto_secretbox_KEYBYTES);
     free_guarded(check.data_key, crypto_secretbox_KEYBYTES);
 
-    // Fresh salt, wrap the EXISTING data key under a key derived from the
-    // new passphrase. Locals first; nothing below throws before persist.
-    unsigned char new_salt[crypto_pwhash_SALTBYTES];
-    randombytes_buf(new_salt, sizeof(new_salt));
-    unsigned char* new_wrap_key = derive_kdf_key(new_pass, new_salt, opslimit_, memlimit_);
-    unsigned char new_wrap_nonce[crypto_secretbox_NONCEBYTES];
-    randombytes_buf(new_wrap_nonce, sizeof(new_wrap_nonce));
-    unsigned char new_wrapped_key[crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES];
-    crypto_secretbox_easy(new_wrapped_key, key_, crypto_secretbox_KEYBYTES, new_wrap_nonce,
-                          new_wrap_key);
+    // A fresh data key, not a re-wrap of the old one: an old copy of the file
+    // plus the old passphrase must not unwrap the key protecting later writes.
+    // Current default KDF params, so passwd upgrades a store made with weaker
+    // ones.
+    Envelope next;
+    randombytes_buf(next.salt, sizeof(next.salt));
+    next.opslimit = kDefaultOpslimit;
+    next.memlimit = kDefaultMemlimit;
+    next.key_created_at = now;
+    unsigned char* new_data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
+    unsigned char* new_wrap_key = nullptr;
+    try {
+        new_wrap_key = derive_kdf_key(new_pass, next.salt, next.opslimit, next.memlimit);
+    } catch (...) {
+        free_guarded(new_data_key, crypto_secretbox_KEYBYTES);
+        throw;
+    }
+    mint_data_key(new_data_key, new_wrap_key, next);
     free_guarded(new_wrap_key, crypto_secretbox_KEYBYTES);
-
-    std::memcpy(salt_, new_salt, sizeof(salt_));
-    std::memcpy(wrap_nonce_, new_wrap_nonce, sizeof(wrap_nonce_));
-    std::memcpy(wrapped_key_, new_wrapped_key, sizeof(wrapped_key_));
-    // key_created_at_ unchanged: the data key itself did not change.
-    persist(data_);
+    commit_new_key(new_data_key, next);
 }
 
 Store::Store(Store&& other) noexcept
     : path_(std::move(other.path_)),
       data_(std::move(other.data_)),
       key_(other.key_),
-      opslimit_(other.opslimit_),
-      memlimit_(other.memlimit_),
-      key_created_at_(other.key_created_at_) {
-    std::memcpy(salt_, other.salt_, sizeof(salt_));
-    std::memcpy(wrap_nonce_, other.wrap_nonce_, sizeof(wrap_nonce_));
-    std::memcpy(wrapped_key_, other.wrapped_key_, sizeof(wrapped_key_));
+      env_(other.env_) {
     other.key_ = nullptr;
 }
 
@@ -456,12 +459,7 @@ Store& Store::operator=(Store&& other) noexcept {
         path_ = std::move(other.path_);
         data_ = std::move(other.data_);
         key_ = other.key_;
-        std::memcpy(salt_, other.salt_, sizeof(salt_));
-        std::memcpy(wrap_nonce_, other.wrap_nonce_, sizeof(wrap_nonce_));
-        std::memcpy(wrapped_key_, other.wrapped_key_, sizeof(wrapped_key_));
-        opslimit_ = other.opslimit_;
-        memlimit_ = other.memlimit_;
-        key_created_at_ = other.key_created_at_;
+        env_ = other.env_;
         other.key_ = nullptr;
     }
     return *this;

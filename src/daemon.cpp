@@ -73,7 +73,7 @@ std::string dispatch(Store& store, const Request& req, std::uint64_t now) {
     }
     if (req.op == "passwd") {
         if (req.old_pass.empty() || req.new_pass.empty()) return error_response("missing passphrase");
-        store.change_passphrase(req.old_pass, req.new_pass);
+        store.change_passphrase(req.old_pass, req.new_pass, now);
         return ok_response();
     }
     return error_response("unknown op: " + req.op);

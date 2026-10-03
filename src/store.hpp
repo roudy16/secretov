@@ -62,14 +62,26 @@ class Store {
     // throws "wrong passphrase" on MAC failure. Re-encrypts the payload
     // under the fresh key.
     void rotate(const std::string& passphrase, std::uint64_t now);
-    // New wrapping key: fresh salt, derive from new_pass, re-wrap the
-    // existing data key. Verifies old_pass first (same way).
-    // key_created_at is unchanged (the data key itself did not change).
-    void change_passphrase(const std::string& old_pass, const std::string& new_pass);
-    std::uint64_t key_created_at() const { return key_created_at_; }
+    // New wrapping key AND new data key: fresh salt, current default KDF
+    // params, derive from new_pass, re-encrypt the payload under a fresh data
+    // key wrapped by it. Verifies old_pass first (same way). key_created_at
+    // becomes `now`.
+    void change_passphrase(const std::string& old_pass, const std::string& new_pass,
+                           std::uint64_t now);
+    std::uint64_t key_created_at() const { return env_.key_created_at; }
 
    private:
     Store() = default;
+
+    // Plaintext header fields written ahead of the payload.
+    struct Envelope {
+        unsigned char salt[crypto_pwhash_SALTBYTES] = {};
+        std::uint64_t opslimit = 0;
+        std::uint64_t memlimit = 0;
+        std::uint64_t key_created_at = 0;
+        unsigned char wrap_nonce[crypto_secretbox_NONCEBYTES] = {};
+        unsigned char wrapped_key[crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES] = {};
+    };
 
     // Wrapping key derived from a passphrase plus the data key it unwrapped.
     // Both mlock'd; the caller frees each.
@@ -81,7 +93,15 @@ class Store {
     // blob must unwrap) and hands back the wrapping key for re-wrapping.
     // Throws `fail_msg` on MAC failure.
     Unwrapped unwrap(const std::string& passphrase, const char* fail_msg) const;
-    void persist(const nlohmann::json& data) const;
+    // Fills `data_key` with a fresh random key and wraps it under `wrap_key`
+    // into `envelope` with a fresh wrap nonce.
+    static void mint_data_key(unsigned char* data_key, const unsigned char* wrap_key,
+                              Envelope& envelope);
+    void persist(const nlohmann::json& data, const unsigned char* data_key,
+                 const Envelope& envelope) const;
+    // Takes ownership of `new_data_key`: persists data_ under it and `next`,
+    // then adopts both. On a failed write the key is freed and nothing changes.
+    void commit_new_key(unsigned char* new_data_key, const Envelope& next);
     void wipe();
 
     std::string path_;
@@ -90,13 +110,7 @@ class Store {
     // Guarded (sodium_mlock) secret material. The Store retains only the
     // data key; the passphrase and wrapping key are never retained.
     unsigned char* key_ = nullptr;  // crypto_secretbox_KEYBYTES (the data key)
-
-    unsigned char salt_[crypto_pwhash_SALTBYTES] = {};
-    std::uint64_t opslimit_ = 0;
-    std::uint64_t memlimit_ = 0;
-    std::uint64_t key_created_at_ = 0;
-    unsigned char wrap_nonce_[crypto_secretbox_NONCEBYTES] = {};
-    unsigned char wrapped_key_[crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES] = {};
+    Envelope env_;
 };
 
 }  // namespace secretov

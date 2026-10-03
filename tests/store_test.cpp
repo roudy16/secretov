@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <string>
@@ -19,6 +20,22 @@ std::string g_dir;
 const std::string kPass = "correct horse battery staple";
 constexpr std::uint64_t kNow1 = 1000000000;
 constexpr std::uint64_t kNow2 = 2000000000;
+
+// Header layout: magic(4) version(1) salt opslimit(8) memlimit(8)
+// key_created_at(8) wrap_nonce wrapped_key payload_nonce ...
+constexpr std::size_t kSaltOff = 5;
+constexpr std::size_t kOpslimitOff = kSaltOff + crypto_pwhash_SALTBYTES;
+constexpr std::size_t kMemlimitOff = kOpslimitOff + 8;
+constexpr std::size_t kWrapNonceOff = kMemlimitOff + 8 + 8;
+constexpr std::size_t kWrappedKeyOff = kWrapNonceOff + crypto_secretbox_NONCEBYTES;
+constexpr std::size_t kWrappedKeyLen = crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES;
+constexpr std::size_t kPayloadNonceOff = kWrappedKeyOff + kWrappedKeyLen;
+
+std::uint64_t read_u64_le(const std::vector<unsigned char>& raw, std::size_t off) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < 8; ++i) value |= static_cast<std::uint64_t>(raw[off + i]) << (8 * i);
+    return value;
+}
 
 std::string store_path(const char* name) { return g_dir + "/" + name; }
 
@@ -137,13 +154,11 @@ void test_rotate() {
     }
     std::vector<unsigned char> after = read_raw(path);
 
-    // Header layout: magic(4) version(1) salt opslimit(8) memlimit(8)
-    // key_created_at(8) wrap_nonce wrapped_key payload_nonce ...
-    const std::size_t salt_off = 5;
-    const std::size_t wrap_nonce_off = salt_off + crypto_pwhash_SALTBYTES + 8 + 8 + 8;
-    const std::size_t wrapped_key_off = wrap_nonce_off + crypto_secretbox_NONCEBYTES;
-    const std::size_t wrapped_key_len = crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES;
-    const std::size_t payload_nonce_off = wrapped_key_off + wrapped_key_len;
+    const std::size_t salt_off = kSaltOff;
+    const std::size_t wrap_nonce_off = kWrapNonceOff;
+    const std::size_t wrapped_key_off = kWrappedKeyOff;
+    const std::size_t wrapped_key_len = kWrappedKeyLen;
+    const std::size_t payload_nonce_off = kPayloadNonceOff;
 
     bool salt_unchanged = std::memcmp(before.data() + salt_off, after.data() + salt_off,
                                       crypto_pwhash_SALTBYTES) == 0;
@@ -172,36 +187,136 @@ void test_implausible_kdf_params() {
     Store::create(path, kPass, kNow1);
     std::vector<unsigned char> raw = read_raw(path);
     // Header layout: magic(4) version(1) salt opslimit(8) memlimit(8) ...
-    const std::size_t memlimit_off = 5 + crypto_pwhash_SALTBYTES + 8;
-    for (std::size_t i = 0; i < 8; ++i) raw[memlimit_off + i] = 0xFF;
+    for (std::size_t i = 0; i < 8; ++i) raw[kMemlimitOff + i] = 0xFF;
     write_raw(path, raw);
     assert(throws_with([&] { Store::open(path, kPass); },
                        "implausible KDF parameters"));
 }
 
 // 10. change_passphrase: reopen works only with the new passphrase; data
-// survives; key_created_at unchanged; wrong old passphrase / empty new
-// passphrase both throw and leave the store untouched.
+// survives; key_created_at becomes the passwd time; wrong old passphrase /
+// empty new passphrase both throw and leave the store untouched. The data key
+// is fresh too: the pre-passwd header (old salt + old wrapped key) spliced
+// onto the post-passwd payload must not open with the old passphrase.
 void test_change_passphrase() {
     std::string path = store_path("s10");
+    std::vector<unsigned char> before;
     {
         Store s = Store::create(path, kPass, kNow1);
         s.set("secret", "value");
+        before = read_raw(path);
 
-        assert(throws_with([&] { s.change_passphrase("wrong", "new pass"); }, "wrong passphrase"));
-        assert(throws_with([&] { s.change_passphrase(kPass, ""); }, "empty passphrase"));
+        assert(throws_with([&] { s.change_passphrase("wrong", "new pass", kNow2); },
+                           "wrong passphrase"));
+        assert(throws_with([&] { s.change_passphrase(kPass, "", kNow2); }, "empty passphrase"));
         assert(s.get("secret").value() == "value");
-
-        s.change_passphrase(kPass, "new pass");
         assert(s.key_created_at() == kNow1);
+
+        s.change_passphrase(kPass, "new pass", kNow2);
+        assert(s.key_created_at() == kNow2);
         assert(s.get("secret").value() == "value");
         s.set("post", "change");  // persists under the new wrapping key
     }
     assert(throws_with([&] { Store::open(path, kPass); },
                        "wrong passphrase or corrupted store"));
+    {
+        Store s = Store::open(path, "new pass");
+        assert(s.get("secret").value() == "value");
+        assert(s.get("post").value() == "change");
+        assert(s.key_created_at() == kNow2);
+    }
+
+    std::vector<unsigned char> after = read_raw(path);
+    std::vector<unsigned char> spliced(before.begin(), before.begin() + kPayloadNonceOff);
+    spliced.insert(spliced.end(), after.begin() + kPayloadNonceOff, after.end());
+    std::string spliced_path = store_path("s10-spliced");
+    write_raw(spliced_path, spliced);
+    assert(throws_with([&] { Store::open(spliced_path, kPass); },
+                       "wrong passphrase or corrupted store"));
+}
+
+// Hand-builds a v2 store with an empty payload under the given KDF params,
+// which Store::create cannot produce (it always uses the defaults).
+void write_v2_store(const std::string& path, const std::string& passphrase,
+                    std::uint64_t opslimit, std::uint64_t memlimit) {
+    unsigned char salt[crypto_pwhash_SALTBYTES];
+    unsigned char wrap_key[crypto_secretbox_KEYBYTES];
+    unsigned char data_key[crypto_secretbox_KEYBYTES];
+    unsigned char wrap_nonce[crypto_secretbox_NONCEBYTES];
+    unsigned char wrapped_key[kWrappedKeyLen];
+    unsigned char payload_nonce[crypto_secretbox_NONCEBYTES];
+    const std::string payload = "{}";
+    unsigned char ciphertext[2 + crypto_secretbox_MACBYTES];
+    randombytes_buf(salt, sizeof(salt));
+    randombytes_buf(data_key, sizeof(data_key));
+    randombytes_buf(wrap_nonce, sizeof(wrap_nonce));
+    randombytes_buf(payload_nonce, sizeof(payload_nonce));
+    assert(crypto_pwhash(wrap_key, sizeof(wrap_key), passphrase.data(), passphrase.size(), salt,
+                         opslimit, memlimit, crypto_pwhash_ALG_ARGON2ID13) == 0);
+    crypto_secretbox_easy(wrapped_key, data_key, sizeof(data_key), wrap_nonce, wrap_key);
+    crypto_secretbox_easy(ciphertext, reinterpret_cast<const unsigned char*>(payload.data()),
+                          payload.size(), payload_nonce, data_key);
+
+    std::vector<unsigned char> raw = {'S', 'C', 'T', 'V', 2};
+    raw.insert(raw.end(), salt, salt + sizeof(salt));
+    for (std::uint64_t field : {opslimit, memlimit, kNow1}) {
+        for (int i = 0; i < 8; ++i) raw.push_back(static_cast<unsigned char>(field >> (8 * i)));
+    }
+    raw.insert(raw.end(), wrap_nonce, wrap_nonce + sizeof(wrap_nonce));
+    raw.insert(raw.end(), wrapped_key, wrapped_key + sizeof(wrapped_key));
+    raw.insert(raw.end(), payload_nonce, payload_nonce + sizeof(payload_nonce));
+    raw.insert(raw.end(), ciphertext, ciphertext + sizeof(ciphertext));
+    write_raw(path, raw);
+}
+
+// 12. passwd re-wraps under the current default KDF params, upgrading a store
+// made with weaker ones; rotate keeps the store's params.
+void test_passwd_upgrades_kdf_params() {
+    std::string path = store_path("s12");
+    write_v2_store(path, kPass, crypto_pwhash_OPSLIMIT_MIN, crypto_pwhash_MEMLIMIT_MIN);
+    {
+        Store s = Store::open(path, kPass);
+        s.set("secret", "value");
+        s.rotate(kPass, kNow2);
+    }
+    std::vector<unsigned char> rotated = read_raw(path);
+    assert(read_u64_le(rotated, kOpslimitOff) == crypto_pwhash_OPSLIMIT_MIN);
+    assert(read_u64_le(rotated, kMemlimitOff) == crypto_pwhash_MEMLIMIT_MIN);
+    {
+        Store s = Store::open(path, kPass);
+        s.change_passphrase(kPass, "new pass", kNow2);
+    }
+    std::vector<unsigned char> upgraded = read_raw(path);
+    assert(read_u64_le(upgraded, kOpslimitOff) == crypto_pwhash_OPSLIMIT_MODERATE);
+    assert(read_u64_le(upgraded, kMemlimitOff) == crypto_pwhash_MEMLIMIT_MODERATE);
     Store s = Store::open(path, "new pass");
     assert(s.get("secret").value() == "value");
-    assert(s.get("post").value() == "change");
+}
+
+// 13. rotate and passwd whose write fails (read-only dir) leave memory
+// unchanged: the store keeps working, and a later set persists under the OLD
+// passphrase and key_created_at.
+void test_failed_rotate_and_passwd_leave_store_unchanged() {
+    std::string dir = store_path("s13");
+    std::filesystem::create_directory(dir);
+    std::string path = dir + "/store";
+    {
+        Store s = Store::create(path, kPass, kNow1);
+        s.set("secret", "value");
+        std::filesystem::permissions(dir, std::filesystem::perms::owner_read |
+                                              std::filesystem::perms::owner_exec);
+        assert(throws_with([&] { s.change_passphrase(kPass, "new pass", kNow2); }, "create"));
+        assert(throws_with([&] { s.rotate(kPass, kNow2); }, "create"));
+        std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+        assert(s.key_created_at() == kNow1);
+        assert(s.get("secret").value() == "value");
+        s.set("after", "failed writes");
+    }
+    assert(throws_with([&] { Store::open(path, "new pass"); },
+                       "wrong passphrase or corrupted store"));
+    Store s = Store::open(path, kPass);
+    assert(s.get("secret").value() == "value");
+    assert(s.get("after").value() == "failed writes");
     assert(s.key_created_at() == kNow1);
 }
 
@@ -275,6 +390,8 @@ int main() {
     test_create_existing();
     test_implausible_kdf_params();
     test_v1_migration();
+    test_passwd_upgrades_kdf_params();
+    test_failed_rotate_and_passwd_leave_store_unchanged();
 
     std::printf("OK\n");
     return 0;
