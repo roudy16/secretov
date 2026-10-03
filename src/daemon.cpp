@@ -25,9 +25,6 @@ namespace {
 
 constexpr int kRotateAfterDays = 30;  // fixed 30d, make a flag if anyone asks
 
-// Cap unterminated request growth; a peer that never sends '\n' gets dropped.
-constexpr std::size_t kMaxRequestBytes = 1 << 20;  // 1 MiB
-
 // Listener::accept() swallows EINTR, so a signal can't unwind the
 // accept loop. We unlink the socket and _exit from the handler instead.
 // No clean stack unwind on shutdown; OS reclaims the mlock'd key.

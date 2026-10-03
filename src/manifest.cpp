@@ -335,10 +335,6 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
     return m;
 }
 
-void require_trusted_manifest_dir(const std::string& manifest_path) {
-    require_trusted_dir(std::filesystem::path(manifest_path).parent_path());
-}
-
 void require_creatable_manifest_dir(const std::string& manifest_path) {
     std::filesystem::path dir = std::filesystem::path(manifest_path).parent_path();
     std::string dir_path = dir.empty() ? "." : dir.string();
@@ -357,7 +353,7 @@ std::string read_manifest_text(const std::string& path) {
     if (ec) throw std::runtime_error("manifest '" + path + "': " + ec.message());
     // Both the directory holding the name and, for a symlink, the one holding
     // the target: write access to either lets someone swap the content.
-    require_trusted_manifest_dir(path);
+    require_trusted_dir(std::filesystem::path(path).parent_path());
     if (real != std::filesystem::path(path)) require_trusted_dir(real.parent_path());
 
     int fd = ::open(real.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);

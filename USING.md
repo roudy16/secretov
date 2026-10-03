@@ -153,7 +153,7 @@ the wheel scroll it on a short terminal, any other key closes it.
 |---|---|
 | tree | `j`/`k` or arrows move, PgUp/PgDn page, `g`/`G` or Home/End top/bottom, `h`/Left fold or go to parent, `l`/Right unfold or go to first child, Enter/Space/`r` reveal or hide (on a folder Enter/Space fold), `c` copy the value, `J`/`K` scroll the detail pane, `/` filter, Esc clear filter and message, `a` add, `e` edit, `d` delete, `R` reload, `?`/F1 help, `q`/Ctrl-C quit (Ctrl-Z does not suspend: resuming would leave safe paste off); mouse: click selects (a folder also folds), wheel moves |
 | filter (`/`) | type or paste to narrow, Backspace erase, Ctrl-U erase all, arrows/PgUp/PgDn move, Enter keep the filter, Esc clear it |
-| add/edit form | Enter: next field (add name) or save, Tab switch field, Esc cancel, Ctrl-R show/hide the value, Ctrl-U erase to line start, Ctrl-W erase previous word or path segment, Ctrl-A/Ctrl-E line start/end |
+| add/edit form | Enter: next field (add name) or save, Tab switch field (add only), Esc cancel, Ctrl-R show/hide the value, Ctrl-U erase to line start, Ctrl-W erase previous word or path segment, Ctrl-A/Ctrl-E line start/end |
 | confirm (`[y/N]`) | `y` yes; Enter, Esc, or any other key no |
 
 `c` copies the selected secret's value without revealing it, through the
@@ -171,7 +171,7 @@ the same discovery and trust checks as `exec`, marks the keys it references
 with `◆`, and shows the env var name(s) each maps to in the detail pane. The
 whole store is still shown. A manifest that fails the trust check or does not
 parse marks nothing, says why in the status bar at start, and keeps
-`◆ manifest refused, see ?` in the list title with the full reason in `?`.
+`◆ refused, see ?` in the list title with the full reason in `?`.
 
 The hint line above the status bar shows the keys for the current mode,
 dropping the least-used ones when the terminal is narrow. Long names are cut
@@ -182,9 +182,11 @@ sits above the detail pane and the add/edit form takes the full width. The
 status bar shows the latest message first (info clears after a few seconds or
 the next key, errors at the next key), then a `daemon unreachable` marker, the
 active filter, the reveal countdown, the key count, and the socket path. The
-message is never cut: short of room, the socket and key count drop and the
+message comes first: short of room, the socket and key count drop and the
 others shorten (`stale`, `/filter`, `60s`), and a message still too long gets
-up to three rows of its own above them.
+up to three rows of its own above them (longer ones end in `…`; warnings such
+as the clipboard note come before the key name, so a long name is what gets
+cut). Revealing a value on a short detail pane scrolls it into view.
 
 The list is fetched at start and after the TUI's own changes; `R` reloads it
 after CLI changes. A key deleted elsewhere is noticed on reveal, copy or edit:
@@ -195,9 +197,11 @@ seconds with `daemon busy` (another client holding the daemon's single
 connection) — the CLI too; `rotate`/`passwd` wait 60 seconds. The request is
 already queued by then, so the daemon may still carry out a save or delete
 once it is free: the TUI says the key "may still be saved/deleted" and `R`
-shows what happened. At startup the TUI prints how to fix a missing token
-(`secretov init`), a stopped daemon (`scripts/service start` or `secretov
-daemon`) or a busy one before taking over the screen.
+shows what happened (also when the daemon hangs up without replying). A value
+too large for the daemon's 1 MiB request limit is refused before it is sent.
+At startup the TUI prints how to fix a missing token (`secretov init`), a
+stopped daemon (`scripts/service start` or `secretov daemon`) or a busy one
+before taking over the screen.
 
 Add starts the name at the selected folder (`dev/api/`); the name is trimmed
 and must not start or end with `/` or contain `//` or control characters.
@@ -205,15 +209,17 @@ Adding a name that already exists asks before overwriting. After saving, the
 new key's folders open and it is selected; after a delete the selection moves
 to the nearest key in the same folder. Edit opens with the current value,
 masked (one bullet per character, so its length shows; the detail pane does
-not show it); long lines scroll sideways in the form. Both refuse an empty value.
+not show it); long lines scroll sideways in the form, and a value taller than
+the input shows `line N/total` in the form title. Both refuse an empty value.
 A multi-line value (a PEM key) can be pasted into the value field — newlines
 are kept, and the paste never submits the form; a paste into the filter is
 added to it if it is one line, and any other paste outside a form is ignored.
 With the terminal's bracketed paste (all common terminals and tmux) the paste
-arrives whole. Without it, an Enter followed within 50 ms by more input is
-kept as a newline, and keys arriving within 100 ms of a submit are dropped
-(`input right after it ignored`), so the rest of a paste never runs as
-commands. Control characters in key names show as `?`.
+arrives whole. Without it, an Enter or Tab in the value followed within 50 ms
+by more input is kept as a newline or tab, and keys arriving within 100 ms of
+a form submit or of the Enter that ends the filter are dropped (`input right
+after Enter ignored`), so the rest of a paste never runs as commands or lands
+in the name field. Control characters in key names show as `?`.
 
 ## Non-secret config: `vars:`
 
@@ -318,8 +324,9 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | Message | Cause | Fix |
 |---|---|---|
 | `daemon not running at ... ?` | Daemon down | `scripts/service start`; check `scripts/service status` if it fails |
-| `daemon busy: no reply within 5 s` | Another client is holding the daemon's one connection | Find and stop the stuck client (`ss -xp \| grep secretov`), then retry |
+| `daemon busy: no reply within 5 s` | Another client is holding the daemon's one connection | Find and stop the stuck client: `ss -xp \| grep secretov.sock` shows the peer inode last, `ss -xp \| grep <that inode>` names the holder; then retry |
 | `daemon busy: request sent but no reply within 5 s; it may still be applied` | Same, but the request was already queued: a `set`/`delete` lands once the daemon is free | Stop the stuck client, check with `list`/`get` before retrying (an `import` rerun then needs `--overwrite`) |
+| `value too large: the request is N bytes, the daemon's limit is 1048576` | A value near or over 1 MiB (JSON escaping counts) | Keep large files out of the store; store a path or a smaller secret |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |

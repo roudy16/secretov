@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -7,6 +8,9 @@
 #include <vector>
 
 namespace secretov {
+
+// Cap on one request line; the daemon drops a peer that sends more without '\n'.
+constexpr std::size_t kMaxRequestBytes = 1 << 20;  // 1 MiB
 
 struct Request {
     std::string token;

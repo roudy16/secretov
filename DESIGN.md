@@ -36,8 +36,10 @@ auto-rotate under a running daemon. The bind-time re-check catches a
 concurrent start (both past the first check during Argon2id) only after
 unlock and any auto-rotate. At bind it also refuses a path that is not a
 socket and removes only a stale socket. On exit it unlinks the path only if it still
-names the socket it bound. Line caps: 1 MiB per request at the daemon,
-64 MiB per response at the client (a `getprefix` carries a whole scope).
+names the socket it bound. Line caps: 1 MiB per request at the daemon (the
+client refuses a larger request before sending, since the daemon drops it
+without a reply), 64 MiB per response at the client (a `getprefix` carries a
+whole scope).
 
 ## Auth
 

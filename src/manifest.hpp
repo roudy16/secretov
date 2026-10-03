@@ -44,10 +44,8 @@ Manifest parse_manifest(const std::string& text, const std::string& path_for_err
 // group/world-writable, and its directory (and a symlink target's directory)
 // is ours or root's and not group/world-writable.
 std::string read_manifest_text(const std::string& path);
-// read_manifest_text's directory check.
-void require_trusted_manifest_dir(const std::string& manifest_path);
-// For a manifest about to be created: its directory passes that check, is a
-// directory, and we can write to it.
+// For a manifest about to be created: its directory passes read_manifest_text's
+// directory check, is a directory, and we can write to it.
 void require_creatable_manifest_dir(const std::string& manifest_path);
 Manifest load_manifest(const std::string& path);
 

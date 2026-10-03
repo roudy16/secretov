@@ -77,8 +77,21 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     }
     nlohmann::json full = req;
     full["token"] = token_;
-    std::string request_line = full.dump();
+    std::string request_line;
+    try {
+        request_line = full.dump();  // throws on invalid UTF-8
+    } catch (...) {
+        scrub_secret_fields(full);
+        throw;
+    }
     scrub_secret_fields(full);
+    // The daemon drops a longer line without a reply, which would read as "may still be applied".
+    if (request_line.size() > kMaxRequestBytes) {
+        std::size_t request_bytes = request_line.size();
+        scrub(request_line);
+        throw std::runtime_error("value too large: the request is " + std::to_string(request_bytes) +
+                                 " bytes, the daemon's limit is " + std::to_string(kMaxRequestBytes));
+    }
     bool sent = conn->write_line(request_line);
     scrub(request_line);
     if (!sent) {

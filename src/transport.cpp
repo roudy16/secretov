@@ -110,7 +110,8 @@ bool Connection::write_line(const std::string& line) {
 
     size_t total = 0;
     while (total < out.size()) {
-        ssize_t n = ::write(fd_, out.data() + total, out.size() - total);
+        // MSG_NOSIGNAL: a peer that hung up is an error return, not a SIGPIPE that kills the client.
+        ssize_t n = ::send(fd_, out.data() + total, out.size() - total, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
