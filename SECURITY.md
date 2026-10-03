@@ -222,24 +222,39 @@ without following symlinks, so a dangling link fails as it does for `exec`.
 
 ### 12. Workspace writable by another account (M2) — `open (host)`
 
-`devuser` (uid 1001, a live node runner) has primary group `roudy`; with
-umask 0002, `~/workspace`, every project dir and some manifests are
-group-writable, so devuser (or whoever compromises its runner) can trojan any
-repo, git hook, or manifest — not a secretov defect, and only partly
-mitigated by finding 11. Owner commands (first confirm the runner does not
-rely on group-writing your files):
+The host account `devuser` (uid 1001) has primary group `roudy`; with umask
+0002, `~/workspace`, every project dir and some manifests are
+group-writable, so anything running as devuser could trojan any repo, git
+hook, or manifest — not a secretov defect, and only partly mitigated by
+finding 11.
+
+Correction (2026-10-03): the review called devuser "a live node runner".
+Wrong. That process is Plane's `plane-runner-1` Docker container, whose image
+runs as uid 1001; `ps` shows the host name for that uid. Inside the
+container its groups are `0`, not `roudy`, and it has no mounts, so it cannot
+reach `~/workspace`. Nothing running uses the devuser account: no home dir,
+no logins in wtmp. The exposure is a dormant account, not a live service.
+
+Owner commands: lock or remove the account if it is not used; that does not
+affect the container, which never reads the host's `/etc/passwd`. Fixing the
+umask keeps new files private either way:
 
 ```sh
-sudo groupadd devuser && sudo usermod -g devuser devuser   # own primary group
+sudo usermod -L devuser             # or: sudo userdel devuser
 sudo chfn -o umask=027 roudy        # pam_umask: every session, graphical too
 echo 'umask 027' >> ~/.bashrc       # terminals already open; re-login after
-chmod -R g-w ~/workspace
+chmod -R g-w ~/workspace            # optional once devuser is locked or gone
 ```
 
 Since finding 11, secretov REFUSES every manifest on this host until the
 chmod runs: `blueowl/.secretov.yaml` and `wed_photo/.secretov.yaml` are 0664,
 and all four project dirs under `~/workspace/roudy16` (blueowl, wed_photo,
-homecloud, homestat) are 0775. The `chmod -R` above fixes all of them.
+homecloud, homestat) are 0775. Either the `chmod -R` above or this narrower
+one fixes them:
+
+```sh
+cd ~/workspace/roudy16 && chmod g-w,o-w {blueowl,wed_photo,homestat,homecloud} {blueowl,wed_photo,homestat,homecloud}/.secretov.yaml
+```
 
 ### 13. Secret values in shell history; interactive `set` echoed (M3) — `done` (2026-10-03, afa8352, 43219db, 7f36a00)
 
@@ -515,8 +530,9 @@ Release). `hardening_test` checks the ELF with readelf.
 
 Done items are marked in the findings. Remaining, highest value first:
 
-1. Host config (12, 26): devuser's own primary group, umask 027,
-   `chmod -R g-w ~/workspace` (until then every manifest here is refused);
+1. Host config (12, 26): `chmod g-w` the four project dirs and manifests
+   (until then every manifest here is refused); lock or remove the unused
+   devuser account; umask 027;
    `scripts/service update` to pick up the hardened, session-bound unit;
    disable linger if nothing needs it. Minutes.
 2. `lock` op tied to logind Lock (32).
