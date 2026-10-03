@@ -38,8 +38,12 @@ To set a value from a script without it reaching shell history, read it into
 a variable first — never put a literal in `printf`:
 
 ```sh
-read -rs v; printf %s "$v" | secretov set DB_PASS; unset v
+IFS= read -rs v; printf %s "$v" | secretov set DB_PASS; unset v
 ```
+
+The tty prompt takes one line (at most 4096 bytes). Never paste a multi-line
+value (a PEM key) at it: `set` refuses the paste and discards the extra lines
+so they never reach your shell. Pipe those instead: `secretov set K < key.pem`.
 
 `get` prints the value to the terminal, so it stays in scrollback; pipe it
 where it is needed instead.
@@ -161,3 +165,9 @@ scripts/service stop
 scripts/service status
 scripts/service update       # refresh deps, rebuild, reinstall, rewrite + re-enable the unit, restart daemon if running
 ```
+
+Refreshing deps is a no-op once each vendored artifact's `.stamp` matches its
+pin. Checkouts from before 295fec5 have no stamps, so their first
+`install`/`update` re-downloads nlohmann/json and libsodium and rebuilds
+libsodium (minutes, needs network). Run it online; if a download fails, the
+existing vendored deps are kept and the command just fails.

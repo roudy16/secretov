@@ -31,9 +31,11 @@ socket is the only transport; Listener and Connection are plain classes over
 it, not an interface.
 
 One daemon per socket: `secretov daemon` exits with `daemon already running`
-before prompting if the socket answers (so a second daemon can never
-auto-rotate under the first), refuses a path that is not a socket, and
-removes only a stale socket. On exit it unlinks the path only if it still
+before prompting if a daemon already answers, so a second start can't
+auto-rotate under a running daemon. The bind-time re-check catches a
+concurrent start (both past the first check during Argon2id) only after
+unlock and any auto-rotate. At bind it also refuses a path that is not a
+socket and removes only a stale socket. On exit it unlinks the path only if it still
 names the socket it bound. Line caps: 1 MiB per request at the daemon,
 64 MiB per response at the client (a `getprefix` carries a whole scope).
 
@@ -120,7 +122,10 @@ env, exec). `set KEY` creates or replaces — there is no separate update op;
 it reads the value from stdin only (a no-echo one-line prompt on a tty, the
 whole stream when piped), never an argv argument, which would leak the secret
 via `/proc/<pid>/cmdline` to other UIDs. Tty prompts refuse to run from a
-background process group, where the typed line would land in the shell.
+background process group, where the typed line would land in the shell, and
+fail (discarding the input) when more input follows the line, so the rest of a
+multi-line paste never reaches the shell either. Every prompted or stdin
+passphrase line, and a tty `set` value, is capped at 4096 bytes.
 No client-side caching — the daemon is a local socket away.
 
 ## Scopes: projects, environments, manifests
@@ -201,14 +206,14 @@ Trust note: a manifest decides what runs with which secrets, so it is read
 owned by the caller and not group/world-writable, and its directory (and a
 symlink target's) owned by the caller or root and not group/world-writable;
 anything else is refused with the `chmod` fix, never skipped for an ancestor.
-`vars:` keys and `env_var_name` reject a deny list of code-loading names
-(`LD_*`, `DYLD_*`, `SECRETOV_*`, `BASH_ENV`, `NODE_OPTIONS`, ...; full list in
-manifest.cpp — a deny list, so a ceiling), and `exec` resolves `argv[0]`
-against the caller's PATH before applying manifest vars, so a manifest `PATH`
-reaches the child but cannot choose the program. A `key:` may still name any
-scope: a manifest the caller owns is the caller's choice, and running `exec`
-inside an untrusted checkout already runs that repo's code — within ceiling
-#1 (SECURITY.md). File names (`.secretov.yaml`, `projects.yaml`, token,
+`vars:` keys and `env_var_name` reject a deny list of names that make the
+child or anything it spawns load code or config (`LD_*`, `DYLD_*`,
+`SECRETOV_*`, `GIT_*`, `XDG_*`, `PATH`, `HOME`, `BASH_ENV`, `PAGER`,
+`NODE_OPTIONS`, ...; full list in manifest.cpp and USING.md — a deny list, so
+a ceiling). With `PATH` denied, `exec` finds the program on the caller's own
+PATH. A `key:` may still name any scope: a manifest the caller owns is the
+caller's choice, and running `exec` inside an untrusted checkout already runs
+that repo's code — within ceiling #1 (SECURITY.md). File names (`.secretov.yaml`, `projects.yaml`, token,
 store, socket) live as constants in paths.hpp only.
 
 ## Dependencies

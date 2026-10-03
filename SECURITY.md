@@ -4,7 +4,9 @@ Findings from a code-level review (2026-08-30) of the daemon, store, transport,
 client, and service scripts, evaluated against the threat model in DESIGN.md.
 Finding 9 re-reviewed and closed out 2026-09-07. Findings 11–34 come from a
 second review against the deployed host (2026-10-03, tagged with the review's
-ids M1…I5), which also corrected 2, 3, 5, 9a and 10.
+ids M1…I5), which also corrected 2, 3, 5, 9a and 10. A verification pass over
+those fixes (same day) reopened and closed gaps in 13, 17, 20, 21, 23, 28 and
+29; each carries a "verification pass" note.
 Kept as a worklist: items below may be addressed in future sessions. Status
 values: `open`, `open (host)` (owner action on the machine, not code),
 `accepted` (documented ceiling, no fix planned), `done`.
@@ -14,7 +16,7 @@ values: `open`, `open (host)` (owner action on the machine, not code),
 Matches DESIGN.md and is implemented carefully: envelope encryption
 (secretbox/XSalsa20-Poly1305 data key wrapped by an Argon2id-derived wrapping
 key), fresh payload nonce per persist, KDF params bounds-checked before use
-(store.cpp), atomic fsync+rename writes with a parent-directory fsync, 0600
+(store.cpp), atomic fsync+rename writes with a best-effort parent-directory fsync, 0600
 files/socket with the umask race handled, SO_PEERCRED UID check on both ends,
 constant-time token compare, every secretov process non-dumpable
 (PR_SET_DUMPABLE=0; the daemon also sets RLIMIT_CORE=0), mlock+memzero on all
@@ -128,7 +130,7 @@ Reviewed as three separate sub-items. None warrants code; one claim was simply
 wrong.
 
 **9a. Token read into unzeroed `std::string`s (both ends)** — `accepted`. The
-copies are real: the client's `load_token()` result, the `nlohmann::json`
+copies are real: the DaemonClient's `token_` copy, the `nlohmann::json`
 request and its `dump()`, the socket write buffer, and the daemon's
 process-lifetime `expected_token` are all ordinary heap. But
 the token also sits in plaintext at `$CONFIG/token` (0600) for the life of the
@@ -229,7 +231,16 @@ The docs showed `printf 'value' | secretov set KEY`, writing the value to
 shell history (plaintext on an unencrypted disk), and `set` on a tty read
 with echo on. Fixed: on a tty `set` prompts `Value for <key>:` with echo off
 and reads one line (piped stdin is still read whole); README/USING show the
-interactive form or `read -rs v; printf %s "$v" | secretov set K`.
+interactive form or `IFS= read -rs v; printf %s "$v" | secretov set K`.
+
+Verification pass: reading one line on a tty left the rest of a multi-line
+paste (a PEM key) in the tty input queue, where the shell ran it and saved it
+to history — the same leak, and a silently truncated value. Now every tty
+prompt checks for input queued past the line (non-canonical, 100 ms, so a
+trailing partial line counts), restores the terminal with TCSAFLUSH, and fails
+with `more input followed the line` when there was any; nothing reaches the
+shell (smoke test pastes three lines). The docs' `read -rs` stripped leading
+and trailing blanks from the value; they now use `IFS= read -rs`.
 
 ### 14. Backup-verify recipe sent the passphrase to shell history (M4) — `done` (2026-10-03, afa8352)
 
@@ -263,6 +274,10 @@ buffer, and rotate/passwd requests left it in the receive buffer, request
 line, and `Request` fields. Fixed as described in "What holds up". Ceilings
 (`ponytail:` in code): nlohmann::json parse-tree copies; request lines over
 64 KiB reallocate the receive buffer (passphrase requests are far smaller).
+Verification pass: `read_line`'s erase slid a pipelined follow-up request
+forward and left a stale copy past `size()` that teardown never zeroed; the
+Connection now zeroes the whole allocation (`capacity()`) on destruction and
+move-assignment.
 
 ### 18. `passwd` re-wrapped the same data key (L4) — `done` (2026-10-03, 8690859)
 
@@ -284,16 +299,33 @@ nothing changes.
 A power loss could roll back an acknowledged `set`/`delete`/`passwd`.
 `write_file_atomic` now fsyncs the parent directory after the rename.
 
+Verification pass: that fsync threw after the rename had already replaced the
+store, and persist's callers read a throw as "nothing changed" — a failed
+`passwd` could leave the disk under the new passphrase while the user was told
+it was unchanged. A failure past the rename is now a stderr warning
+(durability best-effort, `ponytail:` in code); paths_test injects it with a
+0300 directory.
+
 ### 21. Manifest env names and `exec` program lookup (L7) — `done` (2026-10-03, 7399ba7); cross-scope `key:` `accepted`
 
 `vars:` could set `PATH`, `LD_PRELOAD`, `BASH_ENV`, ..., and `PATH` was
 applied before `execvp`, so a manifest could choose which `psql` ran. Fixed:
-`vars:` keys and `env_var_name` reject `LD_*`, `DYLD_*`, `SECRETOV_*`,
-`BASH_ENV`, `ENV`, `IFS`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `PYTHONPATH`,
-`PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GIT_SSH_COMMAND`,
-`GIT_EXEC_PATH` (a deny list — `ponytail:` ceiling; `PATH` stays allowed),
-and `exec` resolves the program against the caller's PATH before any
-manifest var is applied, then `execv`s it. `--secret KEY=VAR` on the command
+`vars:` keys and `env_var_name` reject a deny list (`ponytail:` ceiling; the
+full list is in manifest.cpp and USING.md's Manifest rules).
+
+Verification pass: the first list still let a manifest run code through the
+child's own tools — psql runs `PAGER`/`PSQL_PAGER` via `sh -c`, git runs
+`GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` (`core.sshCommand`, `core.pager`) and
+reads a repo-local gitconfig via `HOME`/`XDG_CONFIG_HOME`, glibc iconv loads
+from `GCONV_PATH`, bash runs `PROMPT_COMMAND` — and a manifest `PATH` still
+chose every program the child spawned (resolving only `argv[0]` against the
+caller's PATH did not cover grandchildren). Now also denied: the `GIT_*` and
+`XDG_*` prefixes, `PATH`, `HOME`, `PROMPT_COMMAND`, `PS1`, `PS4`, `ZDOTDIR`,
+`PAGER`, `PSQL_PAGER`, `MANPAGER`, `LESSOPEN`, `LESSCLOSE`, `EDITOR`,
+`VISUAL`, `GCONV_PATH`, `NODE_PATH`, `PYTHONHOME`, `RUBYLIB`. With `PATH`
+denied, the separate program resolution was dropped and `exec` is plain
+`execvp` again, which also restores its `/bin/sh` fallback for shebang-less
+scripts (lost with `execv`). `--secret KEY=VAR` on the command
 line is not filtered (your own argv). A manifest `key:` naming another
 project's scope is accepted under ceiling #1: since finding 11 a manifest is
 only read if you own it and nobody else can write it.
@@ -309,9 +341,13 @@ given — `accepted`: the peer check covers a misconfigured shared dir.
 
 A second `secretov daemon` took over the path, leaving the service daemon
 unlocked and unreachable. Now it exits 1 with "daemon already running at
-<path>" before the passphrase prompt (and before any auto-rotate), refuses
-a path that is not a socket, removes only a stale socket, and on exit
-unlinks the path only if it still names its own inode.
+<path>" before the passphrase prompt (and before any auto-rotate) when a
+daemon already answers, and on exit unlinks the path only if it still names
+its own inode. At bind (after unlock and any auto-rotate) it re-checks for a
+live daemon, refuses a path that is not a socket, and removes only a stale
+socket. Verification pass, `accepted`: two daemons started together both pass
+the pre-prompt check during Argon2id and can both auto-rotate before the
+bind-time re-check stops the second; same-UID only.
 
 ### 24. Client processes were dumpable (L10) — `done` (2026-10-03, afa8352)
 
@@ -345,8 +381,16 @@ unquoted ` #...` comment prints a warning naming the line and key.
 
 get-deps.sh only checked that files existed, and `update` never ran it.
 Now each artifact has a version+digest `.stamp` and is refetched when it
-differs (libsodium's tree is removed first), and `scripts/service
-install|update` run get-deps.sh every time (a no-op when stamps match).
+differs, and `scripts/service install|update` run get-deps.sh every time (a
+no-op when stamps match).
+
+Verification pass: get-deps.sh removed the vendored libsodium before
+fetching, so an offline run left the checkout unbuildable (this host has no
+system libsodium), and checkouts from before 295fec5 have no stamps, so their
+first `install`/`update` always refetches. Now json.hpp is fetched to a
+temporary name and libsodium's old tree is removed only after the new one
+built; a failed fetch keeps both. README notes that the first run after
+295fec5 needs network and takes minutes.
 
 ### 29. Unit set only NoNewPrivileges (L15) — `done` (2026-10-03, eeb441a); namespace options `accepted`
 
@@ -356,9 +400,13 @@ Added: `UMask=0077`, `RestrictAddressFamilies=AF_UNIX`,
 `LockPersonality`, `RestrictNamespaces`, `RestrictRealtime`,
 `RestrictSUIDSGID`, `KeyringMode=private` (verified with secret-tool unlock
 under a transient unit). Not added: PrivateTmp/PrivateDevices/ProtectSystem/
-ProtectHome and the other namespace-based options — in a user unit they need
-unprivileged user namespaces, which stock Ubuntu 24.04 blocks via AppArmor,
-and only same-UID peers reach the daemon anyway.
+ProtectHome and the other namespace-based options: only same-UID peers reach
+the daemon, and a same-UID attacker reads the store, token and keyring
+without going through it, so they would add little. (Corrected in the
+verification pass: the earlier rationale said this host blocks unprivileged
+user namespaces; it does not — Pop!_OS 24.04 here has no
+`apparmor_restrict_unprivileged_userns`. Stock Ubuntu 24.04's AppArmor block
+is a portability limit on adding them, not this host's constraint.)
 
 ### 30. No passphrase floor; KDF params frozen at create (I1) — `done` (2026-10-03, afa8352, 8690859)
 
