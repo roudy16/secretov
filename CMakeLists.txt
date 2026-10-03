@@ -1,10 +1,30 @@
 cmake_minimum_required(VERSION 3.25)  # FetchContent SYSTEM keyword
 project(secretov CXX)
 
+# An unset build type means -O0, which silently disables FORTIFY below.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # clangd; without this only FTXUI's subdir-scoped setting exports
 add_compile_options(-Wall -Wextra)
+
+# PIC everywhere (FTXUI/yaml-cpp static libs are linked into PIE executables);
+# the remaining hardening flags apply to secretov's own targets only, via
+# secretov_core's PUBLIC usage requirements.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+include(CheckPIESupported)
+check_pie_supported()
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-fcf-protection SECRETOV_HAVE_CF_PROTECTION)
+set(SECRETOV_HARDENING_COMPILE
+  -fstack-protector-strong -fstack-clash-protection
+  $<$<BOOL:${SECRETOV_HAVE_CF_PROTECTION}>:-fcf-protection>
+  # FORTIFY warns (and does nothing) without optimization.
+  "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE;-D_FORTIFY_SOURCE=3>")
+set(SECRETOV_HARDENING_LINK -Wl,-z,relro,-z,now,-z,noexecstack)
 
 # nlohmann/json: system package first, vendored header fallback.
 find_package(nlohmann_json QUIET)
@@ -73,6 +93,8 @@ list(REMOVE_ITEM SECRETOV_CORE_SRC
 add_library(secretov_core STATIC ${SECRETOV_CORE_SRC})
 target_include_directories(secretov_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(secretov_core PUBLIC sodium nlohmann_json::nlohmann_json yaml-cpp::yaml-cpp)
+target_compile_options(secretov_core PUBLIC ${SECRETOV_HARDENING_COMPILE})
+target_link_options(secretov_core PUBLIC ${SECRETOV_HARDENING_LINK})
 
 add_executable(secretov src/main.cpp src/tui.cpp)
 target_link_libraries(secretov PRIVATE secretov_core
@@ -92,3 +114,5 @@ add_test(NAME paths_test COMMAND paths_test)
 
 add_test(NAME smoke_test
   COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_test.sh $<TARGET_FILE:secretov>)
+add_test(NAME hardening_test
+  COMMAND ${CMAKE_SOURCE_DIR}/tests/hardening_test.sh $<TARGET_FILE:secretov>)
