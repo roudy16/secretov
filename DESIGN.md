@@ -11,16 +11,31 @@ the same user, or root. Accepted ceiling; extend later if needed. Also accepted:
 the plaintext header's `key_created_at` is not authenticated, so tampering with
 it can only skew rotation scheduling (never expose or corrupt secrets).
 
-After unlock the daemon holds only the data key (see Storage); the passphrase
-and the key derived from it are zeroed once the data key is unwrapped. A
-reader of daemon memory gets the data key and the decrypted secrets, not the
-passphrase.
+After unlock the daemon holds only the data key (see Storage). The startup
+passphrase is read with `::read` straight into one pre-reserved buffer (no
+stdio buffer, no reallocation) and zeroed after unlock; the key derived from
+it is freed once the data key is unwrapped. For `rotate`/`passwd` requests the
+daemon zeroes the receive buffer, the request line, and the parsed passphrase
+fields. Ceilings: nlohmann::json's own parse-tree copies of those fields, and
+the client processes' copies, are freed unscrubbed. Every secretov process is
+non-dumpable (`PR_SET_DUMPABLE=0`), so those copies are reachable only via
+root, swap, or physical memory — which already yield the data key and every
+secret.
 
 ## Transport
 
 Unix domain socket at `$XDG_RUNTIME_DIR/secretov.sock`, mode 0600, peer UID
-checked via `SO_PEERCRED`. The unix socket is the only transport; Listener and
-Connection are plain classes over it, not an interface.
+checked via `SO_PEERCRED` on both ends: the daemon drops other UIDs, and the
+client refuses to send anything to a socket another UID serves. The unix
+socket is the only transport; Listener and Connection are plain classes over
+it, not an interface.
+
+One daemon per socket: `secretov daemon` exits with `daemon already running`
+before prompting if the socket answers (so a second daemon can never
+auto-rotate under the first), refuses a path that is not a socket, and
+removes only a stale socket. On exit it unlinks the path only if it still
+names the socket it bound. Line caps: 1 MiB per request at the daemon,
+64 MiB per response at the client (a `getprefix` carries a whole scope).
 
 ## Auth
 
@@ -74,16 +89,24 @@ Two distinct operations, as in envelope-based managers:
   daemon's memory at time T cannot open ciphertext written after the rotation.
   It does nothing for secrets already in the store (a reader of daemon memory
   has those too) and nothing against a leaked passphrase.
-- `passwd` — new wrapping key. Fresh salt, derive from the new passphrase,
-  re-wrap the existing data key. The payload is untouched, so it is cheap.
-  This is the response to a leaked passphrase.
+- `passwd` — new wrapping key AND new data key. Fresh salt, derive from the
+  new passphrase at the current default Argon2id params (MODERATE, upgrading
+  a store created weaker), mint a data key, re-encrypt the payload under it,
+  and reset key-created-at. This is the response to a leaked passphrase: an
+  old copy plus the old passphrase opens only what that copy held. `rotate`
+  keeps the store's KDF params (changing them would cost a second Argon2id).
+
+Both build the new key and header as candidates and adopt them only after the
+write succeeds; a failed write leaves the daemon on the old passphrase and
+key.
 
 Both are daemon ops that carry the current passphrase (see Protocol), because
 the daemon no longer retains it after unlock. Triggers:
 - Auto: on unlock, if key-created-at is older than N days (default 30),
   rotate transparently — the passphrase is in hand at that moment.
 - Manual: `secretov rotate` and `secretov passwd`, each prompting for the
-  current passphrase.
+  current passphrase (`init` and `passwd` warn on a new passphrase under 12
+  characters).
 
 Old ciphertext copies (backups) remain openable with the passphrase and data
 key they were written under — copy hygiene is on the user.
@@ -94,8 +117,10 @@ key they were written under — copy hygiene is on the user.
 `rotate` and `passwd` (both prompt for the current passphrase), `tui` (interactive terminal UI over the daemon socket),
 `exec --secret NAME ... -- cmd` (fetch secrets, inject into child
 env, exec). `set KEY` creates or replaces — there is no separate update op;
-it reads the value from stdin only, never an argv argument, which would leak
-the secret via `/proc/<pid>/cmdline` to other UIDs.
+it reads the value from stdin only (a no-echo one-line prompt on a tty, the
+whole stream when piped), never an argv argument, which would leak the secret
+via `/proc/<pid>/cmdline` to other UIDs. Tty prompts refuse to run from a
+background process group, where the typed line would land in the shell.
 No client-side caching — the daemon is a local socket away.
 
 ## Scopes: projects, environments, manifests
@@ -147,15 +172,18 @@ projects:
 ```
 
 Resolution: project = `-p` (registry) else nearest `.secretov.yaml` walking up
-from cwd; env = `-e` else `$SECRETOV_ENV` else manifest `default_env` else
-error. Env var names come only from the manifest.
+from cwd through directories owned by the caller (the walk stops at the first
+one that is not); env = `-e` else `$SECRETOV_ENV` else manifest `default_env`
+else error. Env var names come only from the manifest.
 
 Commands: `exec [-p] [-e] [--dry-run] -- cmd` (dry-run prints secret var
 names and their keys, never a secret value, and prints plaintext `vars:`
 values in full since they are already committed; `--secret KEY[=VAR]` stays
 for raw one-offs), `import [FILE]
 [-p] [-e] [--overwrite]` (dotenv in, all-or-nothing on collisions, stores
-`env/project/VAR` and adds `VAR: {env_var_name: VAR}` to the manifest),
+`env/project/VAR` and adds `VAR: {env_var_name: VAR}` to the manifest; the
+dotenv parser rejects duplicate keys and unknown `\` escapes and warns when it
+strips an unquoted ` #` comment),
 `list [-p] [-e]`, `set KEY [-p] [-e]` (resolves `env/project/KEY`, so a
 scoped secret can be replaced without retyping the three-segment key; a bare
 `set KEY` still writes the raw key).
@@ -168,11 +196,20 @@ is left untouched and the user is told to add the entries by hand.
 Wire: `getprefix` returns every key under a prefix in one round-trip; `exec`
 groups needed keys by `env/project/` prefix and issues one per group.
 
-Trust note: a manifest in a cloned repo may name any scope. Running `exec`
-inside an untrusted checkout hands its command those secrets — but you are
-already running that repo's code, so this does not widen the same-UID
-ceiling. File names (`.secretov.yaml`, `projects.yaml`, token, store, socket)
-live as constants in paths.hpp only.
+Trust note: a manifest decides what runs with which secrets, so it is read
+(only via `read_manifest_text`) under ssh-StrictModes rules: the file must be
+owned by the caller and not group/world-writable, and its directory (and a
+symlink target's) owned by the caller or root and not group/world-writable;
+anything else is refused with the `chmod` fix, never skipped for an ancestor.
+`vars:` keys and `env_var_name` reject a deny list of code-loading names
+(`LD_*`, `DYLD_*`, `SECRETOV_*`, `BASH_ENV`, `NODE_OPTIONS`, ...; full list in
+manifest.cpp — a deny list, so a ceiling), and `exec` resolves `argv[0]`
+against the caller's PATH before applying manifest vars, so a manifest `PATH`
+reaches the child but cannot choose the program. A `key:` may still name any
+scope: a manifest the caller owns is the caller's choice, and running `exec`
+inside an untrusted checkout already runs that repo's code — within ceiling
+#1 (SECURITY.md). File names (`.secretov.yaml`, `projects.yaml`, token,
+store, socket) live as constants in paths.hpp only.
 
 ## Dependencies
 

@@ -26,15 +26,17 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
 - `src/manifest.{hpp,cpp}` — `.secretov.yaml` manifests, `projects.yaml`
   registry, dotenv parsing, and the comment-preserving text insertion that
   `import` uses to update manifests (re-parsed and verified before writing).
+  `read_manifest_text` (owner/mode check) is the only way a manifest is read.
 - `src/client.{hpp,cpp}` (scope resolution for exec/import/list lives here),
   `src/tui.cpp`, `src/paths.hpp` (all on-disk file names as constants —
   single source of truth), `src/protocol.hpp`.
-- `tests/store_test.cpp`, `tests/manifest_test.cpp` (assert-based, no
-  framework), `tests/smoke_test.sh` (full daemon lifecycle + scopes in a
-  scratch env).
+- `tests/store_test.cpp`, `tests/manifest_test.cpp`, `tests/paths_test.cpp`
+  (assert-based, no framework), `tests/smoke_test.sh` (full daemon lifecycle
+  + scopes in a scratch env; needs python3 for its pty checks),
+  `tests/hardening_test.sh` (readelf: PIE, RELRO, BIND_NOW, non-exec stack).
 - `scripts/service` + `scripts/linux-systemd.sh` — run the daemon as a
-  systemd user unit started at login, passphrase from the session keyring
-  via `secret-tool`; SECURITY.md is the security worklist.
+  sandboxed systemd user unit bound to the graphical session, passphrase from
+  the session keyring via `secret-tool`; SECURITY.md is the security worklist.
 
 ## Constraints
 
@@ -53,9 +55,13 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
 
 ## Gotchas
 
-- FTXUI's CMake defaults the build to Release (`-DNDEBUG`). store_test.cpp
-  has `#undef NDEBUG` so its asserts survive — keep that in any new
-  assert-based test file.
+- CMakeLists.txt defaults an unset build type to Release (`-DNDEBUG`, and
+  FORTIFY needs optimization). The assert-based tests `#undef NDEBUG` so
+  their asserts survive — keep that in any new assert-based test file.
+- Scratch socket paths must fit `sun_path` (107 chars): keep a scratch
+  `XDG_RUNTIME_DIR` short or the daemon fails with `socket path too long`.
+- smoke_test.sh sets `umask 077`: under this host's 0002 umask, scratch
+  project dirs would be group-writable and their manifests refused.
 - Scratch-testing the binary: this machine exports `XDG_DATA_HOME`/
   `XDG_CONFIG_HOME` globally, so override `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
   and `XDG_RUNTIME_DIR` (not just `HOME`) or you will write into the real
