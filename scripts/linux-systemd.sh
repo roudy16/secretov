@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Linux/systemd implementation of scripts/service. Installs the secretov
 # binary (CLI + daemon are one binary) to $PREFIX and runs the daemon as a
-# systemd user unit that starts at login.
+# systemd user unit bound to the graphical session: it starts at graphical
+# login and stops at logout (even with linger on).
 #
 # The daemon reads its passphrase from stdin and a service has no tty, so the
 # passphrase lives in the session keyring (Secret Service — gnome-keyring's
@@ -45,21 +46,25 @@ store_passphrase() {
     echo "passphrase stored in the session keyring"
 }
 
-build_and_install() {
+# get-deps.sh runs every time: it is a no-op unless a pinned dep changed.
+build() {
     cd "$REPO_DIR"
-    if [ ! -d build ]; then
-        ./third_party/get-deps.sh
-        cmake -B build
-    fi
+    ./third_party/get-deps.sh
+    [ -d build ] || cmake -B build
     cmake --build build -j
-    cmake --install build --prefix "$PREFIX"
 }
+
+install_binary() { cmake --install "$REPO_DIR/build" --prefix "$PREFIX"; }
 
 write_unit() {
     mkdir -p "$UNIT_DIR"
     cat >"$UNIT_DIR/secretov.service" <<UNIT
 [Unit]
 Description=secretov secrets daemon
+# The keyring is only unlocked inside the graphical session; never outlive it.
+PartOf=graphical-session.target
+Requisite=graphical-session.target
+After=graphical-session.target
 # Retry while the keyring is still locked after login; give up after a while
 # so a stale keyring passphrase does not burn Argon2id forever.
 StartLimitIntervalSec=300
@@ -68,15 +73,27 @@ StartLimitBurst=20
 [Service]
 Type=exec
 ExecStart=/bin/sh -c 'secret-tool lookup service secretov | exec "\$0" daemon' $BIN
-NoNewPrivileges=yes
 Restart=on-failure
 RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+KeyringMode=private
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 UNIT
     systemctl --user daemon-reload
-    systemctl --user enable --quiet secretov
+    # reenable drops links from an older [Install] (e.g. default.target.wants).
+    systemctl --user reenable --quiet secretov
 }
 
 start() {
@@ -102,9 +119,10 @@ start() {
 case "${1:-}" in
 install)
     need_secret_tool
-    build_and_install
+    build
+    install_binary
     write_unit
-    echo "installed $BIN and user unit secretov.service (enabled at login)"
+    echo "installed $BIN and user unit secretov.service (enabled at graphical login)"
     if have_passphrase; then
         echo "next: scripts/service start"
     else
@@ -114,12 +132,12 @@ install)
 update)
     was_active=false
     systemctl --user is-active --quiet secretov && was_active=true
-    cd "$REPO_DIR" && cmake --build build -j   # build first; a failed build must not take the daemon down
+    build   # before stopping; a failed build must not take the daemon down
     $was_active && systemctl --user stop secretov
-    build_and_install
+    install_binary
     write_unit
     echo "updated $BIN"
-    $was_active && start
+    if $was_active; then start; fi
     ;;
 passphrase) store_passphrase ;;
 start) start ;;
