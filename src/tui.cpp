@@ -210,6 +210,102 @@ struct Row {
     int depth;
 };
 
+// Every color the TUI draws, by role: slate structure, one teal accent, amber
+// for plaintext on screen, red for danger. Built each frame: FTXUI fixes a
+// Color's depth (truecolor, 256, 16 or none) when it is constructed, and the
+// screen settles the terminal's support only once it starts. Below 256 colors
+// the slate backgrounds would map to clashing ANSI pairs, so inverse, bold and
+// dim carry the selection, status bar and key names, as with NO_COLOR.
+struct Frame {  // a pane or modal outline and the header chip on it
+    ftxui::Color line;
+    ftxui::Color header_text;
+};
+
+struct Theme {
+    bool has_color;
+    Frame calm;     // unfocused pane
+    Frame focused;  // the pane or form that takes keys, and help
+    Frame hot;      // the detail pane while a value is revealed
+    Frame danger;   // delete and overwrite confirms
+    ftxui::Color rule;
+    ftxui::Decorator folder, secret, project_mark, tree_glyph, selection, selection_mark;
+    ftxui::Decorator label, muted, accent, masked, revealed_value, revealed_label, warning, error;
+    ftxui::Decorator status_bar, status_error, status_dim, chip_stale, chip_busy, chip_filter, chip_countdown;
+    ftxui::Decorator key_cap, key_hint, help_heading, help_keys, field, field_focused;
+};
+
+Theme make_theme() {
+    using namespace ftxui;
+    // Steel: slate structure, one teal accent. Mid tones so text stays legible on a light terminal too.
+    constexpr uint32_t kSlate = 0x4a5a6e, kSlateText = 0xd5dee8, kRule = 0x3a4757;
+    constexpr uint32_t kTeal = 0x3eb5c7, kTealText = 0x26a0b3, kSteel = 0x5f8fc0;
+    constexpr uint32_t kMuted = 0x7f8a96, kFaint = 0x626c78, kInk = 0x0e1820;
+    constexpr uint32_t kSelection = 0x23506e, kSelectionText = 0xf0f6fb, kSelectionMark = 0x8be6f0;
+    constexpr uint32_t kBar = 0x253241, kBarText = 0xb9c6d3, kBarDim = 0x6c7884;
+    constexpr uint32_t kCap = 0x34414f, kCapText = 0xdce5ee, kHint = 0x8c949e;
+    constexpr uint32_t kField = 0x26303b, kFieldText = 0xc5d0db, kFieldFocused = 0x304050, kFieldFocusedText = 0xeef3f8;
+    constexpr uint32_t kAmber = 0xe8923a, kHotText = 0xffdcaa, kHotBackground = 0x33271a;
+    constexpr uint32_t kRed = 0xe0605a, kRedOnBar = 0xff8f87, kYellow = 0xd8c25a;
+
+    bool has_color = Terminal::ColorSupport() != Terminal::Color::Palette1;
+    bool shades = Terminal::ColorSupport() >= Terminal::Color::Palette256;
+    auto rgb = [](uint32_t hex) {
+        return Color::RGB(static_cast<uint8_t>(hex >> 16), static_cast<uint8_t>(hex >> 8), static_cast<uint8_t>(hex));
+    };
+    auto fg = [&](uint32_t hex) { return color(rgb(hex)); };
+    auto fg_on = [&](uint32_t foreground, uint32_t background) { return fg(foreground) | bgcolor(rgb(background)); };
+    Decorator chip_bold = has_color ? Decorator(bold) : Decorator(bold) | inverted;
+    return Theme{
+        .has_color = has_color,
+        .calm = {rgb(kSlate), rgb(kSlateText)},
+        .focused = {rgb(kTeal), rgb(kInk)},
+        .hot = {rgb(kAmber), rgb(kInk)},
+        .danger = {rgb(kRed), rgb(kInk)},
+        .rule = rgb(kRule),
+        .folder = fg(kSteel) | bold,
+        .secret = nothing,
+        .project_mark = fg(kTealText),
+        .tree_glyph = fg(kFaint),
+        .selection = shades ? fg_on(kSelectionText, kSelection) : inverted,
+        .selection_mark = shades ? fg_on(kSelectionMark, kSelection) : inverted,
+        .label = fg(kMuted),
+        .muted = shades ? fg(kMuted) : dim,
+        .accent = fg(kTealText),
+        .masked = fg(kFaint),
+        .revealed_value = shades ? fg_on(kHotText, kHotBackground) : bold,
+        .revealed_label = fg(kAmber) | bold,
+        .warning = fg(kYellow),
+        .error = fg(kRed),
+        .status_bar = shades ? fg_on(kBarText, kBar) : inverted,
+        .status_error = fg(kRedOnBar) | bold,
+        .status_dim = shades ? fg(kBarDim) : dim,
+        .chip_stale = fg_on(kInk, kRed) | chip_bold,
+        .chip_busy = fg_on(kInk, kYellow) | chip_bold,
+        .chip_filter = fg_on(kInk, kTeal) | chip_bold,
+        .chip_countdown = fg_on(kInk, kAmber) | chip_bold,
+        .key_cap = shades ? fg_on(kCapText, kCap) : bold,
+        .key_hint = shades ? fg(kHint) : dim,
+        .help_heading = fg(kTeal) | bold,
+        .help_keys = fg(kSteel),
+        .field = shades ? fg_on(kFieldText, kField) : nothing,
+        .field_focused = shades ? fg_on(kFieldFocusedText, kFieldFocused) : inverted,
+    };
+}
+
+// A rounded outline in the frame's color with `title` as a chip on its top
+// edge. The chip shrinks rather than cover the right corner.
+ftxui::Element framed(const Theme& theme, const Frame& frame, const std::string& title, ftxui::Element content) {
+    using namespace ftxui;
+    Element chip = text(title) | bold | color(frame.header_text) | bgcolor(frame.line);
+    if (!theme.has_color) chip |= inverted;
+    Element title_row = hbox({emptyElement() | size(WIDTH, EQUAL, 2), chip | xflex_shrink,
+                              emptyElement() | size(WIDTH, EQUAL, 1)});
+    return dbox({std::move(content) | borderStyled(ROUNDED, frame.line), vbox({std::move(title_row), filler()})});
+}
+
+// Columns a framed() title takes on the top edge, corners included.
+int framed_title_columns(const std::string& title) { return text_columns(title) + 4; }
+
 int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     using namespace ftxui;
 
@@ -734,31 +830,46 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     // of name still fit, so deeper levels share one column; the detail pane
     // shows the full path.
     constexpr int kMinLabelColumns = 6;
-    auto row_prefix = [&](int i, bool is_selected) {
-        const Row& row = row_at(i);
-        const char* glyph = !row.dir ? (is_marked(row) ? "◆ " : "· ") : is_folded(row.id) ? "▸ " : "▾ ";
-        int indent = std::clamp(list_text_width - 4 - kMinLabelColumns, 0, 2 * row.depth);
-        return std::string(is_selected ? "> " : "  ") + std::string(static_cast<std::size_t>(indent), ' ') + glyph;
+    auto row_glyph = [&](const Row& row) {
+        return !row.dir ? (is_marked(row) ? "◆ " : "· ") : is_folded(row.id) ? "▸ " : "▾ ";
     };
+    auto row_indent = [&](int i, bool is_selected) {
+        int indent = std::clamp(list_text_width - 4 - kMinLabelColumns, 0, 2 * row_at(i).depth);
+        return std::string(is_selected ? "> " : "  ") + std::string(static_cast<std::size_t>(indent), ' ');
+    };
+
+    Theme theme = make_theme();
 
     MenuOption menu_opt = MenuOption::Vertical();
     // Names are cut to the pane instead of letting the menu scroll sideways,
     // which would hide the marker and the tree structure.
     menu_opt.entries_option.transform = [&](const EntryState& entry) {
-        std::string prefix = row_prefix(entry.index, entry.active);
-        Element line = text(prefix + ellipsize(entry.label, list_text_width - text_columns(prefix)));
-        if (row_at(entry.index).dir) line |= bold;
-        if (is_marked(row_at(entry.index))) line |= color(Color::Cyan);
-        if (entry.active) line |= inverted;
-        return line;
+        const Row& row = row_at(entry.index);
+        std::string indent = row_indent(entry.index, entry.active);
+        const char* glyph = row_glyph(row);
+        std::string name = ellipsize(entry.label, list_text_width - text_columns(indent) - text_columns(glyph));
+        Decorator name_style = row.dir ? theme.folder : is_marked(row) ? theme.project_mark : theme.secret;
+        Decorator glyph_style = row.dir ? theme.folder : is_marked(row) ? theme.project_mark : theme.tree_glyph;
+        if (entry.active) {
+            // The selection sets its own foreground so it reads on its own background.
+            Decorator selected = is_marked(row) ? theme.selection_mark : theme.selection;
+            return hbox({text(indent), text(glyph), text(name) | (row.dir ? bold : nothing)}) | selected;
+        }
+        return hbox({text(indent), text(glyph) | glyph_style, text(name) | name_style});
     };
     Component menu = Menu(&labels, &selected, menu_opt);
 
+    auto field_style = [&](InputState state) {
+        if (state.is_placeholder) state.element |= theme.muted;
+        return state.element | (state.focused ? theme.field_focused : theme.field);
+    };
     InputOption name_opt;
+    name_opt.transform = field_style;
     name_opt.multiline = false;
     name_opt.cursor_position = &name_cursor;
     Component name_input = Input(&add_name, "env/project/KEY", name_opt);
     InputOption value_opt;
+    value_opt.transform = field_style;
     value_opt.password = &value_masked;
     value_opt.cursor_position = &value_cursor;
     Component value_input = Input(&add_value, "type or paste", value_opt);
@@ -777,6 +888,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     auto renderer = Renderer(tab, [&] {
         sync_selection();
+        theme = make_theme();
         // FTXUI sizes its screen only after Render, so a resize would lag a
         // frame behind screen.dimx(); ask the terminal directly.
         Dimensions terminal = Terminal::Size();
@@ -793,21 +905,21 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         };
         std::vector<StatusPart> parts;
         if (daemon_state == DaemonState::Unreachable) {
-            parts.push_back({" daemon unreachable: list stale ", " stale ", bold | color(Color::Red)});
+            parts.push_back({" daemon unreachable: list stale ", " stale ", theme.chip_stale});
         } else if (daemon_state == DaemonState::Busy) {
-            parts.push_back({" daemon busy ", " busy ", bold | color(Color::Yellow)});
+            parts.push_back({" daemon busy ", " busy ", theme.chip_busy});
         }
         if (mode == Mode::Filter || !filter.empty()) {
             std::string shown = printable(filter) + (mode == Mode::Filter ? "▏" : "");
-            parts.push_back({" filter: " + shown + " ", " /" + ellipsize(shown, 12) + " ", bold});
+            parts.push_back({" filter: " + shown + " ", " /" + ellipsize(shown, 12) + " ", theme.chip_filter});
         }
         if (revealed) {
             auto left = std::chrono::ceil<std::chrono::seconds>(kRevealFor - (Clock::now() - revealed_at));
             std::string seconds = std::to_string(std::max<long long>(left.count(), 0)) + "s ";
-            parts.push_back({" shown, hides in " + seconds, " " + seconds, bold});
+            parts.push_back({" shown, hides in " + seconds, " " + seconds, theme.chip_countdown});
         }
         parts.push_back({" keys: " + std::to_string(keys.size()) + " ", "", nothing});
-        parts.push_back({" " + daemon.socket_path() + " ", "", dim});
+        parts.push_back({" " + daemon.socket_path() + " ", "", theme.status_dim});
         auto parts_columns = [&] {
             int columns = 0;
             for (const StatusPart& part : parts) {
@@ -825,7 +937,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         int message_columns = text_columns(message) + 2;
         fit_parts(terminal.dimx - message_columns);
         bool message_on_own_rows = message_columns + parts_columns() > terminal.dimx;
-        Decorator message_style = status_is_error ? bold | color(Color::Red) : nothing;
+        Decorator message_style = status_is_error ? theme.status_error : nothing;
         Elements status_rows;
         Elements parts_row;
         if (message_on_own_rows) {
@@ -838,7 +950,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 lines.back() = ellipsize(lines.back(), terminal.dimx - 3) + "…";
             }
             for (const std::string& line : lines) {
-                status_rows.push_back(hbox({text(" " + line) | message_style, filler()}) | inverted);
+                status_rows.push_back(hbox({text(" " + line) | message_style, filler()}) | theme.status_bar);
             }
             parts_row.push_back(filler());
         } else {
@@ -847,10 +959,10 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         for (const StatusPart& part : parts) {
             const std::string& shown = part.compacted ? part.compact : part.full;
             if (shown.empty()) continue;
-            parts_row.push_back(separator());
+            parts_row.push_back(separator() | color(theme.rule));
             parts_row.push_back(text(shown) | part.style);
         }
-        status_rows.push_back(hbox(std::move(parts_row)) | inverted);
+        status_rows.push_back(hbox(std::move(parts_row)) | theme.status_bar);
         int status_height = static_cast<int>(status_rows.size());
         Element status_bar = vbox(std::move(status_rows));
 
@@ -869,15 +981,16 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             }
             // +3: borders and scroll indicator. At most 2/5 so the detail pane keeps room for a value.
             int widest = terminal.dimx * 2 / 5;
-            int narrowest = std::max(24, std::min(text_columns(list_title) + 2, widest));  // the title stays whole
+            int narrowest = std::max(24, std::min(framed_title_columns(list_title), widest));  // the title stays whole
             list_width = std::clamp(longest + 3, narrowest, widest);
         }
         list_text_width = list_width - 3;
         Element list_body = !rows.empty()       ? (menu->Render() | vscroll_indicator | yframe)
-                            : !filter.empty()   ? (text("(no match)") | dim | center)
-                                                : (text("(empty)") | dim | center);
-        Element list_pane =
-            window(text(list_title), list_body) | size(WIDTH, EQUAL, list_width) | size(HEIGHT, EQUAL, list_height);
+                            : !filter.empty()   ? (text("(no match)") | theme.muted | center)
+                                                : (text("(empty)") | theme.muted | center);
+        bool list_has_keys = mode == Mode::Normal || mode == Mode::Filter;
+        Element list_pane = framed(theme, list_has_keys ? theme.focused : theme.calm, list_title, list_body) |
+                            size(WIDTH, EQUAL, list_width) | size(HEIGHT, EQUAL, list_height);
 
         int detail_width = stacked ? terminal.dimx : terminal.dimx - list_width;
         int detail_height = stacked ? panes_height - list_height : panes_height;
@@ -891,36 +1004,37 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             }
         };
         if (rows.empty()) {
-            detail_lines.push_back(text(filter.empty() ? "press 'a' to add a secret" : "Esc clears the filter") | dim);
+            const char* empty_hint = filter.empty() ? "press 'a' to add a secret" : "Esc clears the filter";
+            detail_lines.push_back(text(empty_hint) | theme.muted);
         } else if (row_at(selected).dir) {
             const std::string& folder = row_at(selected).id;
             std::size_t count = 0;
             for (const std::string& key : keys) {
                 if (key.compare(0, folder.size(), folder) == 0) ++count;
             }
-            detail_lines.push_back(text("folder:") | dim);
-            add_wrapped(printable(folder), bold);
-            detail_lines.push_back(separator());
+            detail_lines.push_back(text("folder:") | theme.label);
+            add_wrapped(printable(folder), theme.folder);
+            detail_lines.push_back(separator() | color(theme.rule));
             detail_lines.push_back(text(std::to_string(count) + " secret(s)"));
         } else {
             const std::string& key = row_at(selected).id;
-            detail_lines.push_back(text("name:") | dim);
+            detail_lines.push_back(text("name:") | theme.label);
             add_wrapped(printable(key), bold);
             auto mapped = marks.env_vars_by_key.find(key);
             if (mapped != marks.env_vars_by_key.end()) {
-                detail_lines.push_back(text("env var in " + marks.project + "'s manifest:") | dim);
-                for (const std::string& env_var : mapped->second) add_wrapped(env_var, color(Color::Cyan));
+                detail_lines.push_back(text("env var in " + marks.project + "'s manifest:") | theme.label);
+                for (const std::string& env_var : mapped->second) add_wrapped(env_var, theme.accent);
             }
-            detail_lines.push_back(separator());
+            detail_lines.push_back(separator() | color(theme.rule));
             value_label_line = static_cast<int>(detail_lines.size());
-            detail_lines.push_back(text("value:") | dim);
+            detail_lines.push_back(text("value:") | (revealed ? theme.revealed_label : theme.label));
             if (revealed) {
                 std::string shown_value = printable_value(*revealed);
-                add_wrapped(shown_value, nothing);
+                add_wrapped(shown_value, theme.revealed_value);
                 zero(shown_value);
             } else {
-                detail_lines.push_back(text("••••••••"));
-                detail_lines.push_back(text("(Enter or r reveals, c copies)") | dim);
+                detail_lines.push_back(text("••••••••") | theme.masked);
+                detail_lines.push_back(text("(Enter or r reveals, c copies)") | theme.muted);
             }
         }
         int detail_line_count = static_cast<int>(detail_lines.size());
@@ -939,38 +1053,58 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         }
         Elements shown_lines(std::make_move_iterator(detail_lines.begin() + detail_scroll),
                              std::make_move_iterator(detail_lines.begin() + detail_last));
-        Element detail_pane = window(text(detail_title), vbox(std::move(shown_lines))) |
+        const Frame& detail_frame = revealed ? theme.hot : theme.calm;
+        Element detail_pane = framed(theme, detail_frame, detail_title, vbox(std::move(shown_lines))) |
                               size(WIDTH, EQUAL, detail_width) | size(HEIGHT, EQUAL, detail_height);
 
+        // A tab ends a hint's key; it is drawn as a keycap, the tab as the cap's right pad.
         std::vector<std::string> hint_items;
         if (mode == Mode::Normal && keys.empty()) {
-            hint_items = {"a add", daemon_state != DaemonState::Ok ? "R retry" : "R reload", "? help  q quit"};
+            hint_items = {"a\tadd", daemon_state != DaemonState::Ok ? "R\tretry" : "R\treload", "?\thelp  q\tquit"};
         } else if (mode == Mode::Normal) {
-            hint_items = {"j/k move"};
+            hint_items = {"j/k\tmove"};
             if (current_key()) {
-                hint_items.insert(hint_items.end(), {revealed ? "Enter/r hide" : "Enter/r reveal", "c copy"});
+                hint_items.insert(hint_items.end(), {revealed ? "Enter/r\thide" : "Enter/r\treveal", "c\tcopy"});
             }
-            if (detail_overflows) hint_items.push_back("J/K scroll");
-            if (daemon_state != DaemonState::Ok) hint_items.push_back("R retry");
-            if (!filter.empty()) hint_items.push_back("Esc clear filter");
-            hint_items.insert(hint_items.end(), {"h/l fold", "/ filter", "a add", "e edit", "d delete"});
-            if (daemon_state == DaemonState::Ok) hint_items.push_back("R reload");
-            hint_items.push_back("? help  q quit");
+            if (detail_overflows) hint_items.push_back("J/K\tscroll");
+            if (daemon_state != DaemonState::Ok) hint_items.push_back("R\tretry");
+            if (!filter.empty()) hint_items.push_back("Esc\tclear filter");
+            hint_items.insert(hint_items.end(), {"h/l\tfold", "/\tfilter", "a\tadd", "e\tedit", "d\tdelete"});
+            if (daemon_state == DaemonState::Ok) hint_items.push_back("R\treload");
+            hint_items.push_back("?\thelp  q\tquit");
         } else if (mode == Mode::Filter) {
-            hint_items = {"type to narrow", "↑/↓ move", "Enter keep filter", "Esc clear"};
+            hint_items = {"type to narrow", "↑/↓\tmove", "Enter\tkeep filter", "Esc\tclear"};
         } else if (mode == Mode::Help) {
-            hint_items = {"j/k scroll  any other key closes help"};
+            hint_items = {"j/k\tscroll  any other key closes help"};
         } else if (mode == Mode::Add || mode == Mode::Edit) {
             // fit_hints drops from the second-to-last back, so the reveal toggle goes early.
             bool in_name = mode == Mode::Add && form_field == 0;
-            hint_items = {in_name ? "Enter next field" : "Enter save",
-                          value_masked ? "Ctrl-R show value" : "Ctrl-R hide value"};
-            if (mode == Mode::Add) hint_items.push_back("Tab switch field");
-            hint_items.insert(hint_items.end(), {"Ctrl-U/W erase", "Ctrl-A/E line start/end", "Esc cancel"});
+            hint_items = {in_name ? "Enter\tnext field" : "Enter\tsave",
+                          value_masked ? "Ctrl-R\tshow value" : "Ctrl-R\thide value"};
+            if (mode == Mode::Add) hint_items.push_back("Tab\tswitch field");
+            hint_items.insert(hint_items.end(), {"Ctrl-U/W\terase", "Ctrl-A/E\tline start/end", "Esc\tcancel"});
         } else {
-            hint_items = {"y yes  other keys no"};
+            hint_items = {"y\tyes  other keys no"};
         }
-        Element hints = text(" " + fit_hints(hint_items, terminal.dimx - 2) + " ") | dim | center;
+        // Each two-space gap gives one space to the next keycap's left pad, so
+        // the line takes the columns fit_hints counted.
+        std::string hint_line = fit_hints(hint_items, terminal.dimx - 2);
+        Elements hint_parts;
+        for (std::size_t from = 0; from <= hint_line.size();) {
+            std::size_t gap = std::min(hint_line.find("  ", from), hint_line.size());
+            std::string_view hint = std::string_view(hint_line).substr(from, gap - from);
+            if (from > 0) hint_parts.push_back(text(" "));
+            std::size_t tab = hint.find('\t');
+            if (tab == std::string_view::npos) {
+                hint_parts.push_back(text(" " + std::string(hint)) | theme.key_hint);
+            } else {
+                hint_parts.push_back(text(" " + std::string(hint.substr(0, tab)) + " ") | theme.key_cap);
+                hint_parts.push_back(text(std::string(hint.substr(tab + 1))) | theme.key_hint);
+            }
+            from = gap + 2;
+        }
+        hint_parts.push_back(text(" "));
+        Element hints = hbox(std::move(hint_parts)) | center;
 
         Element panes = stacked ? vbox({list_pane, detail_pane}) : hbox({list_pane, detail_pane});
         Element root = vbox({panes | flex, hints, status_bar});
@@ -986,17 +1120,17 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             int overlay_width = stacked ? std::max(terminal.dimx - 2, 10) : std::clamp(terminal.dimx - 4, 20, 72);
             Elements lines;
             if (adding) {
-                lines.push_back(hbox({text("name:  "), name_input->Render()}));
+                lines.push_back(hbox({text("name:  ") | theme.label, name_input->Render()}));
                 std::string name = trim_key_name(add_name);
                 if (key_exists(name)) {
-                    lines.push_back(text("       exists: saving will ask to overwrite") | color(Color::Yellow));
+                    lines.push_back(text("       exists: saving will ask to overwrite") | theme.warning);
                 }
             } else {
                 // Wrapped, not cut: the last segment is what tells keys apart.
                 std::string name = printable(current_key().value_or(""));
                 const char* label = "name:  ";
                 for (std::string_view piece : wrap_lines(name, std::max(overlay_width - 9, 1))) {
-                    lines.push_back(hbox({text(label), text(std::string(piece)) | bold}));
+                    lines.push_back(hbox({text(label) | theme.label, text(std::string(piece)) | bold}));
                     label = "       ";
                 }
             }
@@ -1012,8 +1146,9 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             // the cursor, which FTXUI keeps centred, so once any line is wider
             // than the input every line shifts and loses its start (FTXUI's
             // Input can't soft-wrap); the detail pane wraps them.
-            lines.push_back(hbox({text("value: "), value_input->Render() | size(HEIGHT, LESS_THAN, value_rows)}));
-            if (problem) lines.push_back(text("       " + *problem) | color(Color::Red));
+            lines.push_back(
+                hbox({text("value: ") | theme.label, value_input->Render() | size(HEIGHT, LESS_THAN, value_rows)}));
+            if (problem) lines.push_back(text("       " + *problem) | theme.error);
             std::string title = adding ? " add secret: env/project/KEY " : " edit secret ";
             // FTXUI's Input shows no sign of the lines scrolled out above or below.
             auto value_lines = std::count(add_value.begin(), add_value.end(), '\n') + 1;
@@ -1022,7 +1157,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 auto cursor_line = std::count(add_value.begin(), cursor_end, '\n') + 1;
                 title += "· line " + std::to_string(cursor_line) + "/" + std::to_string(value_lines) + " ";
             }
-            root = dbox({root, modal(window(text(title), vbox(std::move(lines))) | size(WIDTH, EQUAL, overlay_width))});
+            root = dbox({root, modal(framed(theme, theme.focused, title, vbox(std::move(lines))) |
+                                     size(WIDTH, EQUAL, overlay_width))});
         }
         if (mode == Mode::ConfirmDelete || mode == Mode::ConfirmOverwrite) {
             std::string name = printable(mode == Mode::ConfirmDelete ? current_key().value_or("")
@@ -1048,7 +1184,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             for (std::string_view piece : wrap_lines(question, question_width)) {
                 question_lines.push_back(text(std::string(piece)));
             }
-            Element dialog = window(text(" confirm "), vbox(std::move(question_lines)));
+            Element dialog = framed(theme, theme.danger, " confirm ", vbox(std::move(question_lines)));
             if (stacked) dialog |= size(WIDTH, EQUAL, question_width + 2);
             root = dbox({root, modal(std::move(dialog))});
         }
@@ -1056,12 +1192,24 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             // Rows are pre-formatted to the overlay width so FTXUI never shrinks the keys column.
             int help_width = std::clamp(terminal.dimx - 4, 10, 76);  // inside the margin and border
             constexpr int kHelpKeysWidth = 20;
-            std::vector<std::pair<std::string, bool>> help_text;  // line, is heading
-            auto add_section = [&](std::string_view heading) { help_text.emplace_back(heading, true); };
+            struct HelpText {
+                std::string line;
+                bool is_heading = false;
+                std::size_t key_bytes = 0;  // leading bytes drawn as keys
+            };
+            std::vector<HelpText> help_text;
+            auto add_section = [&](std::string_view heading) { help_text.push_back({std::string(heading), true}); };
             auto add_row = [&](std::string_view row_keys, std::string_view row_text) {
                 int keys_width = row_keys.empty() ? 0 : kHelpKeysWidth;  // a keyless row gets the full width
+                std::string key_cell = "  " + std::string(row_keys);
+                bool first_line = true;
                 for (std::string& line : help_row_lines(row_keys, row_text, keys_width, help_width)) {
-                    help_text.emplace_back(std::move(line), false);
+                    // The first line starts with the keys, or on a narrow overlay holds only them, cut.
+                    std::size_t key_bytes = !first_line || row_keys.empty() ? 0
+                                            : line.starts_with(key_cell)    ? key_cell.size()
+                                                                            : line.size();
+                    first_line = false;
+                    help_text.push_back({std::move(line), false, key_bytes});
                 }
             };
             for (const HelpLine& line : kHelp) {
@@ -1089,15 +1237,21 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             int help_last = std::min(help_count, help_scroll + help_height);
             Elements help_lines;
             for (int i = help_scroll; i < help_last; ++i) {
-                const auto& [line, heading] = help_text[static_cast<std::size_t>(i)];
-                help_lines.push_back(heading ? text(line) | bold : text(line));
+                const HelpText& row = help_text[static_cast<std::size_t>(i)];
+                if (row.is_heading) {
+                    help_lines.push_back(hbox({text(row.line + " ") | theme.help_heading,
+                                               separator() | color(theme.rule) | flex}));
+                } else {
+                    help_lines.push_back(hbox({text(row.line.substr(0, row.key_bytes)) | theme.help_keys,
+                                               text(row.line.substr(row.key_bytes))}));
+                }
             }
             std::string help_title = " keys ";
             if (help_overflows) {
                 help_title += std::to_string(help_scroll + 1) + "-" + std::to_string(help_last) + "/" +
                               std::to_string(help_count) + " j/k ";
             }
-            root = dbox({root, modal(window(text(help_title), vbox(std::move(help_lines))) |
+            root = dbox({root, modal(framed(theme, theme.focused, help_title, vbox(std::move(help_lines))) |
                                      size(WIDTH, EQUAL, help_width + 2))});
         }
         return root;
