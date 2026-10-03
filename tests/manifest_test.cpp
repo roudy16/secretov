@@ -1,6 +1,7 @@
 #include "manifest.hpp"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 // Tests must assert even in Release builds (FTXUI's CMake defaults to Release).
 #undef NDEBUG
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -54,6 +56,7 @@ void test_scoped_key() {
 }
 
 void test_dotenv() {
+    std::ostringstream warnings;
     KeyValues kv = parse_dotenv(
         "# comment\n"
         "\n"
@@ -61,8 +64,10 @@ void test_dotenv() {
         "B = two words # trailing\n"
         "C=\"quoted # not comment\\n\"\n"
         "D='single \"inner\"'\r\n"
-        "E=\n");
+        "E=\n",
+        warnings);
     assert(kv.size() == 5);
+    assert(warnings.str().find("line 4") != std::string::npos && warnings.str().find("'B'") != std::string::npos);
     assert(kv[0].first == "A" && kv[0].second == "1");
     assert(kv[1].first == "B" && kv[1].second == "two words");
     assert(kv[2].second == "quoted # not comment\n");
@@ -72,6 +77,11 @@ void test_dotenv() {
     assert(throws_with([] { parse_dotenv("1BAD=x\n"); }, "invalid key"));
     assert(throws_with([] { parse_dotenv("Q=\"open\n"); }, "unterminated"));
     assert(throws_with([] { parse_dotenv("Q=\"a\" b\n"); }, "after closing quote"));
+
+    KeyValues escapes = parse_dotenv("T=\"a\\tb\\rc\\\\d\\\"e\"\n");
+    assert(escapes[0].second == "a\tb\rc\\d\"e");
+    assert(throws_with([] { parse_dotenv("T=\"a\\qb\"\n"); }, "unsupported escape '\\q'"));
+    assert(throws_with([] { parse_dotenv("A=1\nB=2\nA=3\n"); }, "line 3: duplicate key 'A' (first set on line 1)"));
 }
 
 void test_parse_manifest() {
@@ -154,6 +164,59 @@ void test_find_manifest_upward() {
     { std::ofstream f(g_dir + "/a/.secretov.yaml"); f << "name: a\n"; }
     std::optional<std::string> found = find_manifest_upward(nested);
     assert(found && *found == g_dir + "/a/.secretov.yaml");
+    // "/" belongs to root, so the walk never looks at /.secretov.yaml.
+    assert(!find_manifest_upward("/"));
+}
+
+void write_manifest(const std::string& path, mode_t mode) {
+    { std::ofstream f(path); f << "name: t\n"; }
+    assert(::chmod(path.c_str(), mode) == 0);
+}
+
+void test_manifest_trust() {
+    std::string dir = g_dir + "/trust";
+    assert(::mkdir(dir.c_str(), 0700) == 0);
+    std::string manifest = dir + "/.secretov.yaml";
+    write_manifest(manifest, 0644);
+    assert(load_manifest(manifest).project == "t");
+
+    assert(::chmod(manifest.c_str(), 0664) == 0);
+    assert(throws_with([&] { load_manifest(manifest); }, "chmod g-w,o-w '"));
+    assert(::chmod(manifest.c_str(), 0644) == 0);
+
+    assert(::chmod(dir.c_str(), 0757) == 0);
+    assert(throws_with([&] { load_manifest(manifest); }, ("manifest directory '" + dir + "'").c_str()));
+    assert(::chmod(dir.c_str(), 0700) == 0);
+
+    // A bad manifest nearer cwd is reported, never skipped for a good ancestor.
+    std::string child = dir + "/child";
+    assert(::mkdir(child.c_str(), 0700) == 0);
+    write_manifest(child + "/.secretov.yaml", 0666);
+    std::optional<std::string> found = find_manifest_upward(child);
+    assert(found && *found == child + "/.secretov.yaml");
+    assert(throws_with([&] { load_manifest(*found); }, "writable by group or others"));
+
+    // A symlink is judged by its target's directory too.
+    std::string open_dir = g_dir + "/open";
+    assert(::mkdir(open_dir.c_str(), 0700) == 0 && ::chmod(open_dir.c_str(), 0777) == 0);
+    write_manifest(open_dir + "/m.yaml", 0644);
+    std::string linked = dir + "/linked";
+    assert(::mkdir(linked.c_str(), 0700) == 0);
+    assert(::symlink((open_dir + "/m.yaml").c_str(), (linked + "/.secretov.yaml").c_str()) == 0);
+    assert(throws_with([&] { load_manifest(linked + "/.secretov.yaml"); }, open_dir.c_str()));
+}
+
+void test_denied_env_names() {
+    for (const char* name : {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "NODE_OPTIONS", "SECRETOV_ENV"}) {
+        std::string as_var = std::string("name: p\nenv:\n  dev:\n    vars:\n      ") + name + ": x\n";
+        assert(throws_with([&] { parse_manifest(as_var, "t"); }, "cannot be set from a manifest"));
+        std::string as_secret =
+            std::string("name: p\nenv:\n  dev:\n    secrets:\n      s:\n        env_var_name: ") + name + "\n";
+        assert(throws_with([&] { parse_manifest(as_secret, "t"); }, "cannot be set from a manifest"));
+    }
+    // PATH stays settable (exec resolves the program first); look-alikes pass.
+    Manifest m = parse_manifest("name: p\nenv:\n  dev:\n    vars:\n      PATH: /x\n      ENVIRONMENT: y\n", "t");
+    assert(m.vars.at("dev").size() == 2);
 }
 
 
@@ -254,6 +317,8 @@ int main() {
     test_insert_preserves_vars_block();
     test_registry();
     test_find_manifest_upward();
+    test_manifest_trust();
+    test_denied_env_names();
 
     std::printf("OK\n");
     return 0;

@@ -1,11 +1,16 @@
 #include "manifest.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <ostream>
 #include <stdexcept>
 #include <yaml-cpp/yaml.h>
 
@@ -21,6 +26,60 @@ bool is_identifier(const std::string& s) {
         if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
     }
     return true;
+}
+
+// ponytail: deny-list ceiling. Names that make a child process (or a nested
+// secretov) load attacker-chosen code or config; anything not listed here
+// still passes. Upgrade path is an allow-list per project if this leaks.
+bool is_denied_env_name(const std::string& name) {
+    static const char* const kDeniedPrefixes[] = {"LD_", "DYLD_", "SECRETOV_"};
+    static const char* const kDeniedNames[] = {
+        "BASH_ENV",   "ENV",      "IFS",     "NODE_OPTIONS",      "PYTHONSTARTUP",   "PYTHONPATH",
+        "PERL5OPT",   "PERL5LIB", "RUBYOPT", "JAVA_TOOL_OPTIONS", "GIT_SSH_COMMAND", "GIT_EXEC_PATH"};
+    for (const char* prefix : kDeniedPrefixes) {
+        if (name.compare(0, std::strlen(prefix), prefix) == 0) return true;
+    }
+    for (const char* denied : kDeniedNames) {
+        if (name == denied) return true;
+    }
+    return false;
+}
+
+// `what` names the offending entry for the error, e.g. "var 'X' (env dev)".
+void require_manifest_env_name(const std::string& name, const std::string& path, const std::string& what) {
+    if (!is_identifier(name)) {
+        throw std::runtime_error("manifest '" + path + "': " + what + " is not a valid environment variable name");
+    }
+    if (is_denied_env_name(name)) {
+        throw std::runtime_error("manifest '" + path + "': " + what +
+                                 " cannot be set from a manifest (it can load code into the child "
+                                 "process or steer secretov)");
+    }
+}
+
+// ssh StrictModes for manifests: anyone else who can write the file, or swap
+// it in its directory, could inject env vars and key: references into exec.
+void require_trusted(const std::string& path, const struct stat& st, bool directory) {
+    const char* kind = directory ? "manifest directory" : "manifest";
+    uid_t me = ::getuid();
+    if (st.st_uid != me && !(directory && st.st_uid == 0)) {
+        throw std::runtime_error(std::string("refusing ") + kind + " '" + path + "': owned by uid " +
+                                 std::to_string(st.st_uid) + ", not you (uid " + std::to_string(me) +
+                                 "); remove it or chown it to yourself");
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        throw std::runtime_error(std::string("refusing ") + kind + " '" + path +
+                                 "': writable by group or others; fix with: chmod g-w,o-w '" + path + "'");
+    }
+}
+
+void require_trusted_dir(const std::filesystem::path& dir) {
+    std::string dir_path = dir.empty() ? "." : dir.string();
+    struct stat st{};
+    if (::stat(dir_path.c_str(), &st) != 0) {
+        throw std::runtime_error("stat '" + dir_path + "': " + std::strerror(errno));
+    }
+    require_trusted(dir_path, st, true);
 }
 
 void require_segment(const std::string& s, const char* what) {
@@ -201,11 +260,9 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
                                                      "' (env " + env + ") missing env_var_name");
                         }
                         e.env_var = body["env_var_name"].as<std::string>();
-                        if (!is_identifier(e.env_var)) {
-                            throw std::runtime_error("manifest '" + path + "': secret '" + e.name +
-                                                     "' env_var_name '" + e.env_var +
-                                                     "' is not a valid environment variable name");
-                        }
+                        require_manifest_env_name(e.env_var, path,
+                                                  "secret '" + e.name + "' (env " + env + ") env_var_name '" +
+                                                      e.env_var + "'");
                         if (body["key"]) {
                             e.key = body["key"].as<std::string>();
                             if (e.key.empty()) {
@@ -229,11 +286,7 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
                     }
                     for (const auto& v : vars) {
                         std::string var_name = v.first.as<std::string>();
-                        if (!is_identifier(var_name)) {
-                            throw std::runtime_error("manifest '" + path + "': var '" + var_name +
-                                                     "' (env " + env +
-                                                     ") is not a valid environment variable name");
-                        }
+                        require_manifest_env_name(var_name, path, "var '" + var_name + "' (env " + env + ")");
                         if (!v.second.IsScalar()) {
                             throw std::runtime_error("manifest '" + path + "': var '" + var_name +
                                                      "' (env " + env +
@@ -262,16 +315,54 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
     return m;
 }
 
+std::string read_manifest_text(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::path real = std::filesystem::canonical(path, ec);
+    if (ec) throw std::runtime_error("manifest '" + path + "': " + ec.message());
+    // Both the directory holding the name and, for a symlink, the one holding
+    // the target: write access to either lets someone swap the content.
+    require_trusted_dir(std::filesystem::path(path).parent_path());
+    if (real != std::filesystem::path(path)) require_trusted_dir(real.parent_path());
+
+    int fd = ::open(real.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("open '" + path + "': " + std::strerror(errno));
+    std::string text;
+    try {
+        struct stat st{};
+        if (::fstat(fd, &st) != 0) throw std::runtime_error("stat '" + path + "': " + std::strerror(errno));
+        if (!S_ISREG(st.st_mode)) throw std::runtime_error("manifest '" + path + "' is not a regular file");
+        require_trusted(path, st, false);
+        char buf[4096];
+        for (;;) {
+            ssize_t n = ::read(fd, buf, sizeof(buf));
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) throw std::runtime_error("read '" + path + "': " + std::strerror(errno));
+            if (n == 0) break;
+            text.append(buf, static_cast<std::size_t>(n));
+        }
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+    ::close(fd);
+    return text;
+}
+
 Manifest load_manifest(const std::string& path) {
-    return parse_manifest(read_file_string(path), path);
+    return parse_manifest(read_manifest_text(path), path);
 }
 
 std::optional<std::string> find_manifest_upward(const std::string& start_dir) {
     std::filesystem::path dir = start_dir;
     for (;;) {
+        // Only directories we own: another UID's directory (/tmp, /home, /)
+        // can hold a manifest nobody here wrote.
+        struct stat dir_st{};
+        if (::stat(dir.c_str(), &dir_st) != 0 || dir_st.st_uid != ::getuid()) return std::nullopt;
         std::filesystem::path candidate = dir / kManifestFileName;
         std::error_code ec;
-        if (std::filesystem::exists(candidate, ec)) return candidate.string();
+        // symlink_status: a dangling link must fail at load, not be skipped.
+        if (std::filesystem::exists(std::filesystem::symlink_status(candidate, ec))) return candidate.string();
         std::filesystem::path parent = dir.parent_path();
         if (parent == dir) return std::nullopt;
         dir = parent;
@@ -299,8 +390,9 @@ std::optional<std::string> registry_project_root(const std::string& registry_pat
     return root;
 }
 
-KeyValues parse_dotenv(const std::string& text) {
+KeyValues parse_dotenv(const std::string& text, std::ostream& warnings) {
     KeyValues out;
+    std::map<std::string, std::size_t> first_line_of_key;
     std::size_t lineno = 0;
     for (std::string line : split_lines(text)) {
         ++lineno;
@@ -319,6 +411,11 @@ KeyValues parse_dotenv(const std::string& text) {
         if (!is_identifier(key)) {
             throw std::runtime_error("dotenv line " + std::to_string(lineno) + ": invalid key '" + key + "'");
         }
+        auto [seen, inserted] = first_line_of_key.emplace(key, lineno);
+        if (!inserted) {
+            throw std::runtime_error("dotenv line " + std::to_string(lineno) + ": duplicate key '" + key +
+                                     "' (first set on line " + std::to_string(seen->second) + ")");
+        }
 
         std::string raw = line.substr(eq + 1);
         std::size_t vstart = raw.find_first_not_of(" \t");
@@ -331,9 +428,20 @@ KeyValues parse_dotenv(const std::string& text) {
             bool closed = false;
             for (; i < raw.size(); ++i) {
                 char c = raw[i];
-                if (quote == '"' && c == '\\' && i + 1 < raw.size()) {
-                    char n = raw[++i];
-                    value.push_back(n == 'n' ? '\n' : n);
+                if (quote == '"' && c == '\\') {
+                    if (i + 1 >= raw.size()) break;  // reported as unterminated
+                    char escaped = raw[++i];
+                    switch (escaped) {
+                        case 'n': value.push_back('\n'); break;
+                        case 't': value.push_back('\t'); break;
+                        case 'r': value.push_back('\r'); break;
+                        case '\\': value.push_back('\\'); break;
+                        case '"': value.push_back('"'); break;
+                        default:
+                            throw std::runtime_error("dotenv line " + std::to_string(lineno) +
+                                                     ": unsupported escape '\\" + std::string(1, escaped) +
+                                                     "' in double-quoted value of '" + key + "'");
+                    }
                     continue;
                 }
                 if (c == quote) {
@@ -352,7 +460,11 @@ KeyValues parse_dotenv(const std::string& text) {
         } else {
             value = raw.substr(vstart);
             std::size_t hash = value.find(" #");
-            if (hash != std::string::npos) value = value.substr(0, hash);
+            if (hash != std::string::npos) {
+                value = value.substr(0, hash);
+                warnings << "warning: dotenv line " << lineno << ": stripped a trailing ' #' comment from '"
+                         << key << "'; quote the value if '#' belongs to it\n";
+            }
             while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
         }
         out.emplace_back(key, value);

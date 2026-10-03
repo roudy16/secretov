@@ -2,6 +2,8 @@
 # End-to-end smoke test for secretov. Uses a scratch HOME/XDG env so it never
 # touches the real ~. Passes secretov as $1 (the built binary), else finds it.
 set -eu
+# Manifests in group/world-writable dirs are refused; don't inherit a 0002 umask.
+umask 077
 
 BIN="${1:-}"
 if [ -z "$BIN" ]; then
@@ -279,6 +281,25 @@ head -c 700000 /dev/zero | tr '\0' y | "$BIN" set dev/demo/BIG2 || fail "set BIG
 ( cd "$PROJ" && "$BIN" exec -e dev -- true ) || fail "exec with a >1 MiB scope"
 "$BIN" delete dev/demo/BIG1
 "$BIN" delete dev/demo/BIG2
+
+# 5g. a manifest PATH reaches the child but cannot pick the program: argv[0]
+# resolves against the caller's PATH. A group-writable project dir is refused.
+mkdir -p "$PROJ/evil"
+printf '#!/bin/sh\nprintf EVIL\n' > "$PROJ/evil/sh"
+chmod +x "$PROJ/evil/sh"
+cp "$PROJ/.secretov.yaml" "$PROJ/.secretov.yaml.bak"
+python3 - "$PROJ/.secretov.yaml" "$PROJ/evil:$PATH" <<'PY2'
+import sys, json, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+p.write_text(t.replace("    vars:\n", "    vars:\n      PATH: " + json.dumps(sys.argv[2]) + "\n", 1))
+PY2
+OUT="$(cd "$PROJ" && "$BIN" exec -e dev -- sh -c 'printf %s "$PATH"')"
+[ "$OUT" = "$PROJ/evil:$PATH" ] || fail "manifest PATH chose the program or was not passed: '$OUT'"
+mv "$PROJ/.secretov.yaml.bak" "$PROJ/.secretov.yaml"
+chmod g+w "$PROJ"
+ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "group-writable project dir should be refused"
+echo "$ERR" | grep -q "chmod g-w,o-w '$PROJ'" || fail "untrusted dir message: $ERR"
+chmod g-w "$PROJ"
 
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
