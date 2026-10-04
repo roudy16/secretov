@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -36,6 +37,13 @@
 #include <sodium.h>
 
 namespace secretov {
+
+// Zeroes, munlocks and frees a crypto_secretbox_KEYBYTES buffer.
+struct GuardedFree {
+    void operator()(unsigned char* key) const noexcept;
+};
+// An mlock'd key buffer of crypto_secretbox_KEYBYTES, wiped on release.
+using GuardedKey = std::unique_ptr<unsigned char, GuardedFree>;
 
 class Store {
    public:
@@ -46,9 +54,8 @@ class Store {
 
     Store(const Store&) = delete;
     Store& operator=(const Store&) = delete;
-    Store(Store&& other) noexcept;
-    Store& operator=(Store&& other) noexcept;
-    ~Store();
+    Store(Store&& other) noexcept = default;
+    Store& operator=(Store&& other) = delete;
 
     std::optional<std::string> get(const std::string& key) const;
     void set(const std::string& key, const std::string& value);
@@ -84,10 +91,9 @@ class Store {
     };
 
     // Wrapping key derived from a passphrase plus the data key it unwrapped.
-    // Both mlock'd; the caller frees each.
     struct Unwrapped {
-        unsigned char* wrap_key = nullptr;
-        unsigned char* data_key = nullptr;
+        GuardedKey wrap_key;
+        GuardedKey data_key;
     };
     // One Argon2id derivation that both proves the passphrase (the stored
     // blob must unwrap) and hands back the wrapping key for re-wrapping.
@@ -97,19 +103,28 @@ class Store {
     // into `envelope` with a fresh wrap nonce.
     static void mint_data_key(unsigned char* data_key, const unsigned char* wrap_key,
                               Envelope& envelope);
+    // Fresh salt, the given KDF params and `now` into `envelope`, then a fresh
+    // data key wrapped under the key derived from `passphrase`. Returns the
+    // data key.
+    static GuardedKey mint_fresh_envelope(const std::string& passphrase, std::uint64_t opslimit,
+                                          std::uint64_t memlimit, std::uint64_t now,
+                                          Envelope& envelope);
+    // Fills the header fields v1 and v2 share and validates the KDF params;
+    // returns the offset just past them. `buf` must already be size-checked.
+    static std::size_t read_common_header(const std::vector<unsigned char>& buf,
+                                          Envelope& envelope);
     void persist(const nlohmann::json& data, const unsigned char* data_key,
                  const Envelope& envelope) const;
-    // Takes ownership of `new_data_key`: persists data_ under it and `next`,
-    // then adopts both. On a failed write the key is freed and nothing changes.
-    void commit_new_key(unsigned char* new_data_key, const Envelope& next);
-    void wipe();
+    // Persists data_ under `new_data_key` and `next`, then adopts both. On a
+    // failed write the key is freed and nothing changes.
+    void commit_new_key(GuardedKey new_data_key, const Envelope& next);
 
     std::string path_;
     nlohmann::json data_ = nlohmann::json::object();
 
     // Guarded (sodium_mlock) secret material. The Store retains only the
     // data key; the passphrase and wrapping key are never retained.
-    unsigned char* key_ = nullptr;  // crypto_secretbox_KEYBYTES (the data key)
+    GuardedKey key_;  // the data key
     Envelope env_;
 };
 

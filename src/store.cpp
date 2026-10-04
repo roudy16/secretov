@@ -25,10 +25,10 @@ constexpr unsigned char kVersion2 = 2;
 constexpr std::uint64_t kDefaultOpslimit = crypto_pwhash_OPSLIMIT_MODERATE;
 constexpr std::uint64_t kDefaultMemlimit = crypto_pwhash_MEMLIMIT_MODERATE;
 
-constexpr std::size_t kHeaderSizeV1 = sizeof(kMagic) + 1 + crypto_pwhash_SALTBYTES + 8 + 8 + 8 +
-                                      crypto_secretbox_NONCEBYTES;
-constexpr std::size_t kHeaderSizeV2 = sizeof(kMagic) + 1 + crypto_pwhash_SALTBYTES + 8 + 8 + 8 +
-                                      crypto_secretbox_NONCEBYTES +
+// magic, version, salt, opslimit, memlimit, key_created_at
+constexpr std::size_t kCommonHeaderSize = sizeof(kMagic) + 1 + crypto_pwhash_SALTBYTES + 8 + 8 + 8;
+constexpr std::size_t kHeaderSizeV1 = kCommonHeaderSize + crypto_secretbox_NONCEBYTES;
+constexpr std::size_t kHeaderSizeV2 = kCommonHeaderSize + crypto_secretbox_NONCEBYTES +
                                       (crypto_secretbox_KEYBYTES + crypto_secretbox_MACBYTES) +
                                       crypto_secretbox_NONCEBYTES;
 
@@ -60,68 +60,72 @@ void check_kdf_params(std::uint64_t opslimit, std::uint64_t memlimit) {
     }
 }
 
-unsigned char* alloc_guarded(std::size_t len) {
-    unsigned char* p = static_cast<unsigned char*>(std::malloc(len ? len : 1));
-    if (!p) {
+GuardedKey alloc_guarded() {
+    auto* key = static_cast<unsigned char*>(std::malloc(crypto_secretbox_KEYBYTES));
+    if (!key) {
         throw std::runtime_error("out of memory allocating key material");
     }
-    if (sodium_mlock(p, len ? len : 1) != 0) {
-        std::free(p);
+    if (sodium_mlock(key, crypto_secretbox_KEYBYTES) != 0) {
+        std::free(key);
         throw std::runtime_error("sodium_mlock failed: " + std::string(std::strerror(errno)));
     }
-    return p;
+    return GuardedKey(key);
 }
 
-void free_guarded(unsigned char* p, std::size_t len) {
-    if (!p) return;
-    sodium_memzero(p, len ? len : 1);
-    sodium_munlock(p, len ? len : 1);
-    std::free(p);
-}
-
-// Argon2id(passphrase, salt, opslimit, memlimit) into a fresh mlock'd buffer.
-// Caller owns the result and must free_guarded() it.
-unsigned char* derive_kdf_key(const std::string& passphrase, const unsigned char* salt,
-                              std::uint64_t opslimit, std::uint64_t memlimit) {
-    unsigned char* key = alloc_guarded(crypto_secretbox_KEYBYTES);
-    if (crypto_pwhash(key, crypto_secretbox_KEYBYTES, passphrase.data(), passphrase.size(), salt,
-                      static_cast<unsigned long long>(opslimit),
+// Argon2id(passphrase, salt, opslimit, memlimit) into a fresh guarded buffer.
+GuardedKey derive_kdf_key(const std::string& passphrase, const unsigned char* salt,
+                          std::uint64_t opslimit, std::uint64_t memlimit) {
+    GuardedKey key = alloc_guarded();
+    if (crypto_pwhash(key.get(), crypto_secretbox_KEYBYTES, passphrase.data(), passphrase.size(),
+                      salt, static_cast<unsigned long long>(opslimit),
                       static_cast<std::size_t>(memlimit), crypto_pwhash_ALG_ARGON2ID13) != 0) {
-        free_guarded(key, crypto_secretbox_KEYBYTES);
         throw std::runtime_error("Argon2id key derivation failed (out of memory?)");
     }
     return key;
 }
 
+// Decrypts and validates a payload; v1 and v2 share this after their headers.
+nlohmann::json decrypt_payload(const unsigned char* ciphertext, std::size_t ciphertext_len,
+                               const unsigned char* nonce, const unsigned char* key) {
+    std::vector<unsigned char> plaintext(ciphertext_len - crypto_secretbox_MACBYTES);
+    if (crypto_secretbox_open_easy(plaintext.data(), ciphertext, ciphertext_len, nonce, key) != 0) {
+        throw std::runtime_error("wrong passphrase or corrupted store");
+    }
+    nlohmann::json data;
+    try {
+        data = nlohmann::json::parse(plaintext.begin(), plaintext.end());
+    } catch (const nlohmann::json::exception&) {
+        throw std::runtime_error("corrupted store: decrypted payload is not valid JSON");
+    }
+    if (!data.is_object()) {
+        throw std::runtime_error("corrupted store: decrypted payload is not a JSON object");
+    }
+    return data;
+}
+
 }  // namespace
 
-void Store::wipe() {
-    free_guarded(key_, crypto_secretbox_KEYBYTES);
-    key_ = nullptr;
+void GuardedFree::operator()(unsigned char* key) const noexcept {
+    sodium_memzero(key, crypto_secretbox_KEYBYTES);
+    sodium_munlock(key, crypto_secretbox_KEYBYTES);
+    std::free(key);
 }
 
 // Derives the wrapping key from `passphrase` (store's own salt and KDF
 // params) and proves it by unwrapping the stored data key blob. One Argon2id
-// call serves both verification and whatever the caller does next. Both
-// returned buffers are guarded; the caller frees each. `fail_msg` is thrown
-// on MAC failure so open() and rotate()/change_passphrase() can report
-// different messages for the same check.
+// call serves both verification and whatever the caller does next.
+// `fail_msg` is thrown on MAC failure so open() and rotate()/
+// change_passphrase() can report different messages for the same check.
 Store::Unwrapped Store::unwrap(const std::string& passphrase, const char* fail_msg) const {
-    unsigned char* data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
-    unsigned char* wrap_key = nullptr;
-    try {
-        wrap_key = derive_kdf_key(passphrase, env_.salt, env_.opslimit, env_.memlimit);
-    } catch (...) {
-        free_guarded(data_key, crypto_secretbox_KEYBYTES);
-        throw;
-    }
-    if (crypto_secretbox_open_easy(data_key, env_.wrapped_key, sizeof(env_.wrapped_key),
-                                   env_.wrap_nonce, wrap_key) != 0) {
-        free_guarded(wrap_key, crypto_secretbox_KEYBYTES);
-        free_guarded(data_key, crypto_secretbox_KEYBYTES);
+    Unwrapped keys;
+    keys.data_key = alloc_guarded();
+    keys.wrap_key = derive_kdf_key(passphrase, env_.salt, env_.opslimit, env_.memlimit);
+    if (crypto_secretbox_open_easy(keys.data_key.get(), env_.wrapped_key,
+                                   sizeof(env_.wrapped_key), env_.wrap_nonce,
+                                   keys.wrap_key.get()) != 0) {
         throw std::runtime_error(fail_msg);
     }
-    return {wrap_key, data_key};
+    return keys;
 }
 
 void Store::mint_data_key(unsigned char* data_key, const unsigned char* wrap_key,
@@ -130,6 +134,33 @@ void Store::mint_data_key(unsigned char* data_key, const unsigned char* wrap_key
     randombytes_buf(envelope.wrap_nonce, sizeof(envelope.wrap_nonce));
     crypto_secretbox_easy(envelope.wrapped_key, data_key, crypto_secretbox_KEYBYTES,
                           envelope.wrap_nonce, wrap_key);
+}
+
+GuardedKey Store::mint_fresh_envelope(const std::string& passphrase, std::uint64_t opslimit,
+                                      std::uint64_t memlimit, std::uint64_t now,
+                                      Envelope& envelope) {
+    randombytes_buf(envelope.salt, sizeof(envelope.salt));
+    envelope.opslimit = opslimit;
+    envelope.memlimit = memlimit;
+    envelope.key_created_at = now;
+    GuardedKey wrap_key = derive_kdf_key(passphrase, envelope.salt, opslimit, memlimit);
+    GuardedKey data_key = alloc_guarded();
+    mint_data_key(data_key.get(), wrap_key.get(), envelope);
+    return data_key;
+}
+
+std::size_t Store::read_common_header(const std::vector<unsigned char>& buf, Envelope& envelope) {
+    std::size_t offset = sizeof(kMagic) + 1;
+    std::memcpy(envelope.salt, buf.data() + offset, sizeof(envelope.salt));
+    offset += sizeof(envelope.salt);
+    envelope.opslimit = get_u64_le(buf.data() + offset);
+    offset += 8;
+    envelope.memlimit = get_u64_le(buf.data() + offset);
+    offset += 8;
+    envelope.key_created_at = get_u64_le(buf.data() + offset);
+    offset += 8;
+    check_kdf_params(envelope.opslimit, envelope.memlimit);
+    return offset;
 }
 
 // Encrypts `data` under `data_key` and writes the whole file with `envelope`
@@ -173,83 +204,10 @@ Store Store::create(const std::string& path, const std::string& passphrase, std:
 
     Store s;
     s.path_ = path;
-    randombytes_buf(s.env_.salt, sizeof(s.env_.salt));
-    s.env_.opslimit = kDefaultOpslimit;
-    s.env_.memlimit = kDefaultMemlimit;
-    s.env_.key_created_at = now;
-
-    unsigned char* data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
-    unsigned char* wrap_key = nullptr;
-    try {
-        wrap_key = derive_kdf_key(passphrase, s.env_.salt, s.env_.opslimit, s.env_.memlimit);
-    } catch (...) {
-        free_guarded(data_key, crypto_secretbox_KEYBYTES);
-        throw;
-    }
-    mint_data_key(data_key, wrap_key, s.env_);
-    free_guarded(wrap_key, crypto_secretbox_KEYBYTES);
-
-    s.key_ = data_key;
-    s.persist(s.data_, s.key_, s.env_);
+    s.key_ = mint_fresh_envelope(passphrase, kDefaultOpslimit, kDefaultMemlimit, now, s.env_);
+    s.persist(s.data_, s.key_.get(), s.env_);
     return s;
 }
-
-namespace {
-
-// Parses a version-1 header (no envelope), decrypts the payload directly
-// with the passphrase-derived key, and returns that key (guarded, caller
-// frees) along with the parsed JSON. Used only for one-way migration.
-struct V1Decoded {
-    unsigned char* key = nullptr;  // crypto_secretbox_KEYBYTES, guarded
-    nlohmann::json data;
-};
-
-V1Decoded decode_v1(const std::vector<unsigned char>& buf, const std::string& passphrase,
-                    unsigned char (&salt_out)[crypto_pwhash_SALTBYTES],
-                    std::uint64_t& opslimit_out, std::uint64_t& memlimit_out,
-                    std::uint64_t& key_created_at_out) {
-    if (buf.size() < kHeaderSizeV1 + crypto_secretbox_MACBYTES) {
-        throw std::runtime_error("corrupted store: truncated header or ciphertext");
-    }
-    std::size_t off = sizeof(kMagic) + 1;
-    std::memcpy(salt_out, buf.data() + off, crypto_pwhash_SALTBYTES);
-    off += crypto_pwhash_SALTBYTES;
-    opslimit_out = get_u64_le(buf.data() + off);
-    off += 8;
-    memlimit_out = get_u64_le(buf.data() + off);
-    off += 8;
-    key_created_at_out = get_u64_le(buf.data() + off);
-    off += 8;
-    const unsigned char* nonce = buf.data() + off;
-    off += crypto_secretbox_NONCEBYTES;
-    const unsigned char* ct = buf.data() + off;
-    std::size_t ct_len = buf.size() - off;
-
-    check_kdf_params(opslimit_out, memlimit_out);
-
-    unsigned char* key = derive_kdf_key(passphrase, salt_out, opslimit_out, memlimit_out);
-
-    std::vector<unsigned char> plaintext(ct_len - crypto_secretbox_MACBYTES);
-    if (crypto_secretbox_open_easy(plaintext.data(), ct, ct_len, nonce, key) != 0) {
-        free_guarded(key, crypto_secretbox_KEYBYTES);
-        throw std::runtime_error("wrong passphrase or corrupted store");
-    }
-
-    nlohmann::json data;
-    try {
-        data = nlohmann::json::parse(plaintext.begin(), plaintext.end());
-    } catch (const nlohmann::json::exception&) {
-        free_guarded(key, crypto_secretbox_KEYBYTES);
-        throw std::runtime_error("corrupted store: decrypted payload is not valid JSON");
-    }
-    if (!data.is_object()) {
-        free_guarded(key, crypto_secretbox_KEYBYTES);
-        throw std::runtime_error("corrupted store: decrypted payload is not a JSON object");
-    }
-    return {key, std::move(data)};
-}
-
-}  // namespace
 
 Store Store::open(const std::string& path, const std::string& passphrase) {
     ensure_sodium();
@@ -262,28 +220,31 @@ Store Store::open(const std::string& path, const std::string& passphrase) {
     }
     unsigned char version = buf[sizeof(kMagic)];
 
+    Store s;
+    s.path_ = path;
+
     if (version == kVersion1) {
-        Store s;
-        s.path_ = path;
-        unsigned char* data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
-        V1Decoded decoded;
-        try {
-            decoded = decode_v1(buf, passphrase, s.env_.salt, s.env_.opslimit, s.env_.memlimit,
-                                s.env_.key_created_at);
-        } catch (...) {
-            free_guarded(data_key, crypto_secretbox_KEYBYTES);
-            throw;
+        if (buf.size() < kHeaderSizeV1 + crypto_secretbox_MACBYTES) {
+            throw std::runtime_error("corrupted store: truncated header or ciphertext");
         }
-        s.data_ = std::move(decoded.data);
+        std::size_t offset = read_common_header(buf, s.env_);
+        const unsigned char* payload_nonce = buf.data() + offset;
+        offset += crypto_secretbox_NONCEBYTES;
+
+        // Version 1 has no envelope: the passphrase-derived key encrypts the
+        // payload directly.
+        GuardedKey wrap_key =
+            derive_kdf_key(passphrase, s.env_.salt, s.env_.opslimit, s.env_.memlimit);
+        s.data_ = decrypt_payload(buf.data() + offset, buf.size() - offset, payload_nonce,
+                                  wrap_key.get());
 
         // Migrate: mint a fresh data key, wrap it under the same
         // passphrase-derived key with a fresh wrap nonce; salt/params/
         // key_created_at are kept.
-        mint_data_key(data_key, decoded.key, s.env_);
-        free_guarded(decoded.key, crypto_secretbox_KEYBYTES);
-
-        s.key_ = data_key;
-        s.persist(s.data_, s.key_, s.env_);
+        s.key_ = alloc_guarded();
+        mint_data_key(s.key_.get(), wrap_key.get(), s.env_);
+        wrap_key.reset();
+        s.persist(s.data_, s.key_.get(), s.env_);
         return s;
     }
 
@@ -294,51 +255,19 @@ Store Store::open(const std::string& path, const std::string& passphrase) {
         throw std::runtime_error("corrupted store: truncated header or ciphertext: '" + path + "'");
     }
 
-    Store s;
-    s.path_ = path;
-    std::size_t off = sizeof(kMagic) + 1;
-    std::memcpy(s.env_.salt, buf.data() + off, sizeof(s.env_.salt));
-    off += sizeof(s.env_.salt);
-    s.env_.opslimit = get_u64_le(buf.data() + off);
-    off += 8;
-    s.env_.memlimit = get_u64_le(buf.data() + off);
-    off += 8;
-    s.env_.key_created_at = get_u64_le(buf.data() + off);
-    off += 8;
-    std::memcpy(s.env_.wrap_nonce, buf.data() + off, sizeof(s.env_.wrap_nonce));
-    off += sizeof(s.env_.wrap_nonce);
-    std::memcpy(s.env_.wrapped_key, buf.data() + off, sizeof(s.env_.wrapped_key));
-    off += sizeof(s.env_.wrapped_key);
-    const unsigned char* payload_nonce = buf.data() + off;
-    off += crypto_secretbox_NONCEBYTES;
-
-    const unsigned char* ct = buf.data() + off;
-    std::size_t ct_len = buf.size() - off;
-
-    check_kdf_params(s.env_.opslimit, s.env_.memlimit);
+    std::size_t offset = read_common_header(buf, s.env_);
+    std::memcpy(s.env_.wrap_nonce, buf.data() + offset, sizeof(s.env_.wrap_nonce));
+    offset += sizeof(s.env_.wrap_nonce);
+    std::memcpy(s.env_.wrapped_key, buf.data() + offset, sizeof(s.env_.wrapped_key));
+    offset += sizeof(s.env_.wrapped_key);
+    const unsigned char* payload_nonce = buf.data() + offset;
+    offset += crypto_secretbox_NONCEBYTES;
 
     Unwrapped keys = s.unwrap(passphrase, "wrong passphrase or corrupted store");
-    free_guarded(keys.wrap_key, crypto_secretbox_KEYBYTES);
-    unsigned char* data_key = keys.data_key;
-
-    std::vector<unsigned char> plaintext(ct_len - crypto_secretbox_MACBYTES);
-    if (crypto_secretbox_open_easy(plaintext.data(), ct, ct_len, payload_nonce, data_key) != 0) {
-        free_guarded(data_key, crypto_secretbox_KEYBYTES);
-        throw std::runtime_error("wrong passphrase or corrupted store");
-    }
-
-    try {
-        s.data_ = nlohmann::json::parse(plaintext.begin(), plaintext.end());
-    } catch (const nlohmann::json::exception&) {
-        free_guarded(data_key, crypto_secretbox_KEYBYTES);
-        throw std::runtime_error("corrupted store: decrypted payload is not valid JSON");
-    }
-    if (!s.data_.is_object()) {
-        free_guarded(data_key, crypto_secretbox_KEYBYTES);
-        throw std::runtime_error("corrupted store: decrypted payload is not a JSON object");
-    }
-
-    s.key_ = data_key;
+    keys.wrap_key.reset();
+    s.data_ = decrypt_payload(buf.data() + offset, buf.size() - offset, payload_nonce,
+                              keys.data_key.get());
+    s.key_ = std::move(keys.data_key);
     return s;
 }
 
@@ -351,7 +280,7 @@ std::optional<std::string> Store::get(const std::string& key) const {
 void Store::set(const std::string& key, const std::string& value) {
     nlohmann::json next = data_;
     next[key] = value;
-    persist(next, key_, env_);
+    persist(next, key_.get(), env_);
     data_ = std::move(next);
 }
 
@@ -359,7 +288,7 @@ bool Store::remove(const std::string& key) {
     if (!data_.contains(key)) return false;
     nlohmann::json next = data_;
     next.erase(key);
-    persist(next, key_, env_);
+    persist(next, key_.get(), env_);
     data_ = std::move(next);
     return true;
 }
@@ -383,35 +312,23 @@ std::map<std::string, std::string> Store::get_prefix(const std::string& prefix) 
     return out;
 }
 
-void Store::commit_new_key(unsigned char* new_data_key, const Envelope& next) {
-    try {
-        persist(data_, new_data_key, next);
-    } catch (...) {
-        free_guarded(new_data_key, crypto_secretbox_KEYBYTES);
-        throw;
-    }
-    free_guarded(key_, crypto_secretbox_KEYBYTES);
-    key_ = new_data_key;
+void Store::commit_new_key(GuardedKey new_data_key, const Envelope& next) {
+    persist(data_, new_data_key.get(), next);
+    key_ = std::move(new_data_key);
     env_ = next;
 }
 
 void Store::rotate(const std::string& passphrase, std::uint64_t now) {
-    unsigned char* new_data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
-    Unwrapped keys;
-    try {
-        keys = unwrap(passphrase, "wrong passphrase");  // proves the passphrase
-    } catch (...) {
-        free_guarded(new_data_key, crypto_secretbox_KEYBYTES);
-        throw;
-    }
-    free_guarded(keys.data_key, crypto_secretbox_KEYBYTES);  // we already hold it in key_
+    Unwrapped keys = unwrap(passphrase, "wrong passphrase");  // proves the passphrase
+    keys.data_key.reset();  // we already hold it in key_
 
     // Same wrapping key (salt/params unchanged); fresh data key and wrap nonce.
     Envelope next = env_;
     next.key_created_at = now;
-    mint_data_key(new_data_key, keys.wrap_key, next);
-    free_guarded(keys.wrap_key, crypto_secretbox_KEYBYTES);
-    commit_new_key(new_data_key, next);
+    GuardedKey new_data_key = alloc_guarded();
+    mint_data_key(new_data_key.get(), keys.wrap_key.get(), next);
+    keys.wrap_key.reset();
+    commit_new_key(std::move(new_data_key), next);
 }
 
 void Store::change_passphrase(const std::string& old_pass, const std::string& new_pass,
@@ -419,52 +336,17 @@ void Store::change_passphrase(const std::string& old_pass, const std::string& ne
     if (new_pass.empty()) {
         throw std::runtime_error("empty passphrase");
     }
-    Unwrapped check = unwrap(old_pass, "wrong passphrase");
-    free_guarded(check.wrap_key, crypto_secretbox_KEYBYTES);
-    free_guarded(check.data_key, crypto_secretbox_KEYBYTES);
+    unwrap(old_pass, "wrong passphrase");  // proves old_pass; both keys freed here
 
     // A fresh data key, not a re-wrap of the old one: an old copy of the file
     // plus the old passphrase must not unwrap the key protecting later writes.
     // At least the current default KDF params, so passwd upgrades a store made
     // with weaker ones and never downgrades a stronger one.
     Envelope next;
-    randombytes_buf(next.salt, sizeof(next.salt));
-    next.opslimit = std::max<std::uint64_t>(env_.opslimit, kDefaultOpslimit);
-    next.memlimit = std::max<std::uint64_t>(env_.memlimit, kDefaultMemlimit);
-    next.key_created_at = now;
-    unsigned char* new_data_key = alloc_guarded(crypto_secretbox_KEYBYTES);
-    unsigned char* new_wrap_key = nullptr;
-    try {
-        new_wrap_key = derive_kdf_key(new_pass, next.salt, next.opslimit, next.memlimit);
-    } catch (...) {
-        free_guarded(new_data_key, crypto_secretbox_KEYBYTES);
-        throw;
-    }
-    mint_data_key(new_data_key, new_wrap_key, next);
-    free_guarded(new_wrap_key, crypto_secretbox_KEYBYTES);
-    commit_new_key(new_data_key, next);
+    GuardedKey new_data_key = mint_fresh_envelope(
+        new_pass, std::max<std::uint64_t>(env_.opslimit, kDefaultOpslimit),
+        std::max<std::uint64_t>(env_.memlimit, kDefaultMemlimit), now, next);
+    commit_new_key(std::move(new_data_key), next);
 }
-
-Store::Store(Store&& other) noexcept
-    : path_(std::move(other.path_)),
-      data_(std::move(other.data_)),
-      key_(other.key_),
-      env_(other.env_) {
-    other.key_ = nullptr;
-}
-
-Store& Store::operator=(Store&& other) noexcept {
-    if (this != &other) {
-        wipe();
-        path_ = std::move(other.path_);
-        data_ = std::move(other.data_);
-        key_ = other.key_;
-        env_ = other.env_;
-        other.key_ = nullptr;
-    }
-    return *this;
-}
-
-Store::~Store() { wipe(); }
 
 }  // namespace secretov
