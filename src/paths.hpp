@@ -122,32 +122,29 @@ inline void write_file_atomic(const std::string& path, const std::string& conten
     if (fd < 0) {
         throw std::runtime_error("create '" + tmp + "': " + std::strerror(errno));
     }
+    auto fail = [&](const std::string& what) {
+        int saved_errno = errno;
+        if (fd >= 0) ::close(fd);
+        ::unlink(tmp.c_str());
+        throw std::runtime_error(what + " '" + tmp + "': " + std::strerror(saved_errno));
+    };
     std::size_t written = 0;
     while (written < contents.size()) {
         ssize_t n = ::write(fd, contents.data() + written, contents.size() - written);
         if (n < 0) {
-            int e = errno;
-            ::close(fd);
-            ::unlink(tmp.c_str());
-            throw std::runtime_error("write '" + tmp + "': " + std::strerror(e));
+            if (errno == EINTR) continue;
+            fail("write");
         }
         written += static_cast<std::size_t>(n);
     }
-    if (::fsync(fd) != 0) {
-        int e = errno;
-        ::close(fd);
-        ::unlink(tmp.c_str());
-        throw std::runtime_error("fsync '" + tmp + "': " + std::strerror(e));
-    }
-    if (::close(fd) != 0) {
-        int e = errno;
-        ::unlink(tmp.c_str());
-        throw std::runtime_error("close '" + tmp + "': " + std::strerror(e));
-    }
+    if (::fsync(fd) != 0) fail("fsync");
+    int close_result = ::close(fd);
+    fd = -1;
+    if (close_result != 0) fail("close");
     if (::rename(tmp.c_str(), path.c_str()) != 0) {
-        int e = errno;
+        int saved_errno = errno;
         ::unlink(tmp.c_str());
-        throw std::runtime_error("rename '" + tmp + "' -> '" + path + "': " + std::strerror(e));
+        throw std::runtime_error("rename '" + tmp + "' -> '" + path + "': " + std::strerror(saved_errno));
     }
     // The rename has replaced `path`: callers (Store::persist and the passwd/
     // rotate commit) treat a throw as "nothing changed", so from here a failure

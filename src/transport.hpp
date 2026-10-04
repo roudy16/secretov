@@ -17,7 +17,7 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
     Connection(Connection&& other) noexcept;
-    Connection& operator=(Connection&& other) noexcept;
+    Connection& operator=(Connection&& other) = delete;
 
     // nullopt on EOF, error, or a line exceeding max_line_bytes (the peer is
     // then dropped). Consumed bytes are zeroed in the receive buffer, and the
