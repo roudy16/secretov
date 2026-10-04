@@ -276,17 +276,20 @@ command line does override a manifest var.
 A manifest decides what code runs with your secrets, so secretov only trusts
 one that nobody else can change:
 
-- **Permissions.** The `.secretov.yaml` must be a regular file owned by you
-  and not group- or world-writable; its directory (and, for a symlink, the
-  target's directory) must be owned by you or root and not group- or
-  world-writable. Otherwise every command that reads it (`exec`, `list`,
+- **Permissions.** The `.secretov.yaml` must be a regular file owned by you;
+  its directory (and, for a symlink, the target's directory) must be owned by
+  you or root. None may be world-writable, and none may be group-writable
+  unless the owning group is your private group (your primary group, named
+  after you) and you are its only member (counting accounts whose primary
+  group it is). Otherwise every command that reads it (`exec`, `list`,
   `set -p/-e`, `import`, `--dry-run`, including `-p` registry lookups)
   refuses with the fix, e.g.
-  `refusing manifest directory '/path': writable by group or others; fix with: chmod g-w,o-w '/path'`.
+  `refusing manifest directory '/path': writable by group 'roudy', which also includes devuser (its primary group); fix with: chmod g-w '/path', or make 'roudy' yours alone: sudo userdel devuser or sudo usermod -g <another group> devuser`.
   An `import` that would create or change the manifest checks the same way,
   and that the directory exists and is writable, before storing anything; a
   symlinked manifest is updated at its target. A default umask of 0002 makes new project dirs
-  group-writable; run the `chmod` it prints.
+  group-writable, which is fine while your group is private to you. Locking an
+  account does not remove it from a group.
 - **Discovery** walks up from the current directory only through directories
   you own, so a manifest in `/tmp`, `/home`, or `/` is never picked up. A bad
   nearer manifest is an error; secretov never falls back to one further up.
@@ -360,7 +363,8 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `'X' (env dev) is set in both vars and secrets` | Same variable defined twice | Remove one of the two definitions |
 | `var 'X' (env dev) must be a scalar value` | A nested map/list under `vars:` | Use a plain scalar |
 | `invalid token` | Client/daemon token mismatch | Daemon restarted against a different config |
-| `refusing manifest[ directory] '...': writable by group or others` | Manifest or its dir is group/world-writable | Run the `chmod g-w,o-w` it prints |
+| `refusing manifest[ directory] '...': writable by everyone` | Manifest or its dir is world-writable | Run the `chmod` it prints |
+| `refusing manifest[ directory] '...': writable by group 'G', which also includes ...` | Group-writable, and another account is in group G | Run the `chmod g-w` it prints, or remove the named accounts from G |
 | `refusing manifest[ directory] '...': owned by uid N, not you` | Someone else's manifest or dir | Remove it, or chown it to yourself |
 | `... cannot be set from a manifest` | A denied name under `vars:` or `env_var_name` | Rename it, or pass it on your own command line |
 | `cannot run 'X': No such file or directory` | `exec` program missing from *your* PATH | Install it, or give a path with a `/` |

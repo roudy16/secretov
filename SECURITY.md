@@ -256,6 +256,13 @@ one fixes them:
 cd ~/workspace/roudy16 && chmod g-w,o-w {blueowl,wed_photo,homestat,homecloud} {blueowl,wed_photo,homestat,homecloud}/.secretov.yaml
 ```
 
+Update (2026-10-03): group write is now allowed when the caller is the
+owning group's only member, so taking devuser out of group `roudy` is an
+alternative to the chmod. Locking it is not enough: `roudy` is devuser's
+primary group, and a locked account is still a member. `sudo userdel
+devuser` or `sudo usermod -g <another group> devuser` does it; the refusal
+names these commands.
+
 ### 13. Secret values in shell history; interactive `set` echoed (M3) — `done` (2026-10-03, afa8352, 43219db, 7f36a00)
 
 The docs showed `printf 'value' | secretov set KEY`, writing the value to

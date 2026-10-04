@@ -345,7 +345,7 @@ head -c 700000 /dev/zero | tr '\0' y | "$BIN" set dev/demo/BIG2 || fail "set BIG
 
 # 5g. a manifest cannot set PATH (it would pick the program and every program
 # the child spawns); a shebang-less executable still runs via /bin/sh like
-# execvp. A group-writable project dir is refused.
+# execvp. A world-writable project dir is refused.
 mkdir -p "$PROJ/bin"
 printf 'printf noshebang-ran\n' > "$PROJ/bin/nosb"
 chmod +x "$PROJ/bin/nosb"
@@ -360,20 +360,20 @@ PY2
 ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "manifest PATH should be refused"
 echo "$ERR" | grep -q "cannot be set from a manifest" || fail "manifest PATH message: $ERR"
 mv "$PROJ/.secretov.yaml.bak" "$PROJ/.secretov.yaml"
-chmod g+w "$PROJ"
-ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "group-writable project dir should be refused"
-echo "$ERR" | grep -q "chmod g-w,o-w '$PROJ'" || fail "untrusted dir message: $ERR"
-chmod g-w "$PROJ"
+chmod o+w "$PROJ"
+ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "world-writable project dir should be refused"
+echo "$ERR" | grep -q "o-w '$PROJ'" || fail "untrusted dir message: $ERR"
+chmod o-w "$PROJ"
 # import refuses a new manifest's untrusted dir before storing anything, and a
 # dangling manifest symlink fails as it does for exec instead of being replaced
 GW="$WORK/gw"
 mkdir -p "$GW"
 printf 'GWTOK=x\n' > "$GW/.env"
-chmod g+w "$GW"
-ERR="$(cd "$GW" && "$BIN" import -p gw -e dev 2>&1)" && fail "import into a group-writable dir should fail"
-echo "$ERR" | grep -q "writable by group or others" || fail "import untrusted dir message: $ERR"
+chmod o+w "$GW"
+ERR="$(cd "$GW" && "$BIN" import -p gw -e dev 2>&1)" && fail "import into a world-writable dir should fail"
+echo "$ERR" | grep -q "writable by everyone" || fail "import untrusted dir message: $ERR"
 if "$BIN" get dev/gw/GWTOK >/dev/null 2>&1; then fail "refused import stored a secret"; fi
-chmod g-w "$GW"
+chmod o-w "$GW"
 ln -s missing "$GW/.secretov.yaml"
 if ( cd "$GW" && "$BIN" import -p gw -e dev >/dev/null 2>&1 ); then fail "import replaced a dangling manifest link"; fi
 [ -L "$GW/.secretov.yaml" ] || fail "dangling manifest link was replaced"

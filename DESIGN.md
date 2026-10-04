@@ -207,9 +207,14 @@ groups needed keys by `env/project/` prefix and issues one per group.
 
 Trust note: a manifest decides what runs with which secrets, so it is read
 (only via `read_manifest_text`) under ssh-StrictModes rules: the file must be
-owned by the caller and not group/world-writable, and its directory (and a
-symlink target's) owned by the caller or root and not group/world-writable;
-anything else is refused with the `chmod` fix, never skipped for an ancestor.
+owned by the caller, and its directory (and a symlink target's) owned by the
+caller or root; none world-writable, and none group-writable unless the
+group is the caller's user private group (their primary gid, named after
+them) with no other member (`gr_mem` plus a passwd scan for primary members;
+a scan error refuses). Limiting this to the private group keeps it fail-closed
+where an NSS backend hides accounts from the scan.
+Anything else is refused with the `chmod` or group fix, never skipped for an
+ancestor.
 `vars:` keys and `env_var_name` reject a deny list of names that make the
 child or anything it spawns load code or config, or redirect its traffic
 through a proxy or CA of the manifest's choosing (`LD_*`, `DYLD_*`,

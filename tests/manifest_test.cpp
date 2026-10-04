@@ -1,5 +1,6 @@
 #include "manifest.hpp"
 
+#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -180,8 +181,28 @@ void test_manifest_trust() {
     write_manifest(manifest, 0644);
     assert(load_manifest(manifest).project == "t");
 
+    // Group write passes only when nobody else is in the owning group, so the
+    // outcome depends on this host's group database.
     assert(::chmod(manifest.c_str(), 0664) == 0);
-    assert(throws_with([&] { load_manifest(manifest); }, "chmod g-w,o-w '"));
+    struct stat manifest_st{};
+    assert(::stat(manifest.c_str(), &manifest_st) == 0);
+    std::optional<GroupMembers> members = other_group_members(manifest_st.st_gid);
+    const struct passwd* my_entry = ::getpwuid(::getuid());
+    bool private_group = my_entry && my_entry->pw_gid == manifest_st.st_gid && members &&
+                         members->group == my_entry->pw_name;
+    if (private_group && members->primary.empty() && members->supplementary.empty()) {
+        assert(load_manifest(manifest).project == "t");
+    } else {
+        assert(throws_with([&] { load_manifest(manifest); }, ("fix with: chmod g-w '" + manifest + "'").c_str()));
+        if (members && !members->primary.empty()) {
+            assert(throws_with([&] { load_manifest(manifest); }, (members->primary[0] + " (its primary group)").c_str()));
+        }
+        if (members && !members->supplementary.empty()) {
+            assert(throws_with([&] { load_manifest(manifest); }, ("sudo gpasswd -d " + members->supplementary[0]).c_str()));
+        }
+    }
+    assert(::chmod(manifest.c_str(), 0646) == 0);
+    assert(throws_with([&] { load_manifest(manifest); }, ("writable by everyone; fix with: chmod o-w '" + manifest + "'").c_str()));
     assert(::chmod(manifest.c_str(), 0644) == 0);
 
     assert(::chmod(dir.c_str(), 0757) == 0);
@@ -194,7 +215,7 @@ void test_manifest_trust() {
     write_manifest(child + "/.secretov.yaml", 0666);
     std::optional<std::string> found = find_manifest_upward(child);
     assert(found && *found == child + "/.secretov.yaml");
-    assert(throws_with([&] { load_manifest(*found); }, "writable by group or others"));
+    assert(throws_with([&] { load_manifest(*found); }, "writable by everyone"));
 
     // A symlink is judged by its target's directory too.
     std::string open_dir = g_dir + "/open";

@@ -4,6 +4,8 @@
 // dotenv parsing, and comment-preserving manifest edits. See DESIGN.md
 // "Scopes". File names live in paths.hpp.
 
+#include <sys/types.h>
+
 #include <iostream>
 #include <map>
 #include <optional>
@@ -40,9 +42,19 @@ std::string scope_prefix(const std::string& env, const std::string& project);
 // manifest.cpp) in both vars and env_var_name.
 Manifest parse_manifest(const std::string& text, const std::string& path_for_errors);
 
-// The only way a manifest file is read. Throws unless the file is ours and not
-// group/world-writable, and its directory (and a symlink target's directory)
-// is ours or root's and not group/world-writable.
+// Everyone in group gid other than us: accounts whose primary group it is, and
+// listed members. nullopt when gid has no group entry.
+struct GroupMembers {
+    std::string group;
+    std::vector<std::string> primary;
+    std::vector<std::string> supplementary;
+};
+std::optional<GroupMembers> other_group_members(gid_t gid);
+
+// The only way a manifest file is read. Throws unless the file is ours, and
+// its directory (and a symlink target's directory) is ours or root's, and none
+// is world-writable or group-writable by a group with anyone else in it. The
+// error names the chmod (or group change) that fixes it.
 std::string read_manifest_text(const std::string& path);
 // For a manifest about to be created: its directory passes read_manifest_text's
 // directory check, is a directory, and we can write to it.

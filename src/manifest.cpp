@@ -1,6 +1,8 @@
 #include "manifest.hpp"
 
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -10,9 +12,11 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 #include <yaml-cpp/yaml.h>
 
 #include "paths.hpp"
@@ -100,19 +104,73 @@ void require_manifest_env_name(const std::string& name, const std::string& path,
     }
 }
 
+std::string join(const std::vector<std::string>& parts, const std::string& separator) {
+    std::string joined;
+    for (const std::string& part : parts) {
+        if (!joined.empty()) joined += separator;
+        joined += part;
+    }
+    return joined;
+}
+
+struct SharedGroup {
+    std::string reason;
+    std::string regroup_fix;  // empty when only the chmod can fix it
+};
+
+// Why group write is unsafe for a file in group gid, with the commands that
+// would make the group ours alone; nullopt when nobody else is in it. Only our
+// user private group qualifies: the passwd scan cannot prove an arbitrary
+// group empty when an NSS backend hides accounts, but another account sharing
+// our private group is an anomaly the local files show (as devuser does here).
+std::optional<SharedGroup> shared_group_problem(gid_t gid) {
+    const struct passwd* my_entry = ::getpwuid(::getuid());
+    if (!my_entry || my_entry->pw_gid != gid) {
+        return SharedGroup{"writable by group " + std::to_string(gid) + ", which is not your private group", ""};
+    }
+    std::string my_name = my_entry->pw_name;
+    std::optional<GroupMembers> members = other_group_members(gid);
+    if (!members) {
+        return SharedGroup{"writable by group " + std::to_string(gid) + ", which has no group entry, so its members are unknown", ""};
+    }
+    if (members->group != my_name) {
+        return SharedGroup{"writable by group '" + members->group + "', which is not your private group (named " + my_name + ")", ""};
+    }
+    if (members->primary.empty() && members->supplementary.empty()) return std::nullopt;
+    std::vector<std::string> member_descriptions;
+    std::vector<std::string> regroup_commands;
+    for (const std::string& user : members->primary) {
+        member_descriptions.push_back(user + " (its primary group)");
+        regroup_commands.push_back("sudo userdel " + user + " or sudo usermod -g <another group> " + user);
+    }
+    for (const std::string& user : members->supplementary) {
+        member_descriptions.push_back(user);
+        regroup_commands.push_back("sudo gpasswd -d " + user + " " + members->group);
+    }
+    return SharedGroup{"writable by group '" + members->group + "', which also includes " + join(member_descriptions, ", "),
+                       "or make '" + members->group + "' yours alone: " + join(regroup_commands, "; ")};
+}
+
 // ssh StrictModes for manifests: anyone else who can write the file, or swap
 // it in its directory, could inject env vars and key: references into exec.
+// Group write is allowed when we are the group's only member (a user private
+// group, the umask 0002 convention).
 void require_trusted(const std::string& path, const struct stat& st, bool directory) {
-    const char* kind = directory ? "manifest directory" : "manifest";
+    std::string refusing = std::string("refusing ") + (directory ? "manifest directory" : "manifest") + " '" + path + "': ";
     uid_t me = ::getuid();
     if (st.st_uid != me && !(directory && st.st_uid == 0)) {
-        throw std::runtime_error(std::string("refusing ") + kind + " '" + path + "': owned by uid " +
-                                 std::to_string(st.st_uid) + ", not you (uid " + std::to_string(me) +
-                                 "); remove it or chown it to yourself");
+        throw std::runtime_error(refusing + "owned by uid " + std::to_string(st.st_uid) + ", not you (uid " +
+                                 std::to_string(me) + "); remove it or chown it to yourself");
     }
-    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-        throw std::runtime_error(std::string("refusing ") + kind + " '" + path +
-                                 "': writable by group or others; fix with: chmod g-w,o-w '" + path + "'");
+    std::optional<SharedGroup> group_problem;
+    if ((st.st_mode & S_IWGRP) != 0) group_problem = shared_group_problem(st.st_gid);
+    if ((st.st_mode & S_IWOTH) != 0) {
+        std::string chmod_flags = group_problem ? "g-w,o-w" : "o-w";
+        throw std::runtime_error(refusing + "writable by everyone; fix with: chmod " + chmod_flags + " '" + path + "'");
+    }
+    if (group_problem) {
+        std::string regroup = group_problem->regroup_fix.empty() ? "" : ", " + group_problem->regroup_fix;
+        throw std::runtime_error(refusing + group_problem->reason + "; fix with: chmod g-w '" + path + "'" + regroup);
     }
 }
 
@@ -368,6 +426,33 @@ void require_creatable_manifest_dir(const std::string& manifest_path) {
     if (::access(dir_path.c_str(), W_OK) != 0) {
         throw std::runtime_error("cannot create a manifest in '" + dir_path + "': " + std::strerror(errno));
     }
+}
+
+std::optional<GroupMembers> other_group_members(gid_t gid) {
+    uid_t me = ::getuid();
+    const struct passwd* my_entry = ::getpwuid(me);
+    std::string my_name = my_entry ? my_entry->pw_name : "";
+    const struct group* group_entry = ::getgrgid(gid);
+    if (!group_entry) return std::nullopt;
+    GroupMembers members{group_entry->gr_name, {}, {}};
+    for (char** member = group_entry->gr_mem; *member; ++member) {
+        if (my_name != *member) members.supplementary.emplace_back(*member);
+    }
+    // Primary members are not in gr_mem; find them by scanning passwd. An NSS
+    // backend with enumeration disabled (sssd, LDAP) hides its users here.
+    ::setpwent();
+    errno = 0;
+    while (const struct passwd* account = ::getpwent()) {
+        if (account->pw_gid == gid && account->pw_uid != me) members.primary.emplace_back(account->pw_name);
+        errno = 0;
+    }
+    int scan_errno = errno;
+    ::endpwent();
+    if (scan_errno != 0 && scan_errno != ENOENT) {
+        throw std::runtime_error(std::string("cannot list accounts to check group ") + members.group +
+                                 ": " + std::strerror(scan_errno) + "; fix with: chmod g-w on the manifest and its directory");
+    }
+    return members;
 }
 
 std::string read_manifest_text(const std::string& path) {
