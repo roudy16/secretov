@@ -398,8 +398,6 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         return false;
     };
 
-    auto is_folded = [&](const std::string& folder_id) { return filter.empty() && collapsed.count(folder_id) > 0; };
-
     // Unfolds every folder above `id` so its row is visible.
     auto expand_to = [&](const std::string& id) {
         for (std::size_t slash = id.find('/'); slash != std::string::npos && slash + 1 < id.size();
@@ -755,7 +753,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     // shows the full path.
     constexpr int kMinLabelColumns = 6;
     auto row_glyph = [&](const Row& row) {
-        return !row.dir ? (is_marked(row) ? "◆ " : "· ") : is_folded(row.id) ? "▸ " : "▾ ";
+        return !row.dir ? (is_marked(row) ? "◆ " : "· ") : is_folded(filter, collapsed, row.id) ? "▸ " : "▾ ";
     };
     auto row_indent = [&](int i, bool is_selected) {
         int indent = std::clamp(list_text_width - 4 - kMinLabelColumns, 0, 2 * row_at(i).depth);
@@ -1381,7 +1379,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 return true;
             }
             if (event == Event::ArrowLeft || event == Event::Character('h')) {
-                bool open_folder = !rows.empty() && row_at(selected).dir && !is_folded(row_at(selected).id);
+                bool open_folder =
+                    !rows.empty() && row_at(selected).dir && !is_folded(filter, collapsed, row_at(selected).id);
                 if (open_folder && filter.empty()) {
                     fold(false);
                 } else {
@@ -1393,7 +1392,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 if (rows.empty() || !row_at(selected).dir) return true;
                 bool has_child_row = selected + 1 < static_cast<int>(rows.size()) &&
                                      row_at(selected + 1).depth > row_at(selected).depth;
-                if (is_folded(row_at(selected).id)) {
+                if (is_folded(filter, collapsed, row_at(selected).id)) {
                     fold(true);
                 } else if (has_child_row) {
                     ++selected;

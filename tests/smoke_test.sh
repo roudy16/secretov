@@ -284,13 +284,20 @@ OUT="$(cd "$PROJ" && SECRETOV_ENV=dev "$BIN" exec -- sh -c 'printf %s "$NEW_ONE"
 "$BIN" list -p demo -e dev | grep -qx "dev/demo/API_KEY" || fail "scoped list"
 if "$BIN" list -p demo -e dev | grep -qx "VIA_STDIN"; then fail "scoped list leaked unscoped key"; fi
 mkdir -p "$XDG_CONFIG_HOME/secretov"
-printf 'projects:\n  demo:\n    root: "%s"\n' "$PROJ" > "$XDG_CONFIG_HOME/secretov/projects.yaml"
+printf 'projects:\n  demo:\n    root: "%s"\n  misnamed:\n    root: "%s"\n' "$PROJ" "$PROJ" \
+    > "$XDG_CONFIG_HOME/secretov/projects.yaml"
 OUT="$(cd / && "$BIN" exec -p demo -e dev -- sh -c 'printf %s "$DB_URL"')"
 [ "$OUT" = "postgres://y" ] || fail "registry exec got '$OUT'"
 if ( cd / && "$BIN" exec -p nope -e dev -- true 2>/dev/null ); then fail "unregistered -p should fail"; fi
 # raw --secret still works anywhere, without a manifest
 OUT="$(cd / && "$BIN" exec --secret VIA_STDIN=RAW -- sh -c 'printf %s "$RAW"')"
 [ "$OUT" = "s3cr3t-value" ] || fail "raw exec got '$OUT'"
+# a key the store lacks is reported missing, not as a daemon error
+ERR="$("$BIN" exec --secret NO_SUCH_KEY=X -- true 2>&1)" && fail "exec with a missing key succeeded"
+echo "$ERR" | grep -q "missing secrets" || fail "exec missing-key message: $ERR"
+# a registry entry whose manifest names another project is refused
+ERR="$(cd / && "$BIN" list -p misnamed -e dev 2>&1)" && fail "registry/manifest project mismatch accepted"
+echo "$ERR" | grep -q "names project 'demo' but registry entry is 'misnamed'" || fail "mismatch message: $ERR"
 
 # 5e. set -p/-e resolves env/project/NAME (same helper as list/exec/import).
 printf '%s' "postgres://z" | ( cd "$PROJ" && "$BIN" set DB_URL -e dev ) || fail "scoped set (manifest)"

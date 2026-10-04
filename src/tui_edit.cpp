@@ -263,13 +263,16 @@ std::string fit_hints(const std::vector<std::string>& hints, int width) {
     return joined();
 }
 
+bool is_folded(std::string_view filter, const std::set<std::string>& collapsed, const std::string& folder_id) {
+    return filter.empty() && collapsed.count(folder_id) > 0;
+}
+
 // Keys are sorted, so a folder's members are contiguous and its row is
 // emitted the first time the prefix appears.
 void build_rows(const std::vector<std::string>& keys, std::string_view filter, const std::set<std::string>& collapsed,
                 std::vector<Row>& rows, std::vector<std::string>& labels) {
     rows.clear();
     labels.clear();
-    auto is_folded = [&](const std::string& folder_id) { return filter.empty() && collapsed.count(folder_id) > 0; };
     std::vector<std::string> branch;  // folder ids open along the current key
     for (const std::string& key : keys) {
         if (!contains_ignore_case(key, filter)) continue;
@@ -281,7 +284,7 @@ void build_rows(const std::vector<std::string>& keys, std::string_view filter, c
         while (shared < folders.size() && shared < branch.size() && branch[shared] == folders[shared]) ++shared;
         branch.resize(shared);
         bool hidden = false;
-        for (const std::string& folder : branch) hidden = hidden || is_folded(folder);
+        for (const std::string& folder : branch) hidden = hidden || is_folded(filter, collapsed, folder);
         for (std::size_t depth = shared; depth < folders.size(); ++depth) {
             branch.push_back(folders[depth]);
             if (!hidden) {
@@ -289,7 +292,7 @@ void build_rows(const std::vector<std::string>& keys, std::string_view filter, c
                 rows.push_back({folders[depth], true, static_cast<int>(depth)});
                 labels.push_back(printable(std::string_view(folders[depth]).substr(name_start)));
             }
-            hidden = hidden || is_folded(folders[depth]);
+            hidden = hidden || is_folded(filter, collapsed, folders[depth]);
         }
         if (!hidden) {
             std::size_t name_start = folders.empty() ? 0 : folders.back().size();

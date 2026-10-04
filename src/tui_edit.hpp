@@ -89,6 +89,9 @@ struct Row {
     int depth;
 };
 
+// Whether folder `folder_id` is folded: collapsed, and no filter is set.
+bool is_folded(std::string_view filter, const std::set<std::string>& collapsed, const std::string& folder_id);
+
 // The visible tree rows for sorted `keys`: those containing `filter` (any
 // case), under folders not in `collapsed` (ignored while a filter is set).
 // `labels` gets each row's last path segment, printable, parallel to `rows`;

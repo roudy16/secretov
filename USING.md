@@ -360,6 +360,7 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `import: VAR: value too large ...; nothing imported` | A `.env` value over 1 MiB once JSON-escaped (a control character counts 6 bytes); every value is checked before anything is stored | Remove or shrink it, then rerun |
 | `import: VAR: [json.exception.type_error.316] ...; nothing imported` | A `.env` value that is not valid UTF-8 | Fix the value's encoding, then rerun |
 | `project 'X' is not in .../projects.yaml` | Step 3 skipped | Add the registry entry, or run from inside the project |
+| `manifest .../.secretov.yaml names project 'X' but registry entry is 'Y'` | The registry's `Y` points at a root whose manifest says `project: X` | Rename the registry entry to `X`, or fix its `root` |
 | `no .secretov.yaml found from the current directory upward` | Not in the project, no `-p` | `cd` to the project, or pass `-p NAME` |
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |
 | `environment 'X' not found in <manifest>` | No such env block | Import that env, or fix the `-e` value |
