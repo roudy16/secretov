@@ -16,6 +16,7 @@
 #include <map>
 #include <optional>
 #include <ostream>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -103,15 +104,17 @@ bool is_denied_env_name(const std::string& name) {
            upper.compare(upper.size() - kProxySuffix.size(), kProxySuffix.size(), kProxySuffix) == 0;
 }
 
+std::runtime_error manifest_error(const std::string& path, const std::string& message) {
+    return std::runtime_error("manifest '" + path + "': " + message);
+}
+
 // `what` names the offending entry for the error, e.g. "var 'X' (env dev)".
 void require_manifest_env_name(const std::string& name, const std::string& path, const std::string& what) {
-    if (!is_identifier(name)) {
-        throw std::runtime_error("manifest '" + path + "': " + what + " is not a valid environment variable name");
-    }
+    if (!is_identifier(name)) throw manifest_error(path, what + " is not a valid environment variable name");
     if (is_denied_env_name(name)) {
-        throw std::runtime_error("manifest '" + path + "': " + what +
-                                 " cannot be set from a manifest (it can load code into the child "
-                                 "process, redirect its traffic, or steer secretov)");
+        throw manifest_error(path, what +
+                                       " cannot be set from a manifest (it can load code into the child "
+                                       "process, redirect its traffic, or steer secretov)");
     }
 }
 
@@ -199,13 +202,15 @@ void require_trusted(const std::string& path, const struct stat& st, bool direct
     }
 }
 
-void require_trusted_dir(const std::filesystem::path& dir) {
+std::string require_trusted_dir(const std::filesystem::path& dir) {
     std::string dir_path = dir.empty() ? "." : dir.string();
     struct stat st{};
     if (::stat(dir_path.c_str(), &st) != 0) {
         throw std::runtime_error("stat '" + dir_path + "': " + std::strerror(errno));
     }
+    if (!S_ISDIR(st.st_mode)) throw std::runtime_error("manifest directory '" + dir_path + "' is not a directory");
     require_trusted(dir_path, st, true);
+    return dir_path;
 }
 
 void require_segment(const std::string& s, const char* what) {
@@ -240,23 +245,13 @@ std::string expand_vars(const std::string& s) {
 
 std::vector<std::string> split_lines(const std::string& text) {
     std::vector<std::string> lines;
-    std::size_t start = 0;
-    while (start < text.size()) {
-        std::size_t nl = text.find('\n', start);
-        if (nl == std::string::npos) {
-            lines.push_back(text.substr(start));
-            break;
-        }
-        lines.push_back(text.substr(start, nl - start));
-        start = nl + 1;
-    }
+    std::istringstream stream(text);
+    for (std::string line; std::getline(stream, line);) lines.push_back(line);
     return lines;
 }
 
 int indent_of(const std::string& line) {
-    int n = 0;
-    while (n < static_cast<int>(line.size()) && line[n] == ' ') ++n;
-    return n;
+    return static_cast<int>(std::min(line.find_first_not_of(' '), line.size()));
 }
 
 bool blank_or_comment(const std::string& line) {
@@ -320,6 +315,26 @@ std::size_t insert_point(const std::vector<std::string>& lines, std::size_t begi
 
 std::string spaces(int n) { return std::string(static_cast<std::size_t>(n), ' '); }
 
+struct Block {
+    std::size_t key_line;
+    std::size_t end;   // exclusive
+    int entry_indent;  // of the block's children
+};
+
+// The `key:` block at `indent` within [begin, end), inserted after the range's
+// last content line when missing.
+Block ensure_block(std::vector<std::string>& lines, std::size_t begin, std::size_t end, int indent, int step,
+                   const std::string& key) {
+    std::size_t key_line = find_child(lines, begin, end, indent, key);
+    if (key_line == std::string::npos) {
+        key_line = insert_point(lines, begin, end, indent);
+        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(key_line), spaces(indent) + key + ":");
+    }
+    std::size_t block_end_line = block_end(lines, key_line, indent);
+    int entry_indent = child_indent(lines, key_line + 1, block_end_line);
+    return {key_line, block_end_line, entry_indent < 0 ? indent + step : entry_indent};
+}
+
 }  // namespace
 
 std::string scoped_key(const std::string& env, const std::string& project, const std::string& name) {
@@ -335,32 +350,76 @@ std::string scope_prefix(const std::string& env, const std::string& project) {
     return env + "/" + project + "/";
 }
 
-Manifest parse_manifest(const std::string& text, const std::string& path) {
-    YAML::Node doc;
-    try {
-        doc = YAML::Load(text);
-    } catch (const YAML::Exception& e) {
-        throw std::runtime_error("manifest '" + path + "': " + e.what());
-    }
-    if (!doc.IsMap()) throw std::runtime_error("manifest '" + path + "' is not a mapping");
-    if (!doc["name"] || !doc["name"].IsScalar()) {
-        throw std::runtime_error("manifest '" + path + "' missing 'name' field");
-    }
+namespace {
 
-    Manifest m;
-    m.path = path;
-    m.project = doc["name"].as<std::string>();
-    require_segment(m.project, "project");
-    if (doc["default_env"]) {
-        if (!doc["default_env"].IsScalar()) {
-            throw std::runtime_error("manifest '" + path + "': default_env must be a string");
+std::vector<SecretEntry> parse_env_secrets(YAML::Node secrets, const std::string& path, const std::string& env,
+                                           const std::string& project) {
+    std::vector<SecretEntry> entries;
+    if (!secrets || secrets.IsNull()) return entries;
+    if (!secrets.IsMap()) throw manifest_error(path, "env '" + env + "' secrets must be a mapping");
+    for (const auto& secret_pair : secrets) {
+        SecretEntry entry;
+        entry.name = secret_pair.first.as<std::string>();
+        std::string described = "secret '" + entry.name + "' (env " + env + ")";
+        YAML::Node body = secret_pair.second;
+        if (!body.IsMap() || !body["env_var_name"] || !body["env_var_name"].IsScalar()) {
+            throw manifest_error(path, described + " missing env_var_name");
         }
-        m.default_env = doc["default_env"].as<std::string>();
+        entry.env_var = body["env_var_name"].as<std::string>();
+        require_manifest_env_name(entry.env_var, path, described + " env_var_name '" + entry.env_var + "'");
+        if (body["key"]) {
+            if (!body["key"].IsScalar()) throw manifest_error(path, described + " key must be a string");
+            entry.key = body["key"].as<std::string>();
+            if (entry.key.empty()) throw manifest_error(path, "secret '" + entry.name + "' has an empty key");
+        } else {
+            entry.key = scoped_key(env, project, entry.name);
+        }
+        entries.push_back(std::move(entry));
     }
+    return entries;
+}
 
-    YAML::Node envs = doc["env"];
-    if (envs && !envs.IsNull()) {
-        if (!envs.IsMap()) throw std::runtime_error("manifest '" + path + "': 'env' must be a mapping");
+// Plaintext, non-secret config. The YAML key is the variable name; the value
+// is used verbatim, never fetched.
+KeyValues parse_env_vars(YAML::Node vars, const std::string& path, const std::string& env) {
+    KeyValues plain;
+    if (!vars || vars.IsNull()) return plain;
+    if (!vars.IsMap()) throw manifest_error(path, "env '" + env + "' vars must be a mapping");
+    for (const auto& var_pair : vars) {
+        std::string var_name = var_pair.first.as<std::string>();
+        require_manifest_env_name(var_name, path, "var '" + var_name + "' (env " + env + ")");
+        if (!var_pair.second.IsScalar()) {
+            throw manifest_error(path, "var '" + var_name + "' (env " + env + ") must be a scalar value");
+        }
+        plain.emplace_back(var_name, var_pair.second.as<std::string>());
+    }
+    return plain;
+}
+
+}  // namespace
+
+Manifest parse_manifest(const std::string& text, const std::string& path) {
+    // yaml-cpp throws from node access too (a non-scalar key, a map read as a
+    // string), so the whole walk is covered to keep the manifest path.
+    try {
+        YAML::Node doc = YAML::Load(text);
+        if (!doc.IsMap()) throw std::runtime_error("manifest '" + path + "' is not a mapping");
+        if (!doc["name"] || !doc["name"].IsScalar()) {
+            throw std::runtime_error("manifest '" + path + "' missing 'name' field");
+        }
+
+        Manifest m;
+        m.path = path;
+        m.project = doc["name"].as<std::string>();
+        require_segment(m.project, "project");
+        if (doc["default_env"]) {
+            if (!doc["default_env"].IsScalar()) throw manifest_error(path, "default_env must be a string");
+            m.default_env = doc["default_env"].as<std::string>();
+        }
+
+        YAML::Node envs = doc["env"];
+        if (!envs || envs.IsNull()) return m;
+        if (!envs.IsMap()) throw manifest_error(path, "'env' must be a mapping");
         for (const auto& env_pair : envs) {
             std::string env = env_pair.first.as<std::string>();
             require_segment(env, "environment");
@@ -368,68 +427,15 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
             KeyValues plain;
             YAML::Node env_node = env_pair.second;
             if (env_node && !env_node.IsNull()) {
-                if (!env_node.IsMap()) {
-                    throw std::runtime_error("manifest '" + path + "': env '" + env + "' must be a mapping");
-                }
-                YAML::Node secrets = env_node["secrets"];
-                if (secrets && !secrets.IsNull()) {
-                    if (!secrets.IsMap()) {
-                        throw std::runtime_error("manifest '" + path + "': env '" + env +
-                                                 "' secrets must be a mapping");
-                    }
-                    for (const auto& s : secrets) {
-                        SecretEntry e;
-                        e.name = s.first.as<std::string>();
-                        YAML::Node body = s.second;
-                        if (!body.IsMap() || !body["env_var_name"] || !body["env_var_name"].IsScalar()) {
-                            throw std::runtime_error("manifest '" + path + "': secret '" + e.name +
-                                                     "' (env " + env + ") missing env_var_name");
-                        }
-                        e.env_var = body["env_var_name"].as<std::string>();
-                        require_manifest_env_name(e.env_var, path,
-                                                  "secret '" + e.name + "' (env " + env + ") env_var_name '" +
-                                                      e.env_var + "'");
-                        if (body["key"]) {
-                            e.key = body["key"].as<std::string>();
-                            if (e.key.empty()) {
-                                throw std::runtime_error("manifest '" + path + "': secret '" + e.name +
-                                                         "' has an empty key");
-                            }
-                        } else {
-                            e.key = scoped_key(env, m.project, e.name);
-                        }
-                        entries.push_back(std::move(e));
-                    }
-                }
-
-                // Plaintext, non-secret config. The YAML key is the variable
-                // name; the value is used verbatim, never fetched.
-                YAML::Node vars = env_node["vars"];
-                if (vars && !vars.IsNull()) {
-                    if (!vars.IsMap()) {
-                        throw std::runtime_error("manifest '" + path + "': env '" + env +
-                                                 "' vars must be a mapping");
-                    }
-                    for (const auto& v : vars) {
-                        std::string var_name = v.first.as<std::string>();
-                        require_manifest_env_name(var_name, path, "var '" + var_name + "' (env " + env + ")");
-                        if (!v.second.IsScalar()) {
-                            throw std::runtime_error("manifest '" + path + "': var '" + var_name +
-                                                     "' (env " + env +
-                                                     ") must be a scalar value");
-                        }
-                        plain.emplace_back(var_name, v.second.as<std::string>());
-                    }
-                }
-
+                if (!env_node.IsMap()) throw manifest_error(path, "env '" + env + "' must be a mapping");
+                entries = parse_env_secrets(env_node["secrets"], path, env, m.project);
+                plain = parse_env_vars(env_node["vars"], path, env);
                 // A variable defined twice has no sane precedence; refuse it
                 // here so every command that loads the manifest fails alike.
                 for (const auto& [var_name, value] : plain) {
-                    for (const SecretEntry& e : entries) {
-                        if (e.env_var == var_name) {
-                            throw std::runtime_error("manifest '" + path + "': '" + var_name +
-                                                     "' (env " + env +
-                                                     ") is set in both vars and secrets");
+                    for (const SecretEntry& entry : entries) {
+                        if (entry.env_var == var_name) {
+                            throw manifest_error(path, "'" + var_name + "' (env " + env + ") is set in both vars and secrets");
                         }
                     }
                 }
@@ -437,17 +443,14 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
             m.envs[env] = std::move(entries);
             m.vars[env] = std::move(plain);
         }
+        return m;
+    } catch (const YAML::Exception& e) {
+        throw manifest_error(path, e.what());
     }
-    return m;
 }
 
 void require_creatable_manifest_dir(const std::string& manifest_path) {
-    std::filesystem::path dir = std::filesystem::path(manifest_path).parent_path();
-    std::string dir_path = dir.empty() ? "." : dir.string();
-    struct stat st{};
-    if (::stat(dir_path.c_str(), &st) != 0) throw std::runtime_error("stat '" + dir_path + "': " + std::strerror(errno));
-    if (!S_ISDIR(st.st_mode)) throw std::runtime_error("manifest directory '" + dir_path + "' is not a directory");
-    require_trusted(dir_path, st, true);
+    std::string dir_path = require_trusted_dir(std::filesystem::path(manifest_path).parent_path());
     if (::access(dir_path.c_str(), W_OK) != 0) {
         throw std::runtime_error("cannot create a manifest in '" + dir_path + "': " + std::strerror(errno));
     }
@@ -585,18 +588,23 @@ std::optional<std::string> find_manifest_upward(const std::string& start_dir) {
 std::optional<std::string> registry_project_root(const std::string& registry_path,
                                                  const std::string& name) {
     if (::access(registry_path.c_str(), F_OK) != 0) return std::nullopt;
-    YAML::Node doc;
+    std::string root_spec;
     try {
-        doc = YAML::LoadFile(registry_path);
+        YAML::Node doc = YAML::LoadFile(registry_path);
+        YAML::Node projects = doc["projects"];
+        if (!projects || projects.IsNull()) return std::nullopt;
+        // A non-const lookup would quietly turn a sequence into a map.
+        if (!projects.IsMap()) throw std::runtime_error("registry '" + registry_path + "': 'projects' must be a mapping");
+        YAML::Node project = projects[name];
+        if (!project || project.IsNull()) return std::nullopt;
+        if (!project.IsMap() || !project["root"] || !project["root"].IsScalar()) {
+            throw std::runtime_error("registry '" + registry_path + "': project '" + name + "' has no 'root'");
+        }
+        root_spec = project["root"].as<std::string>();
     } catch (const YAML::Exception& e) {
         throw std::runtime_error("registry '" + registry_path + "': " + e.what());
     }
-    YAML::Node project = doc["projects"] ? doc["projects"][name] : YAML::Node();
-    if (!project || project.IsNull()) return std::nullopt;
-    if (!project["root"] || !project["root"].IsScalar()) {
-        throw std::runtime_error("registry '" + registry_path + "': project '" + name + "' has no 'root'");
-    }
-    std::string root = expand_vars(project["root"].as<std::string>());
+    std::string root = expand_vars(root_spec);
     if (::access(root.c_str(), F_OK) != 0) {
         throw std::runtime_error("project root not found: " + root);
     }
@@ -632,10 +640,12 @@ KeyValues parse_dotenv(const std::string& text, std::ostream& warnings) {
 
         std::string raw = line.substr(eq + 1);
         std::size_t vstart = raw.find_first_not_of(" \t");
-        std::string value;
         if (vstart == std::string::npos) {
-            value = "";
-        } else if (raw[vstart] == '"' || raw[vstart] == '\'') {
+            out.emplace_back(key, "");
+            continue;
+        }
+        std::string value;
+        if (raw[vstart] == '"' || raw[vstart] == '\'') {
             char quote = raw[vstart];
             std::size_t i = vstart + 1;
             bool closed = false;
@@ -695,9 +705,9 @@ std::string manifest_with_entries(const std::string& text, const std::string& pr
 
     std::vector<std::string> lines = split_lines(text);
     int step = 2;
-    for (const auto& l : lines) {
-        if (!blank_or_comment(l) && indent_of(l) > 0) {
-            step = indent_of(l);
+    for (const std::string& line : lines) {
+        if (!blank_or_comment(line) && indent_of(line) > 0) {
+            step = indent_of(line);
             break;
         }
     }
@@ -705,52 +715,33 @@ std::string manifest_with_entries(const std::string& text, const std::string& pr
         lines = {"version: \"1\"", "name: " + project, "env:"};
     }
 
-    std::size_t env_line = find_child(lines, 0, lines.size(), 0, "env");
-    if (env_line == std::string::npos) {
-        lines.push_back("env:");
-        env_line = lines.size() - 1;
-    }
-    std::size_t env_end = block_end(lines, env_line, 0);
-    int ci = child_indent(lines, env_line + 1, env_end);
-    if (ci < 0) ci = step;
-
-    std::size_t e_line = find_child(lines, env_line + 1, env_end, ci, env);
-    if (e_line == std::string::npos) {
-        e_line = insert_point(lines, env_line + 1, env_end, ci);
-        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(e_line), spaces(ci) + env + ":");
-    }
-    std::size_t e_end = block_end(lines, e_line, ci);
-    int si = child_indent(lines, e_line + 1, e_end);
-    if (si < 0) si = ci + step;
-
-    std::size_t s_line = find_child(lines, e_line + 1, e_end, si, "secrets");
-    if (s_line == std::string::npos) {
-        s_line = insert_point(lines, e_line + 1, e_end, si);
-        lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(s_line), spaces(si) + "secrets:");
-    }
-    std::size_t s_end = block_end(lines, s_line, si);
-    int ni = child_indent(lines, s_line + 1, s_end);
-    if (ni < 0) ni = si + step;
-    int vi = ni + step;
-    for (std::size_t i = s_line + 1; i < s_end; ++i) {
-        if (!blank_or_comment(lines[i]) && indent_of(lines[i]) > ni) {
-            vi = indent_of(lines[i]);
+    Block env_root = ensure_block(lines, 0, lines.size(), 0, step, "env");
+    Block env_block = ensure_block(lines, env_root.key_line + 1, env_root.end, env_root.entry_indent, step, env);
+    Block secrets_block =
+        ensure_block(lines, env_block.key_line + 1, env_block.end, env_block.entry_indent, step, "secrets");
+    int name_indent = secrets_block.entry_indent;
+    int value_indent = name_indent + step;
+    for (std::size_t i = secrets_block.key_line + 1; i < secrets_block.end; ++i) {
+        if (!blank_or_comment(lines[i]) && indent_of(lines[i]) > name_indent) {
+            value_indent = indent_of(lines[i]);
             break;
         }
     }
 
     std::vector<std::string> added;
     for (const auto& [name, var] : name_to_var) {
-        if (find_child(lines, s_line + 1, s_end, ni, name) != std::string::npos) continue;
-        added.push_back(spaces(ni) + name + ":");
-        added.push_back(spaces(vi) + "env_var_name: " + var);
+        if (find_child(lines, secrets_block.key_line + 1, secrets_block.end, name_indent, name) != std::string::npos) {
+            continue;
+        }
+        added.push_back(spaces(name_indent) + name + ":");
+        added.push_back(spaces(value_indent) + "env_var_name: " + var);
     }
-    std::size_t at = insert_point(lines, s_line + 1, s_end, ni);
+    std::size_t at = insert_point(lines, secrets_block.key_line + 1, secrets_block.end, name_indent);
     lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(at), added.begin(), added.end());
 
     std::string out;
-    for (const auto& l : lines) {
-        out += l;
+    for (const std::string& line : lines) {
+        out += line;
         out.push_back('\n');
     }
 

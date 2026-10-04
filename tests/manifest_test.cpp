@@ -104,6 +104,13 @@ void test_parse_manifest() {
         [] { parse_manifest("name: x\nenv:\n  dev:\n    secrets:\n      a:\n        env_var_name: 1BAD\n", "t"); },
         "not a valid environment variable"));
     assert(throws_with([] { parse_manifest("name: x\nenv: [a]\n", "t"); }, "'env' must be a mapping"));
+    // yaml-cpp errors from node access keep the manifest path.
+    assert(throws_with([] { parse_manifest("name: x\nenv:\n  [a]: {}\n", "t"); }, "manifest 't': "));
+    assert(throws_with([] { parse_manifest("name: x\nenv:\n  dev:\n    vars:\n      [A]: b\n", "t"); },
+                       "manifest 't': "));
+    assert(throws_with(
+        [] { parse_manifest("name: x\nenv:\n  dev:\n    secrets:\n      a:\n        env_var_name: A\n        key: [k]\n", "t"); },
+        "secret 'a' (env dev) key must be a string"));
 }
 
 void test_insert_preserves_text() {
@@ -150,19 +157,32 @@ void test_insert_fresh_and_four_space() {
     std::string bare = "name: p\n";
     assert(manifest_with_entries(bare, "p", "dev", {{"A", "A"}}) ==
            "name: p\nenv:\n  dev:\n    secrets:\n      A:\n        env_var_name: A\n");
+    // Trailing blank lines stay at the end, below the appended env block.
+    assert(manifest_with_entries("name: p\n\n\n", "p", "dev", {{"A", "A"}}) ==
+           "name: p\nenv:\n  dev:\n    secrets:\n      A:\n        env_var_name: A\n\n\n");
+    // split_lines keeps a missing final newline and interior blank lines.
+    assert(manifest_with_entries("name: p\n\n# tail", "p", "dev", {{"A", "A"}}) ==
+           "name: p\n\n# tail\nenv:\n  dev:\n    secrets:\n      A:\n        env_var_name: A\n");
 }
 
 void test_registry() {
     std::string path = g_dir + "/projects.yaml";
     {
         std::ofstream f(path);
-        f << "projects:\n  demo:\n    root: \"${HOME}\"\n  broken:\n    root: /nonexistent/xyz\n";
+        f << "projects:\n  demo:\n    root: \"${HOME}\"\n  broken:\n    root: /nonexistent/xyz\n  flat: x\n";
     }
     std::optional<std::string> root = registry_project_root(path, "demo");
     assert(root && *root == std::getenv("HOME"));
     assert(!registry_project_root(path, "nope"));
     assert(!registry_project_root(g_dir + "/missing.yaml", "demo"));
     assert(throws_with([&] { registry_project_root(path, "broken"); }, "project root not found"));
+    assert(throws_with([&] { registry_project_root(path, "flat"); }, "project 'flat' has no 'root'"));
+    std::string listed = g_dir + "/listed.yaml";
+    { std::ofstream f(listed); f << "projects: [demo]\n"; }
+    assert(throws_with([&] { registry_project_root(listed, "demo"); }, "'projects' must be a mapping"));
+    std::string scalar = g_dir + "/scalar.yaml";
+    { std::ofstream f(scalar); f << "just text\n"; }
+    assert(throws_with([&] { registry_project_root(scalar, "demo"); }, ("registry '" + scalar + "': ").c_str()));
 }
 
 void test_find_manifest_upward() {
