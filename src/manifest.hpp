@@ -33,6 +33,8 @@ struct Manifest {
     std::map<std::string, KeyValues> vars;
 };
 
+std::string join(const std::vector<std::string>& parts, const std::string& separator);
+
 // "env/project/name". Throws if any segment is empty or contains '/'.
 std::string scoped_key(const std::string& env, const std::string& project, const std::string& name);
 // "env/project/" — the getprefix argument for a scope.

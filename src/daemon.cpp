@@ -3,7 +3,6 @@
 #include <poll.h>
 #include <signal.h>
 #include <sodium.h>
-#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -39,7 +38,16 @@ void on_signal(int) {
     ::_exit(0);
 }
 
-void scrub(std::string& s) { sodium_memzero(s.data(), s.size()); }
+class WipeOnExit {
+public:
+    explicit WipeOnExit(std::string& text) : text_(text) {}
+    ~WipeOnExit() { wipe(text_); }
+    WipeOnExit(const WipeOnExit&) = delete;
+    WipeOnExit& operator=(const WipeOnExit&) = delete;
+
+private:
+    std::string& text_;
+};
 
 bool token_matches(const std::string& expected, const std::string& got) {
     if (expected.size() != got.size()) return false;
@@ -93,7 +101,7 @@ void serve_connection(Connection& conn, Store& store, const std::string& expecte
         // passphrase/value strings and frees them unscrubbed; scrubbing those
         // needs a custom allocator or a hand-rolled parser.
         auto req = parse_request(*line);
-        scrub(*line);
+        wipe(*line);
         if (!req) {
             conn.write_line(error_response("malformed request"));
             continue;
@@ -109,9 +117,9 @@ void serve_connection(Connection& conn, Store& store, const std::string& expecte
                 response = error_response(e.what());
             }
         }
-        scrub(req->old_pass);
-        scrub(req->new_pass);
-        scrub(req->value);
+        wipe(req->old_pass);
+        wipe(req->new_pass);
+        wipe(req->value);
         if (!conn.write_line(response)) {
             return;  // peer went away mid-write; drop the connection
         }
@@ -121,14 +129,11 @@ void serve_connection(Connection& conn, Store& store, const std::string& expecte
 }  // namespace
 
 int run_daemon() {
-    // A secrets daemon must never be dumpable: a core would spill the key/passphrase.
+    // main() already cleared PR_SET_DUMPABLE; a zero core limit also covers
+    // a dump requested after something re-enables it.
     struct rlimit no_core{0, 0};
     if (::setrlimit(RLIMIT_CORE, &no_core) != 0) {
         throw std::runtime_error("setrlimit(RLIMIT_CORE) failed: " +
-                                 std::string(std::strerror(errno)));
-    }
-    if (::prctl(PR_SET_DUMPABLE, 0) != 0) {
-        throw std::runtime_error("prctl(PR_SET_DUMPABLE) failed: " +
                                  std::string(std::strerror(errno)));
     }
 
@@ -137,26 +142,19 @@ int run_daemon() {
     // Fail before the passphrase prompt (and any auto-rotate, which would
     // re-key the store under the running daemon). Listener re-checks at bind.
     if (connect_unix(paths.socket)) {
-        std::cerr << "secretov: daemon already running at " << paths.socket << "\n";
-        return 1;
+        throw std::runtime_error("daemon already running at " + paths.socket);
     }
 
-    std::string passphrase;
-    try {
-        passphrase = read_passphrase("Passphrase: ");
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
-    }
+    std::string passphrase = read_passphrase("Passphrase: ");
+    WipeOnExit wipe_passphrase_on_exit(passphrase);
 
     std::uint64_t now = static_cast<std::uint64_t>(std::time(nullptr));
     Store store = [&] {
         try {
             return Store::open(paths.store, passphrase);
         } catch (const std::exception& e) {
-            std::cerr << "secretov: cannot open store: " << e.what() << "\n"
-                      << "  (run 'secretov init' first, or check your passphrase)\n";
-            std::exit(1);
+            throw std::runtime_error(std::string("cannot open store: ") + e.what() +
+                                     "\n  (run 'secretov init' first, or check your passphrase)");
         }
     }();
 
@@ -168,36 +166,28 @@ int run_daemon() {
             std::cerr << "secretov: key older than " << kRotateAfterDays
                       << " days; rotated on unlock\n";
         } catch (const std::exception& e) {
-            std::cerr << "secretov: auto-rotation failed: " << e.what() << "\n";
-            return 1;
+            throw std::runtime_error(std::string("auto-rotation failed: ") + e.what());
         }
     }
 
     // The store retains only the data key from here on; the passphrase and
     // the wrapping key derived from it are never held past unlock.
-    sodium_memzero(passphrase.data(), passphrase.size());
-    passphrase.clear();
+    wipe(passphrase);
 
     std::string expected_token;
     try {
         expected_token = rstrip(read_file_string(paths.token));
     } catch (const std::exception& e) {
-        std::cerr << "secretov: cannot read token file '" << paths.token << "': " << e.what()
-                  << "\n  (run 'secretov init' first)\n";
-        return 1;
+        throw std::runtime_error("cannot read token file '" + paths.token + "': " + e.what() +
+                                 "\n  (run 'secretov init' first)");
     }
     if (expected_token.empty()) {
-        std::cerr << "secretov: token file '" << paths.token << "' is empty\n";
-        return 1;
+        throw std::runtime_error("token file '" + paths.token + "' is empty");
     }
-
-    if (paths.socket.size() >= sizeof(g_socket_path)) {
-        std::cerr << "secretov: socket path too long: " << paths.socket << "\n";
-        return 1;
-    }
-    std::strncpy(g_socket_path, paths.socket.c_str(), sizeof(g_socket_path) - 1);
 
     Listener listener(paths.socket);
+    // Listener refuses a path longer than sun_path, so it fits.
+    std::strncpy(g_socket_path, paths.socket.c_str(), sizeof(g_socket_path) - 1);
     g_socket_dev = listener.bound_dev();
     g_socket_ino = listener.bound_ino();
 

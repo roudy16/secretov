@@ -162,6 +162,14 @@ inline void write_file_atomic(const std::string& path, const std::string& conten
     if (dir_fd >= 0) ::close(dir_fd);
 }
 
+// Zeroes the whole allocation, not just size(): erase/backspace and
+// shrinking leave stale bytes in the capacity tail.
+inline void wipe(std::string& text) {
+    text.resize(text.capacity());
+    sodium_memzero(text.data(), text.size());
+    text.clear();
+}
+
 // Read one secret line from stdin. On a tty: prompt on stderr with echo off
 // (restored after); refuse (discarding it) any input queued past the line, and
 // a line the terminal may have truncated.
@@ -243,7 +251,7 @@ inline std::string read_secret_line(const std::string& prompt) {
     if (on_tty) std::cerr << "\n";
     const bool tty_truncated = on_tty && line.size() >= kMaxTtyLineBytes;
     if (read_errno != 0 || too_long || tty_input_left || tty_truncated) {
-        sodium_memzero(line.data(), line.size());
+        wipe(line);
         if (too_long) {
             throw std::runtime_error("input line longer than " +
                                      std::to_string(kMaxSecretLineBytes) + " bytes");

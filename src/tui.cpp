@@ -58,13 +58,6 @@ namespace {
 
 using nlohmann::json;
 
-// Wipes past size() too: erase/backspace leave old bytes in the capacity tail.
-void zero(std::string& s) {
-    s.resize(s.capacity());
-    sodium_memzero(s.data(), s.size());
-    s.clear();
-}
-
 // ponytail: values longer than this reallocate and leave an unzeroed copy behind.
 constexpr std::size_t kSecretReserve = 4096;
 
@@ -92,7 +85,7 @@ void take_value(nlohmann::json& resp, std::string& into) {
     if (found == resp.end() || !found->is_string()) throw std::runtime_error("daemon reply has no value");
     std::string& held = found->get_ref<std::string&>();
     into.assign(held);
-    zero(held);
+    wipe(held);
 }
 
 bool is_busy(const DaemonUnreachable& e) { return std::string_view(e.what()).starts_with("daemon busy"); }
@@ -379,7 +372,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     auto remask = [&] {
         if (revealed) {
-            zero(*revealed);
+            wipe(*revealed);
             revealed.reset();
         }
     };
@@ -566,7 +559,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     auto clear_filter = [&] {
         bool was_set = !filter.empty();
-        zero(filter);  // a secret pasted here by mistake must not linger, even backspaced away
+        wipe(filter);  // a secret pasted here by mistake must not linger, even backspaced away
         if (!was_set) return;
         std::string id = rows.empty() ? "" : row_at(selected).id;
         expand_to(id);
@@ -613,8 +606,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         } catch (const std::exception& e) {
             fail(e, *key);
         }
-        zero(value);
-        zero(sequence);
+        wipe(value);
+        wipe(sequence);
     };
 
     // Expires the reveal and info messages; driven by a once-a-second tick.
@@ -628,8 +621,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     };
 
     auto close_form = [&] {
-        zero(add_name);
-        zero(add_value);
+        wipe(add_name);
+        wipe(add_value);
         name_cursor = 0;
         value_cursor = 0;
         value_masked = true;
@@ -664,7 +657,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             json resp = call("get", *key, std::nullopt);
             take_value(resp, add_value);
         } catch (const std::exception& e) {
-            zero(add_value);
+            wipe(add_value);
             fail(e, *key);
             return;
         }
@@ -714,7 +707,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         close_form();
         say(verb + " " + key);
         expand_to(key);
-        if (!contains_ignore_case(key, filter)) zero(filter);
+        if (!contains_ignore_case(key, filter)) wipe(filter);
         refresh(key);
         return true;
     };
@@ -778,7 +771,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             auto line_count = std::count(paste_buffer.begin(), paste_buffer.end(), '\n') + 1;
             say("pasted " + std::to_string(line_count) + (line_count == 1 ? " line" : " lines"));
         }
-        zero(paste_buffer);
+        wipe(paste_buffer);
     };
 
     // Where the selection lands after deleting the selected row: the next
@@ -1061,7 +1054,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             if (revealed) {
                 std::string shown_value = printable_value(*revealed);
                 add_wrapped(shown_value, theme.revealed_value);
-                zero(shown_value);
+                wipe(shown_value);
             } else {
                 detail_lines.push_back(text("••••••••") | theme.masked);
                 detail_lines.push_back(text("(Enter or r reveals, c copies)") | theme.muted);
@@ -1366,7 +1359,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         }
         if (event == paste_start) {
             pasting = true;
-            zero(paste_buffer);
+            wipe(paste_buffer);
             paste_buffer.reserve(kSecretReserve);
             return true;
         }
@@ -1376,7 +1369,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 finish_paste();
             } else if (event == Event::Escape) {  // a lost end marker must not swallow input forever
                 pasting = false;
-                zero(paste_buffer);
+                wipe(paste_buffer);
                 say("paste aborted");
             } else if (event.is_character()) {
                 paste_buffer += event.character();
@@ -1417,7 +1410,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 }
                 apply_filter();
             } else if (event == Event::CtrlU) {
-                zero(filter);
+                wipe(filter);
                 apply_filter();
             } else if (event.is_character()) {
                 filter += event.character();
@@ -1602,10 +1595,10 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     ticker.join();
 
     remask();
-    zero(add_name);
-    zero(add_value);
-    zero(paste_buffer);
-    zero(filter);
+    wipe(add_name);
+    wipe(add_value);
+    wipe(paste_buffer);
+    wipe(filter);
     return 0;
 }
 

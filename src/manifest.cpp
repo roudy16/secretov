@@ -25,6 +25,15 @@
 
 namespace secretov {
 
+std::string join(const std::vector<std::string>& parts, const std::string& separator) {
+    std::string joined;
+    for (const std::string& part : parts) {
+        if (!joined.empty()) joined += separator;
+        joined += part;
+    }
+    return joined;
+}
+
 namespace {
 
 bool is_identifier(const std::string& s) {
@@ -104,15 +113,6 @@ void require_manifest_env_name(const std::string& name, const std::string& path,
                                  " cannot be set from a manifest (it can load code into the child "
                                  "process, redirect its traffic, or steer secretov)");
     }
-}
-
-std::string join(const std::vector<std::string>& parts, const std::string& separator) {
-    std::string joined;
-    for (const std::string& part : parts) {
-        if (!joined.empty()) joined += separator;
-        joined += part;
-    }
-    return joined;
 }
 
 struct SharedGroup {

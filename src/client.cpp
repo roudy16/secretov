@@ -37,19 +37,24 @@ constexpr std::size_t kRecommendedMinPassphraseChars = 12;
 constexpr int kReplyTimeoutSeconds = 5;
 constexpr int kKdfReplyTimeoutSeconds = 60;
 
-void scrub(std::string& text) {
-    text.resize(text.capacity());
-    sodium_memzero(text.data(), text.size());
-    text.clear();
-}
-
 // Request fields that carry a secret value or passphrase.
 void scrub_secret_fields(nlohmann::json& message) {
     for (const char* field : {"value", "old", "new", "token"}) {
         auto found = message.find(field);
-        if (found != message.end() && found->is_string()) scrub(found->get_ref<std::string&>());
+        if (found != message.end() && found->is_string()) wipe(found->get_ref<std::string&>());
     }
 }
+
+class ScrubSecretFieldsOnExit {
+public:
+    explicit ScrubSecretFieldsOnExit(nlohmann::json& message) : message_(message) {}
+    ~ScrubSecretFieldsOnExit() { scrub_secret_fields(message_); }
+    ScrubSecretFieldsOnExit(const ScrubSecretFieldsOnExit&) = delete;
+    ScrubSecretFieldsOnExit& operator=(const ScrubSecretFieldsOnExit&) = delete;
+
+private:
+    nlohmann::json& message_;
+};
 
 }  // namespace
 
@@ -63,18 +68,12 @@ DaemonClient::DaemonClient(const Paths& paths) : socket_path_(paths.socket) {
 std::string DaemonClient::serialize(const nlohmann::json& req) const {
     nlohmann::json full = req;
     full["token"] = token_;
-    std::string request_line;
-    try {
-        request_line = full.dump();  // throws on invalid UTF-8
-    } catch (...) {
-        scrub_secret_fields(full);
-        throw;
-    }
-    scrub_secret_fields(full);
+    ScrubSecretFieldsOnExit scrub_full_on_exit(full);
+    std::string request_line = full.dump();  // throws on invalid UTF-8
     // The daemon drops a longer line without a reply, which would read as "may still be applied".
     if (request_line.size() > kMaxRequestBytes) {
         std::size_t request_bytes = request_line.size();
-        scrub(request_line);
+        wipe(request_line);
         throw std::runtime_error("value too large: the request is " + std::to_string(request_bytes) +
                                  " bytes, the daemon's limit is " + std::to_string(kMaxRequestBytes));
     }
@@ -98,7 +97,7 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     }
     std::string request_line = serialize(req);
     bool sent = conn->write_line(request_line);
-    scrub(request_line);
+    wipe(request_line);
     if (!sent) {
         throw DaemonUnreachable(conn->timed_out() ? "daemon busy: " + no_reply + " (another client may be holding it)"
                                                   : "failed to send request to daemon",
@@ -117,10 +116,10 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     try {
         resp = nlohmann::json::parse(*line);
     } catch (const nlohmann::json::exception&) {
-        scrub(*line);
+        wipe(*line);
         throw std::runtime_error("malformed response from daemon");
     }
-    scrub(*line);
+    wipe(*line);
     return resp;
 }
 
@@ -146,27 +145,16 @@ nlohmann::json make_request(const std::string& op, const std::string& key, std::
 void DaemonClient::check_request(const std::string& op, const std::string& key,
                                  std::optional<std::string_view> value) const {
     nlohmann::json req = make_request(op, key, value);
-    try {
-        std::string request_line = serialize(req);
-        scrub(request_line);
-    } catch (...) {
-        scrub_secret_fields(req);
-        throw;
-    }
-    scrub_secret_fields(req);
+    ScrubSecretFieldsOnExit scrub_req_on_exit(req);
+    std::string request_line = serialize(req);
+    wipe(request_line);
 }
 
 nlohmann::json DaemonClient::request(const std::string& op, const std::string& key,
                                      std::optional<std::string_view> value) const {
     nlohmann::json req = make_request(op, key, value);
-    try {
-        nlohmann::json resp = request_raw(req);
-        scrub_secret_fields(req);
-        return resp;
-    } catch (...) {
-        scrub_secret_fields(req);
-        throw;
-    }
+    ScrubSecretFieldsOnExit scrub_req_on_exit(req);
+    return request_raw(req);
 }
 
 namespace {
@@ -181,10 +169,25 @@ std::string read_stdin_value() {
     return value;
 }
 
-void warn_if_short_passphrase(const std::string& passphrase) {
+// Confirms on a tty only: piped input has no typo to catch.
+std::string read_new_passphrase(const std::string& prompt, const std::string& confirm_prompt) {
+    std::string passphrase = read_passphrase(prompt);
+    if (::isatty(STDIN_FILENO)) {
+        std::string confirm = read_passphrase(confirm_prompt);
+        bool matches = passphrase == confirm;
+        wipe(confirm);
+        if (!matches) throw std::runtime_error("passphrases do not match");
+    }
     if (passphrase.size() < kRecommendedMinPassphraseChars) {
         std::cerr << "secretov: warning: new passphrase is shorter than "
                   << kRecommendedMinPassphraseChars << " characters\n";
+    }
+    return passphrase;
+}
+
+void export_env_var(const std::string& name, const std::string& value) {
+    if (::setenv(name.c_str(), value.c_str(), 1) != 0) {
+        throw std::runtime_error("setenv '" + name + "' failed");
     }
 }
 
@@ -290,15 +293,7 @@ const std::vector<SecretEntry>& entries_for(const Manifest& m, const std::string
 int cmd_init() {
     Paths paths = resolve_paths();
     try {
-        std::string passphrase = read_passphrase("Passphrase: ");
-        if (::isatty(STDIN_FILENO)) {
-            std::string confirm = read_passphrase("Confirm passphrase: ");
-            if (passphrase != confirm) {
-                std::cerr << "secretov: passphrases do not match\n";
-                return 1;
-            }
-        }
-        warn_if_short_passphrase(passphrase);
+        std::string passphrase = read_new_passphrase("Passphrase: ", "Confirm passphrase: ");
 
         ensure_parent_dir(paths.store);
         Store::create(paths.store, passphrase, static_cast<std::uint64_t>(std::time(nullptr)));
@@ -323,14 +318,8 @@ int cmd_init() {
 }
 
 int cmd_get(const std::string& key) {
-    Paths paths = resolve_paths();
-    try {
-        nlohmann::json resp = DaemonClient(paths).request("get", key);
-        std::cout << resp.value("value", std::string{}) << "\n";
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
-    }
+    nlohmann::json resp = DaemonClient(resolve_paths()).request("get", key);
+    std::cout << resp.value("value", std::string{}) << "\n";
     return 0;
 }
 
@@ -358,66 +347,50 @@ int cmd_set(int argc, char** argv) {
         std::cerr << "secretov set: " << e.what() << "\n" << kUsage;
         return 2;
     }
-    try {
-        std::string key = name;
-        if (scope.project || scope.env) {
-            ResolvedScope resolved = resolve_scope(paths, scope);
-            key = scoped_key(resolved.env, resolved.project, name);
-        }
-        // A tty gets a no-echo single-line prompt; a pipe is read whole (multi-line values).
-        std::string value;
-        if (::isatty(STDIN_FILENO)) {
-            value = read_secret_line("Value for " + key + ": ");
-            // A stray Enter would otherwise silently overwrite the key with "".
-            if (value.empty()) {
-                throw std::runtime_error(
-                    "empty value on the terminal; nothing stored (pipe an empty value if you mean it)");
-            }
-        } else {
-            value = read_stdin_value();
-        }
-        DaemonClient(paths).request("set", key, value);
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
+    std::string key = name;
+    if (scope.project || scope.env) {
+        ResolvedScope resolved = resolve_scope(paths, scope);
+        key = scoped_key(resolved.env, resolved.project, name);
     }
+    // A tty gets a no-echo single-line prompt; a pipe is read whole (multi-line values).
+    std::string value;
+    if (::isatty(STDIN_FILENO)) {
+        value = read_secret_line("Value for " + key + ": ");
+        // A stray Enter would otherwise silently overwrite the key with "".
+        if (value.empty()) {
+            throw std::runtime_error(
+                "empty value on the terminal; nothing stored (pipe an empty value if you mean it)");
+        }
+    } else {
+        value = read_stdin_value();
+    }
+    DaemonClient(paths).request("set", key, value);
     return 0;
 }
 
 int cmd_list(int argc, char** argv) {
     Paths paths = resolve_paths();
-    try {
-        ScopeArgs scope;
-        for (int i = 0; i < argc; ++i) {
-            if (!take_scope_arg(argc, argv, i, scope)) {
-                std::cerr << "usage: secretov list [-p NAME] [-e ENV]\n";
-                return 2;
-            }
+    ScopeArgs scope;
+    for (int i = 0; i < argc; ++i) {
+        if (!take_scope_arg(argc, argv, i, scope)) {
+            std::cerr << "usage: secretov list [-p NAME] [-e ENV]\n";
+            return 2;
         }
-        std::string prefix;
-        if (scope.project || scope.env) {
-            ResolvedScope resolved = resolve_scope(paths, scope);
-            prefix = scope_prefix(resolved.env, resolved.project);
-        }
-        nlohmann::json resp = DaemonClient(paths).request("list");
-        for (const auto& key : resp.value("keys", std::vector<std::string>{})) {
-            if (key.compare(0, prefix.size(), prefix) == 0) std::cout << key << "\n";
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
+    }
+    std::string prefix;
+    if (scope.project || scope.env) {
+        ResolvedScope resolved = resolve_scope(paths, scope);
+        prefix = scope_prefix(resolved.env, resolved.project);
+    }
+    nlohmann::json resp = DaemonClient(paths).request("list");
+    for (const auto& key : resp.value("keys", std::vector<std::string>{})) {
+        if (key.compare(0, prefix.size(), prefix) == 0) std::cout << key << "\n";
     }
     return 0;
 }
 
 int cmd_delete(const std::string& key) {
-    Paths paths = resolve_paths();
-    try {
-        DaemonClient(paths).request("delete", key);
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
-    }
+    DaemonClient(resolve_paths()).request("delete", key);
     return 0;
 }
 
@@ -426,36 +399,18 @@ int cmd_delete(const std::string& key) {
 // non-dumpable and exits right after. Scrub them if clients become long-lived.
 int cmd_rotate() {
     Paths paths = resolve_paths();
-    try {
-        std::string pass = read_passphrase("Current passphrase: ");
-        DaemonClient(paths).request_raw(nlohmann::json{{"op", "rotate"}, {"old", pass}});
-        std::cout << "rotated encryption key\n";
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
-    }
+    std::string pass = read_passphrase("Current passphrase: ");
+    DaemonClient(paths).request_raw(nlohmann::json{{"op", "rotate"}, {"old", pass}});
+    std::cout << "rotated encryption key\n";
     return 0;
 }
 
 int cmd_passwd() {
     Paths paths = resolve_paths();
-    try {
-        std::string old_pass = read_passphrase("Current passphrase: ");
-        std::string new_pass = read_passphrase("New passphrase: ");
-        if (::isatty(STDIN_FILENO)) {
-            std::string confirm = read_passphrase("Confirm new passphrase: ");
-            if (new_pass != confirm) {
-                std::cerr << "secretov: passphrases do not match\n";
-                return 1;
-            }
-        }
-        warn_if_short_passphrase(new_pass);
-        DaemonClient(paths).request_raw(nlohmann::json{{"op", "passwd"}, {"old", old_pass}, {"new", new_pass}});
-        std::cout << "passphrase changed\n";
-    } catch (const std::exception& e) {
-        std::cerr << "secretov: " << e.what() << "\n";
-        return 1;
-    }
+    std::string old_pass = read_passphrase("Current passphrase: ");
+    std::string new_pass = read_new_passphrase("New passphrase: ", "Confirm new passphrase: ");
+    DaemonClient(paths).request_raw(nlohmann::json{{"op", "passwd"}, {"old", old_pass}, {"new", new_pass}});
+    std::cout << "passphrase changed\n";
     return 0;
 }
 
@@ -523,11 +478,7 @@ int cmd_exec(int argc, char** argv) {
         }
         // Plaintext first, so an explicit --secret on the command line wins
         // over a manifest var of the same name.
-        for (const auto& [envvar, value] : plain) {
-            if (::setenv(envvar.c_str(), value.c_str(), 1) != 0) {
-                throw std::runtime_error("setenv '" + envvar + "' failed");
-            }
-        }
+        for (const auto& [envvar, value] : plain) export_env_var(envvar, value);
 
         // One getprefix per env/project/ group; keys without a '/' are fetched singly.
         DaemonClient client(paths);
@@ -558,15 +509,9 @@ int cmd_exec(int argc, char** argv) {
                 }
                 value = hit->second;
             }
-            if (::setenv(envvar.c_str(), value.c_str(), 1) != 0) {
-                throw std::runtime_error("setenv '" + envvar + "' failed");
-            }
+            export_env_var(envvar, value);
         }
-        if (!missing.empty()) {
-            std::string list;
-            for (const auto& k : missing) list += (list.empty() ? "" : ", ") + k;
-            throw std::runtime_error("missing secrets: " + list);
-        }
+        if (!missing.empty()) throw std::runtime_error("missing secrets: " + join(missing, ", "));
     } catch (const std::exception& e) {
         std::cerr << "secretov exec: " << e.what() << "\n";
         return 1;
@@ -656,9 +601,8 @@ int cmd_import(int argc, char** argv) {
             name_to_var.emplace_back(var, var);
         }
         if (!collisions.empty() && !overwrite) {
-            std::string list;
-            for (const auto& k : collisions) list += "\n  " + k;
-            throw std::runtime_error("already in store (pass --overwrite to replace):" + list);
+            throw std::runtime_error("already in store (pass --overwrite to replace):\n  " +
+                                     join(collisions, "\n  "));
         }
 
         // A request send() would refuse (over the daemon's cap once escaped, or
@@ -684,12 +628,10 @@ int cmd_import(int argc, char** argv) {
             try {
                 client.request("set", key, value);
             } catch (const std::exception& e) {
-                std::string list;
-                for (const auto& k : stored) list += "\n  " + k;
                 throw std::runtime_error(var + ": " + e.what() +
                                          (stored.empty() ? ""
                                                          : "; manifest not updated; already stored (rerun with "
-                                                           "--overwrite once fixed):" + list));
+                                                           "--overwrite once fixed):\n  " + join(stored, "\n  ")));
             }
             stored.push_back(std::move(key));
         }
