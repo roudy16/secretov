@@ -42,19 +42,48 @@ std::string scope_prefix(const std::string& env, const std::string& project);
 // manifest.cpp) in both vars and env_var_name.
 Manifest parse_manifest(const std::string& text, const std::string& path_for_errors);
 
-// Everyone in group gid other than us: accounts whose primary group it is, and
-// listed members. nullopt when gid has no group entry.
+// Everyone in group gid other than us, from the passwd and group databases:
+// accounts whose primary group it is, members listed under any group entry
+// with that gid, and the names of other entries sharing it. nullopt when gid
+// has no group entry. Processes granted the gid outside these databases
+// (systemd SupplementaryGroups=, setgid binaries, sessions of a removed
+// member) and accounts a non-enumerating NSS backend hides are not seen.
+struct ListedMember {
+    std::string user;
+    std::string group;
+};
 struct GroupMembers {
     std::string group;
     std::vector<std::string> primary;
-    std::vector<std::string> supplementary;
+    std::vector<ListedMember> supplementary;
+    std::vector<std::string> other_names;
 };
 std::optional<GroupMembers> other_group_members(gid_t gid);
 
+// The database-free core of other_group_members. groups holds every group
+// entry seen, the one getgrgid returned first (it names the group);
+// accounts holds every passwd entry seen. Duplicates are counted once.
+struct GroupEntry {
+    std::string name;
+    gid_t gid;
+    std::vector<std::string> members;
+};
+struct AccountEntry {
+    std::string name;
+    uid_t uid;
+    gid_t gid;
+};
+GroupMembers collect_group_members(gid_t gid, uid_t my_uid, const std::string& my_name,
+                                   const std::vector<GroupEntry>& groups, const std::vector<AccountEntry>& accounts);
+// True when nobody but us is in the group: no other account, listed member,
+// or group name sharing its gid.
+bool ours_alone(const GroupMembers& members);
+
 // The only way a manifest file is read. Throws unless the file is ours, and
 // its directory (and a symlink target's directory) is ours or root's, and none
-// is world-writable or group-writable by a group with anyone else in it. The
-// error names the chmod (or group change) that fixes it.
+// is world-writable, or group-writable unless the group is our private group
+// with nobody else in it and the inode has no access ACL. The error names the
+// chmod, setfacl, or group change that fixes it.
 std::string read_manifest_text(const std::string& path);
 // For a manifest about to be created: its directory passes read_manifest_text's
 // directory check, is a directory, and we can write to it.

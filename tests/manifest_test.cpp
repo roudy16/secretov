@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace secretov;
 
@@ -174,6 +175,49 @@ void write_manifest(const std::string& path, mode_t mode) {
     assert(::chmod(path.c_str(), mode) == 0);
 }
 
+// Expectations here are written out by hand, not derived from the code under
+// test, so a membership bug cannot hide behind its own oracle.
+void test_collect_group_members() {
+    const gid_t kPrivate = 1000;
+    const uid_t kMe = 1000;
+    const std::string kMeName = "roudy";
+
+    GroupMembers alone = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {}}, {"docker", 999, {"bob"}}},
+                                               {{"roudy", 1000, 1000}, {"bob", 1001, 1001}});
+    assert(alone.group == "roudy" && ours_alone(alone));
+
+    // We are skipped even when listed in our own group or met twice.
+    GroupMembers self_listed = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {"roudy"}}, {"roudy", 1000, {"roudy"}}},
+                                                     {{"roudy", 1000, 1000}});
+    assert(ours_alone(self_listed) && self_listed.other_names.empty());
+
+    // Another account whose primary group it is.
+    GroupMembers primary = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {}}},
+                                                 {{"roudy", 1000, 1000}, {"devuser", 1001, 1000}, {"devuser", 1001, 1000}});
+    assert(!ours_alone(primary) && primary.primary == std::vector<std::string>{"devuser"});
+
+    // A member listed only in getgrgid's entry (a backend that does not
+    // enumerate) still counts, once.
+    GroupMembers first_entry_only = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {"alice"}}}, {});
+    assert(!ours_alone(first_entry_only) && first_entry_only.supplementary.size() == 1 &&
+           first_entry_only.supplementary[0].user == "alice" && first_entry_only.supplementary[0].group == "roudy");
+    GroupMembers counted_once = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {"alice"}}, {"roudy", 1000, {"alice"}}}, {});
+    assert(counted_once.supplementary.size() == 1);
+
+    // A second name on the gid refuses with or without members.
+    GroupMembers alias_empty = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {}}, {"roudy", 1000, {}}, {"share", 1000, {}}}, {});
+    assert(!ours_alone(alias_empty) && alias_empty.other_names == std::vector<std::string>{"share"} &&
+           alias_empty.supplementary.empty());
+    GroupMembers alias_members = collect_group_members(kPrivate, kMe, kMeName, {{"roudy", 1000, {}}, {"share", 1000, {"alice", "roudy"}}}, {});
+    assert(alias_members.supplementary.size() == 1 && alias_members.supplementary[0].user == "alice" &&
+           alias_members.supplementary[0].group == "share");
+
+    // The first entry names the group, so a foreign name is visible to the
+    // caller's private-group check.
+    GroupMembers foreign = collect_group_members(kPrivate, kMe, kMeName, {{"staff", 1000, {}}}, {});
+    assert(foreign.group == "staff");
+}
+
 void test_manifest_trust() {
     std::string dir = g_dir + "/trust";
     assert(::mkdir(dir.c_str(), 0700) == 0);
@@ -181,8 +225,8 @@ void test_manifest_trust() {
     write_manifest(manifest, 0644);
     assert(load_manifest(manifest).project == "t");
 
-    // Group write passes only when nobody else is in the owning group, so the
-    // outcome depends on this host's group database.
+    // Group write passes only when the owning group is our private group with
+    // nobody else in it, so the outcome depends on this host's group database.
     assert(::chmod(manifest.c_str(), 0664) == 0);
     struct stat manifest_st{};
     assert(::stat(manifest.c_str(), &manifest_st) == 0);
@@ -190,7 +234,9 @@ void test_manifest_trust() {
     const struct passwd* my_entry = ::getpwuid(::getuid());
     bool private_group = my_entry && my_entry->pw_gid == manifest_st.st_gid && members &&
                          members->group == my_entry->pw_name;
-    if (private_group && members->primary.empty() && members->supplementary.empty()) {
+    bool private_and_alone = private_group && members->primary.empty() && members->supplementary.empty() &&
+                             members->other_names.empty();
+    if (private_and_alone) {
         assert(load_manifest(manifest).project == "t");
     } else {
         assert(throws_with([&] { load_manifest(manifest); }, ("fix with: chmod g-w '" + manifest + "'").c_str()));
@@ -198,9 +244,56 @@ void test_manifest_trust() {
             assert(throws_with([&] { load_manifest(manifest); }, (members->primary[0] + " (its primary group)").c_str()));
         }
         if (members && !members->supplementary.empty()) {
-            assert(throws_with([&] { load_manifest(manifest); }, ("sudo gpasswd -d " + members->supplementary[0]).c_str()));
+            const ListedMember& listed = members->supplementary[0];
+            assert(throws_with([&] { load_manifest(manifest); },
+                               ("sudo gpasswd -d " + listed.user + " " + listed.group).c_str()));
         }
     }
+    assert(::chmod(manifest.c_str(), 0644) == 0);
+
+    // Group write by any group but our private one is refused, file or dir.
+    std::vector<gid_t> my_groups(static_cast<std::size_t>(::getgroups(0, nullptr)));
+    my_groups.resize(static_cast<std::size_t>(::getgroups(static_cast<int>(my_groups.size()), my_groups.data())));
+    std::optional<gid_t> other_gid;
+    for (gid_t candidate : my_groups) {
+        if (!my_entry || candidate != my_entry->pw_gid) other_gid = candidate;
+    }
+    if (other_gid) {
+        assert(::chown(manifest.c_str(), static_cast<uid_t>(-1), *other_gid) == 0);
+        assert(::chmod(manifest.c_str(), 0664) == 0);
+        assert(throws_with([&] { load_manifest(manifest); }, "which is not your private group"));
+        assert(::chmod(manifest.c_str(), 0644) == 0);
+        assert(::chown(manifest.c_str(), static_cast<uid_t>(-1), manifest_st.st_gid) == 0);
+
+        struct stat dir_st{};
+        assert(::stat(dir.c_str(), &dir_st) == 0);
+        assert(::chown(dir.c_str(), static_cast<uid_t>(-1), *other_gid) == 0);
+        assert(::chmod(dir.c_str(), 0770) == 0);
+        assert(throws_with([&] { load_manifest(manifest); }, ("manifest directory '" + dir + "'").c_str()));
+        assert(throws_with([&] { load_manifest(manifest); }, "which is not your private group"));
+        assert(::chmod(dir.c_str(), 0700) == 0);
+        assert(::chown(dir.c_str(), static_cast<uid_t>(-1), dir_st.st_gid) == 0);
+    } else {
+        std::fprintf(stderr, "skip: no supplementary group to test non-private group write\n");
+    }
+
+    // An ACL entry for another account sets the group bits as its mask, so a
+    // private-group file that would otherwise pass is refused. Needs setfacl.
+    if (private_and_alone && std::system(("setfacl -m u:65534:rw '" + manifest + "' 2>/dev/null").c_str()) == 0) {
+        assert(throws_with([&] { load_manifest(manifest); }, ("setfacl -b '" + manifest + "'").c_str()));
+        assert(std::system(("setfacl -b '" + manifest + "'").c_str()) == 0);
+        assert(::chmod(manifest.c_str(), 0664) == 0);
+        assert(load_manifest(manifest).project == "t");
+        assert(::chmod(manifest.c_str(), 0644) == 0);
+
+        assert(std::system(("setfacl -m u:65534:rwx '" + dir + "'").c_str()) == 0);
+        assert(throws_with([&] { load_manifest(manifest); }, ("manifest directory '" + dir + "': has an ACL").c_str()));
+        assert(std::system(("setfacl -b '" + dir + "'").c_str()) == 0);
+        assert(::chmod(dir.c_str(), 0700) == 0);
+    } else {
+        std::fprintf(stderr, "skip: ACL test needs a private group, setfacl, and ACL support in /tmp\n");
+    }
+
     assert(::chmod(manifest.c_str(), 0646) == 0);
     assert(throws_with([&] { load_manifest(manifest); }, ("writable by everyone; fix with: chmod o-w '" + manifest + "'").c_str()));
     assert(::chmod(manifest.c_str(), 0644) == 0);
@@ -354,6 +447,7 @@ int main() {
     test_insert_preserves_vars_block();
     test_registry();
     test_find_manifest_upward();
+    test_collect_group_members();
     test_manifest_trust();
     test_denied_env_names();
 

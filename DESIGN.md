@@ -210,11 +210,19 @@ Trust note: a manifest decides what runs with which secrets, so it is read
 owned by the caller, and its directory (and a symlink target's) owned by the
 caller or root; none world-writable, and none group-writable unless the
 group is the caller's user private group (their primary gid, named after
-them) with no other member (`gr_mem` plus a passwd scan for primary members;
-a scan error refuses). Limiting this to the private group keeps it fail-closed
-where an NSS backend hides accounts from the scan.
-Anything else is refused with the `chmod` or group fix, never skipped for an
-ancestor.
+them) with no other member and no access ACL. Membership is the `gr_mem` of
+the entry `getgrgid` returns and of every enumerated entry with that gid,
+plus a passwd scan for primary members (`collect_group_members` is the
+database-free core the tests drive); a second group name on the gid, with or
+without members, or a scan error, refuses. An ACL makes the
+group bits the ACL mask, which can stand for named users' write, so any
+`system.posix_acl_access` on a group-writable inode refuses. The check sees
+only the passwd and group databases: a gid granted outside them (systemd
+`SupplementaryGroups=`, a setgid binary, processes of a member removed while
+logged in) or accounts a non-enumerating NSS backend (sssd, LDAP) hides are
+not seen. Each takes an admin deliberately sharing the caller's private gid.
+Anything else is refused with the `chmod`, `setfacl`, or group fix, never
+skipped for an ancestor.
 `vars:` keys and `env_var_name` reject a deny list of names that make the
 child or anything it spawns load code or config, or redirect its traffic
 through a proxy or CA of the manifest's choosing (`LD_*`, `DYLD_*`,

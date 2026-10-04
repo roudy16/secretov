@@ -280,16 +280,21 @@ one that nobody else can change:
   its directory (and, for a symlink, the target's directory) must be owned by
   you or root. None may be world-writable, and none may be group-writable
   unless the owning group is your private group (your primary group, named
-  after you) and you are its only member (counting accounts whose primary
-  group it is). Otherwise every command that reads it (`exec`, `list`,
+  after you), you are its only member (counting accounts whose primary
+  group it is and any other group sharing its gid), and the file or
+  directory has no ACL (`ls -l` shows a `+`). Otherwise every command that reads it (`exec`, `list`,
   `set -p/-e`, `import`, `--dry-run`, including `-p` registry lookups)
   refuses with the fix, e.g.
-  `refusing manifest directory '/path': writable by group 'roudy', which also includes devuser (its primary group); fix with: chmod g-w '/path', or make 'roudy' yours alone: sudo userdel devuser or sudo usermod -g <another group> devuser`.
+  `refusing manifest directory '/path': writable by group 'roudy', which also includes devuser (its primary group); fix with: chmod g-w '/path', or make 'roudy' yours alone: sudo userdel devuser or sudo usermod -g <another group> devuser (and end any of their processes still running)`.
   An `import` that would create or change the manifest checks the same way,
   and that the directory exists and is writable, before storing anything; a
   symlinked manifest is updated at its target. A default umask of 0002 makes new project dirs
   group-writable, which is fine while your group is private to you. Locking an
-  account does not remove it from a group.
+  account does not remove it from a group, and removing one does not take the
+  group from its processes already running; end them too. Membership is read
+  from the passwd and group databases, so a service you give your group
+  (systemd `SupplementaryGroups=`) is not seen; don't share your private
+  group with anything you would not let write your manifests.
 - **Discovery** walks up from the current directory only through directories
   you own, so a manifest in `/tmp`, `/home`, or `/` is never picked up. A bad
   nearer manifest is an error; secretov never falls back to one further up.
@@ -364,7 +369,11 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `var 'X' (env dev) must be a scalar value` | A nested map/list under `vars:` | Use a plain scalar |
 | `invalid token` | Client/daemon token mismatch | Daemon restarted against a different config |
 | `refusing manifest[ directory] '...': writable by everyone` | Manifest or its dir is world-writable | Run the `chmod` it prints |
-| `refusing manifest[ directory] '...': writable by group 'G', which also includes ...` | Group-writable, and another account is in group G | Run the `chmod g-w` it prints, or remove the named accounts from G |
+| `refusing manifest[ directory] '...': writable by group 'G', which also includes ...` | Group-writable, and another account or group shares G | Run the `chmod g-w` it prints, or the `gpasswd`/`usermod`/`groupmod` commands it prints, then end those accounts' processes |
+| `refusing manifest[ directory] '...': writable by group G, which is not your private group` | Group-writable by a group other than your own (G is a gid, or a quoted name when it reuses your gid) | Run the `chmod g-w` it prints |
+| `refusing manifest[ directory] '...': writable by group G, which has no group entry` | Group-writable by a gid with no name | Run the `chmod g-w` it prints |
+| `refusing manifest[ directory] '...': has an ACL` | Group-writable with an ACL, which may grant write to others | Run the `setfacl -b` or `chmod g-w` it prints |
+| `refusing manifest[ directory] '...': group-writable, and its ACL cannot be read` | The ACL query failed | Run the `chmod g-w` it prints |
 | `refusing manifest[ directory] '...': owned by uid N, not you` | Someone else's manifest or dir | Remove it, or chown it to yourself |
 | `... cannot be set from a manifest` | A denied name under `vars:` or `env_var_name` | Rename it, or pass it on your own command line |
 | `cannot run 'X': No such file or directory` | `exec` program missing from *your* PATH | Install it, or give a path with a `/` |

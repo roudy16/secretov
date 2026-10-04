@@ -220,7 +220,7 @@ and replaced it with a regular file. Now a manifest about to be created has
 its directory checked before anything is stored, and existence is tested
 without following symlinks, so a dangling link fails as it does for `exec`.
 
-### 12. Workspace writable by another account (M2) — `open (host)`
+### 12. Workspace writable by another account (M2) — `done (host)` (2026-10-03)
 
 The host account `devuser` (uid 1001) has primary group `roudy`; with umask
 0002, `~/workspace`, every project dir and some manifests are
@@ -246,7 +246,7 @@ echo 'umask 027' >> ~/.bashrc       # terminals already open; re-login after
 chmod -R g-w ~/workspace            # optional once devuser is locked or gone
 ```
 
-Since finding 11, secretov REFUSES every manifest on this host until the
+Before devuser was deleted, secretov refused every manifest on this host until the
 chmod runs: `blueowl/.secretov.yaml` and `wed_photo/.secretov.yaml` are 0664,
 and all four project dirs under `~/workspace/roudy16` (blueowl, wed_photo,
 homecloud, homestat) are 0775. Either the `chmod -R` above or this narrower
@@ -261,7 +261,10 @@ owning group's only member, so taking devuser out of group `roudy` is an
 alternative to the chmod. Locking it is not enough: `roudy` is devuser's
 primary group, and a locked account is still a member. `sudo userdel
 devuser` or `sudo usermod -g <another group> devuser` does it; the refusal
-names these commands.
+names these commands. Resolved the same day: devuser was deleted, so group
+`roudy` is private again, and the four project dirs are 0755 with 0644
+manifests. A 0002 umask is now harmless here; see finding 35 for the limits
+of the private-group rule.
 
 ### 13. Secret values in shell history; interactive `set` echoed (M3) — `done` (2026-10-03, afa8352, 43219db, 7f36a00)
 
@@ -533,15 +536,42 @@ CMake now sets PIE, `-z relro -z now -z noexecstack`,
 and `_FORTIFY_SOURCE=3` (optimized configs; the build type now defaults to
 Release). `hardening_test` checks the ELF with readelf.
 
+### 35. Private-group write rule widened trust past what it checked (5a69714) — `done` (2026-10-03); residual `accepted`
+
+5a69714 accepted group write when the group is the caller's private group
+with no other member. Review of that commit found:
+
+- An access ACL makes st_mode's group bits the ACL mask, so
+  `setfacl -m u:mallory:rw` (or a default ACL inherited from a shared parent)
+  showed as private-group write and was accepted while mallory could swap
+  the manifest. Now any `system.posix_acl_access` on a group-writable inode
+  refuses, with `setfacl -b` or `chmod g-w` as the fix; an unreadable ACL
+  refuses too.
+- Only the first group entry for the gid was read; a second name on the
+  same gid (`share:x:1000:alice`) grants alice the gid through initgroups.
+  Now every entry with the gid is scanned, and another name or member
+  refuses.
+- The commit message and DESIGN.md called the rule fail-closed against
+  NSS backends hiding accounts. Wrong: a non-enumerating backend ends the
+  passwd scan cleanly, so its accounts are not seen. Docs corrected.
+- The smoke test's group-write cases became world-write, so no test refused
+  a non-private group. Unit and smoke tests now chgrp to a supplementary
+  group and expect refusal, and the unit test covers ACLs (needs setfacl).
+
+Accepted residual: membership is read from the passwd and group databases
+only. A gid granted outside them (systemd `SupplementaryGroups=`, setgid
+binaries, processes of a member removed while logged in) or accounts a
+non-enumerating NSS backend hides are not seen. Each requires an admin to
+share the caller's private gid on purpose; refusals now say to end removed
+members' processes.
+
 ## Priority order for fixes
 
 Done items are marked in the findings. Remaining, highest value first:
 
-1. Host config (12, 26): `chmod g-w` the four project dirs and manifests
-   (until then every manifest here is refused); lock or remove the unused
-   devuser account; umask 027;
-   `scripts/service update` to pick up the hardened, session-bound unit;
-   disable linger if nothing needs it. Minutes.
+1. Host config (26): `scripts/service update` to pick up the hardened,
+   session-bound unit and the current manifest trust rules; disable linger
+   if nothing needs it. Minutes.
 2. `lock` op tied to logind Lock (32).
 3. Keyring unlock-key slot instead of the passphrase in the keyring (16).
 4. TPM2 `systemd-creds` credential (15; needs systemd ≥ 256).

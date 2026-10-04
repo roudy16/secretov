@@ -4,8 +4,10 @@
 #include <grp.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdlib>
@@ -120,9 +122,8 @@ struct SharedGroup {
 
 // Why group write is unsafe for a file in group gid, with the commands that
 // would make the group ours alone; nullopt when nobody else is in it. Only our
-// user private group qualifies: the passwd scan cannot prove an arbitrary
-// group empty when an NSS backend hides accounts, but another account sharing
-// our private group is an anomaly the local files show (as devuser does here).
+// user private group qualifies, so a group meant to be shared never passes;
+// see GroupMembers for what the membership check cannot see.
 std::optional<SharedGroup> shared_group_problem(gid_t gid) {
     const struct passwd* my_entry = ::getpwuid(::getuid());
     if (!my_entry || my_entry->pw_gid != gid) {
@@ -136,26 +137,47 @@ std::optional<SharedGroup> shared_group_problem(gid_t gid) {
     if (members->group != my_name) {
         return SharedGroup{"writable by group '" + members->group + "', which is not your private group (named " + my_name + ")", ""};
     }
-    if (members->primary.empty() && members->supplementary.empty()) return std::nullopt;
+    if (ours_alone(*members)) return std::nullopt;
     std::vector<std::string> member_descriptions;
     std::vector<std::string> regroup_commands;
     for (const std::string& user : members->primary) {
         member_descriptions.push_back(user + " (its primary group)");
         regroup_commands.push_back("sudo userdel " + user + " or sudo usermod -g <another group> " + user);
     }
-    for (const std::string& user : members->supplementary) {
-        member_descriptions.push_back(user);
-        regroup_commands.push_back("sudo gpasswd -d " + user + " " + members->group);
+    for (const ListedMember& listed : members->supplementary) {
+        member_descriptions.push_back(listed.group == members->group ? listed.user
+                                                                     : listed.user + " (via group '" + listed.group + "')");
+        regroup_commands.push_back("sudo gpasswd -d " + listed.user + " " + listed.group);
+    }
+    for (const std::string& other_name : members->other_names) {
+        member_descriptions.push_back("group '" + other_name + "', which shares gid " + std::to_string(gid));
+        regroup_commands.push_back("sudo groupmod -g <unused gid> " + other_name);
     }
     return SharedGroup{"writable by group '" + members->group + "', which also includes " + join(member_descriptions, ", "),
-                       "or make '" + members->group + "' yours alone: " + join(regroup_commands, "; ")};
+                       "or make '" + members->group + "' yours alone: " + join(regroup_commands, "; ") +
+                           " (and end any of their processes still running)"};
+}
+
+// With an access ACL the group bits in st_mode are the ACL mask, so they can
+// stand for write by named users or groups rather than the owning group.
+// Queries the open fd when there is one, else the path (following symlinks,
+// as stat did).
+std::optional<std::string> acl_problem(const std::string& path, int fd) {
+    constexpr const char* kAccessAcl = "system.posix_acl_access";
+    ssize_t acl_size = fd >= 0 ? ::fgetxattr(fd, kAccessAcl, nullptr, 0) : ::getxattr(path.c_str(), kAccessAcl, nullptr, 0);
+    if (acl_size >= 0) return "has an ACL, so its group write may extend to other accounts; fix with: setfacl -b '" + path +
+                              "', or chmod g-w '" + path + "'";
+    if (errno == ENODATA || errno == ENOTSUP) return std::nullopt;
+    return std::string("group-writable, and its ACL cannot be read (") + std::strerror(errno) + "); fix with: chmod g-w '" +
+           path + "'";
 }
 
 // ssh StrictModes for manifests: anyone else who can write the file, or swap
 // it in its directory, could inject env vars and key: references into exec.
 // Group write is allowed when we are the group's only member (a user private
-// group, the umask 0002 convention).
-void require_trusted(const std::string& path, const struct stat& st, bool directory) {
+// group, the umask 0002 convention) and no ACL widens it. fd is the open
+// file, or -1 to query path.
+void require_trusted(const std::string& path, const struct stat& st, bool directory, int fd = -1) {
     std::string refusing = std::string("refusing ") + (directory ? "manifest directory" : "manifest") + " '" + path + "': ";
     uid_t me = ::getuid();
     if (st.st_uid != me && !(directory && st.st_uid == 0)) {
@@ -171,6 +193,9 @@ void require_trusted(const std::string& path, const struct stat& st, bool direct
     if (group_problem) {
         std::string regroup = group_problem->regroup_fix.empty() ? "" : ", " + group_problem->regroup_fix;
         throw std::runtime_error(refusing + group_problem->reason + "; fix with: chmod g-w '" + path + "'" + regroup);
+    }
+    if ((st.st_mode & S_IWGRP) != 0) {
+        if (std::optional<std::string> acl = acl_problem(path, fd)) throw std::runtime_error(refusing + *acl);
     }
 }
 
@@ -428,31 +453,79 @@ void require_creatable_manifest_dir(const std::string& manifest_path) {
     }
 }
 
+GroupMembers collect_group_members(gid_t gid, uid_t my_uid, const std::string& my_name,
+                                   const std::vector<GroupEntry>& groups, const std::vector<AccountEntry>& accounts) {
+    GroupMembers members;
+    bool named = false;
+    for (const GroupEntry& entry : groups) {
+        if (entry.gid != gid) continue;
+        if (!named) {
+            members.group = entry.name;
+            named = true;
+        } else if (entry.name != members.group &&
+                   std::find(members.other_names.begin(), members.other_names.end(), entry.name) == members.other_names.end()) {
+            members.other_names.push_back(entry.name);
+        }
+        for (const std::string& user : entry.members) {
+            bool seen = std::any_of(members.supplementary.begin(), members.supplementary.end(),
+                                    [&](const ListedMember& listed) { return listed.user == user && listed.group == entry.name; });
+            if (user != my_name && !seen) members.supplementary.push_back({user, entry.name});
+        }
+    }
+    for (const AccountEntry& account : accounts) {
+        if (account.gid == gid && account.uid != my_uid &&
+            std::find(members.primary.begin(), members.primary.end(), account.name) == members.primary.end()) {
+            members.primary.push_back(account.name);
+        }
+    }
+    return members;
+}
+
+bool ours_alone(const GroupMembers& members) {
+    return members.primary.empty() && members.supplementary.empty() && members.other_names.empty();
+}
+
 std::optional<GroupMembers> other_group_members(gid_t gid) {
     uid_t me = ::getuid();
     const struct passwd* my_entry = ::getpwuid(me);
     std::string my_name = my_entry ? my_entry->pw_name : "";
     const struct group* group_entry = ::getgrgid(gid);
     if (!group_entry) return std::nullopt;
-    GroupMembers members{group_entry->gr_name, {}, {}};
-    for (char** member = group_entry->gr_mem; *member; ++member) {
-        if (my_name != *member) members.supplementary.emplace_back(*member);
+    auto copy_group = [](const struct group& entry) {
+        GroupEntry copied{entry.gr_name, entry.gr_gid, {}};
+        for (char** member = entry.gr_mem; *member; ++member) copied.members.emplace_back(*member);
+        return copied;
+    };
+    // getgrgid's entry first: a backend that answers it may not enumerate.
+    // Then every entry, since initgroups grants the gid to members of each.
+    std::vector<GroupEntry> groups{copy_group(*group_entry)};
+    ::setgrent();
+    errno = 0;
+    while (const struct group* entry = ::getgrent()) {
+        if (entry->gr_gid == gid) groups.push_back(copy_group(*entry));
+        errno = 0;
     }
-    // Primary members are not in gr_mem; find them by scanning passwd. An NSS
-    // backend with enumeration disabled (sssd, LDAP) hides its users here.
+    int group_scan_errno = errno;
+    ::endgrent();
+    if (group_scan_errno != 0 && group_scan_errno != ENOENT) {
+        throw std::runtime_error(std::string("cannot list groups to check group ") + groups[0].name + ": " +
+                                 std::strerror(group_scan_errno) + "; fix with: chmod g-w on the manifest and its directory");
+    }
+    // Primary members are not in gr_mem; find them by scanning passwd.
+    std::vector<AccountEntry> accounts;
     ::setpwent();
     errno = 0;
     while (const struct passwd* account = ::getpwent()) {
-        if (account->pw_gid == gid && account->pw_uid != me) members.primary.emplace_back(account->pw_name);
+        if (account->pw_gid == gid) accounts.push_back({account->pw_name, account->pw_uid, account->pw_gid});
         errno = 0;
     }
-    int scan_errno = errno;
+    int account_scan_errno = errno;
     ::endpwent();
-    if (scan_errno != 0 && scan_errno != ENOENT) {
-        throw std::runtime_error(std::string("cannot list accounts to check group ") + members.group +
-                                 ": " + std::strerror(scan_errno) + "; fix with: chmod g-w on the manifest and its directory");
+    if (account_scan_errno != 0 && account_scan_errno != ENOENT) {
+        throw std::runtime_error(std::string("cannot list accounts to check group ") + groups[0].name + ": " +
+                                 std::strerror(account_scan_errno) + "; fix with: chmod g-w on the manifest and its directory");
     }
-    return members;
+    return collect_group_members(gid, me, my_name, groups, accounts);
 }
 
 std::string read_manifest_text(const std::string& path) {
@@ -471,7 +544,7 @@ std::string read_manifest_text(const std::string& path) {
         struct stat st{};
         if (::fstat(fd, &st) != 0) throw std::runtime_error("stat '" + path + "': " + std::strerror(errno));
         if (!S_ISREG(st.st_mode)) throw std::runtime_error("manifest '" + path + "' is not a regular file");
-        require_trusted(path, st, false);
+        require_trusted(path, st, false, fd);
         char buf[4096];
         for (;;) {
             ssize_t n = ::read(fd, buf, sizeof(buf));

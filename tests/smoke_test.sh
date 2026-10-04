@@ -364,6 +364,14 @@ chmod o+w "$PROJ"
 ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "world-writable project dir should be refused"
 echo "$ERR" | grep -q "o-w '$PROJ'" || fail "untrusted dir message: $ERR"
 chmod o-w "$PROJ"
+# group write by a group other than our private one is refused the same way
+OTHER_GID="$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -n 1)"
+if [ -n "$OTHER_GID" ]; then
+    chgrp "$OTHER_GID" "$PROJ" && chmod g+w "$PROJ"
+    ERR="$(cd "$PROJ" && "$BIN" exec -e dev -- true 2>&1)" && fail "non-private group-writable project dir should be refused"
+    echo "$ERR" | grep -q "not your private group" || fail "non-private group dir message: $ERR"
+    chmod g-w "$PROJ" && chgrp "$(id -g)" "$PROJ"
+fi
 # import refuses a new manifest's untrusted dir before storing anything, and a
 # dangling manifest symlink fails as it does for exec instead of being replaced
 GW="$WORK/gw"
@@ -374,6 +382,13 @@ ERR="$(cd "$GW" && "$BIN" import -p gw -e dev 2>&1)" && fail "import into a worl
 echo "$ERR" | grep -q "writable by everyone" || fail "import untrusted dir message: $ERR"
 if "$BIN" get dev/gw/GWTOK >/dev/null 2>&1; then fail "refused import stored a secret"; fi
 chmod o-w "$GW"
+if [ -n "$OTHER_GID" ]; then
+    chgrp "$OTHER_GID" "$GW" && chmod g+w "$GW"
+    ERR="$(cd "$GW" && "$BIN" import -p gw -e dev 2>&1)" && fail "import into a non-private group-writable dir should fail"
+    echo "$ERR" | grep -q "not your private group" || fail "import non-private group dir message: $ERR"
+    if "$BIN" get dev/gw/GWTOK >/dev/null 2>&1; then fail "refused import stored a secret"; fi
+    chmod g-w "$GW" && chgrp "$(id -g)" "$GW"
+fi
 ln -s missing "$GW/.secretov.yaml"
 if ( cd "$GW" && "$BIN" import -p gw -e dev >/dev/null 2>&1 ); then fail "import replaced a dangling manifest link"; fi
 [ -L "$GW/.secretov.yaml" ] || fail "dangling manifest link was replaced"
