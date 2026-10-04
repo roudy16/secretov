@@ -262,16 +262,10 @@ struct ResolvedScope {
 // manifest from cwd supplies the project.
 ResolvedScope resolve_scope(const Paths& paths, const ScopeArgs& scope) {
     std::optional<Manifest> manifest;
-    std::string project;
-    if (scope.project) {
-        project = *scope.project;
-        if (std::optional<std::string> root = registry_project_root(paths.registry, project)) {
-            manifest = load_manifest(*root + "/" + kManifestFileName);
-        }
-    } else {
+    if (!scope.project || registry_project_root(paths.registry, *scope.project)) {
         manifest = resolve_manifest(paths, scope);
-        project = manifest->project;
     }
+    std::string project = scope.project ? *scope.project : manifest->project;
     return {resolve_env(scope, manifest ? &*manifest : nullptr), project};
 }
 
@@ -545,6 +539,8 @@ int cmd_exec(int argc, char** argv) {
             if (slash == std::string::npos) {
                 nlohmann::json resp = client.send(nlohmann::json{{"op", "get"}, {"key", key}});
                 if (!resp.value("ok", false)) {
+                    std::string error = resp.value("error", std::string("request failed"));
+                    if (error != "not found") throw std::runtime_error(error);
                     missing.push_back(key);
                     continue;
                 }

@@ -130,6 +130,13 @@ void test_insert_rejects_inline_and_mismatch() {
                        "inline value"));
     assert(throws_with([] { manifest_with_entries(kSample, "other", "dev", {{"X", "X"}}); },
                        "names project"));
+    // An existing entry that would make exec read another key or set another var.
+    assert(throws_with([] { manifest_with_entries(kSample, "flows-admin", "dev", {{"database-url", "OTHER"}}); },
+                       "different key or env_var_name"));
+    assert(throws_with(
+        [] { manifest_with_entries(kSample, "flows-admin", "dev", {{"openai-key", "OPENAI_API_KEY"}}); },
+        "different key or env_var_name"));
+    assert(manifest_with_entries(kSample, "flows-admin", "dev", {{"database-url", "DATABASE_URL"}}) == kSample);
 }
 
 void test_insert_fresh_and_four_space() {

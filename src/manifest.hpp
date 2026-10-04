@@ -110,7 +110,8 @@ KeyValues parse_dotenv(const std::string& text, std::ostream& warnings = std::ce
 // Returns `text` with `NAME:\n  env_var_name: VAR` entries inserted under
 // env.<env>.secrets, creating missing blocks and matching the file's
 // indentation. Everything else (comments, spacing) is untouched. Entries
-// already present are left alone. Empty text yields a fresh manifest for
+// already present are left alone, but must already have env_var_name VAR and
+// key env/project/NAME. Empty text yields a fresh manifest for
 // `project`. Throws if the result does not re-parse with the entries present.
 std::string manifest_with_entries(const std::string& text, const std::string& project,
                                   const std::string& env, const KeyValues& name_to_var);

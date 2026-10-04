@@ -975,7 +975,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             std::vector<std::string> lines = word_wrap(message, terminal.dimx - 2);
             if (lines.size() > 3) {
                 lines.resize(3);
-                lines.back() = ellipsize(lines.back(), terminal.dimx - 3) + "…";
+                lines.back() = ellipsize(lines.back() + "…", terminal.dimx - 2);
             }
             for (const std::string& line : lines) {
                 status_rows.push_back(hbox({text(" " + line) | message_style, filler()}) | theme.status_bar);

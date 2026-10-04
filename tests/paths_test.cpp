@@ -65,6 +65,25 @@ void test_write_file_atomic_dir_fsync_failure_is_committed(const std::string& di
     assert(secretov::read_file_string(no_read_dir + "/f") == "committed");
 }
 
+void test_resolve_paths_without_home(const std::string& dir) {
+    // Both XDG dirs set: HOME is never consulted, so its absence must not throw.
+    assert(::setenv("XDG_DATA_HOME", (dir + "/data").c_str(), 1) == 0);
+    assert(::setenv("XDG_CONFIG_HOME", (dir + "/config").c_str(), 1) == 0);
+    assert(::setenv("XDG_RUNTIME_DIR", dir.c_str(), 1) == 0);
+    assert(::unsetenv("HOME") == 0);
+    secretov::Paths resolved = secretov::resolve_paths();
+    assert(resolved.store == dir + "/data/secretov/" + secretov::kStoreFileName);
+    assert(resolved.registry == dir + "/config/secretov/" + secretov::kRegistryFileName);
+    assert(::unsetenv("XDG_CONFIG_HOME") == 0);
+    bool threw = false;
+    try {
+        secretov::resolve_paths();
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()).find("HOME is not set") != std::string::npos;
+    }
+    assert(threw);
+}
+
 }  // namespace
 
 int main() {
@@ -79,6 +98,7 @@ int main() {
     test_secret_line_cap();
     test_write_file_atomic_relative_path(dir);
     test_write_file_atomic_dir_fsync_failure_is_committed(dir);
+    test_resolve_paths_without_home(dir);
 
     std::filesystem::remove_all(dir);
     std::printf("OK\n");

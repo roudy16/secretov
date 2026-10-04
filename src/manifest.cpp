@@ -763,16 +763,15 @@ std::string manifest_with_entries(const std::string& text, const std::string& pr
     auto it = check.envs.find(env);
     if (it == check.envs.end()) throw std::runtime_error("manifest edit failed: env '" + env + "' not present");
     for (const auto& [name, var] : name_to_var) {
-        bool found = false;
-        for (const auto& e : it->second) {
-            if (e.name == name) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
+        auto entry = std::find_if(it->second.begin(), it->second.end(),
+                                  [&](const SecretEntry& candidate) { return candidate.name == name; });
+        if (entry == it->second.end()) {
             throw std::runtime_error("manifest edit failed: entry '" + name +
                                      "' not present after insertion; add it by hand");
+        }
+        if (entry->env_var != var || entry->key != scoped_key(env, project, name)) {
+            throw std::runtime_error("manifest entry '" + name + "' in env '" + env +
+                                     "' already exists with a different key or env_var_name; fix it by hand");
         }
     }
     return out;

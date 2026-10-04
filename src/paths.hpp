@@ -38,11 +38,6 @@ struct Paths {
     std::string socket;
 };
 
-inline std::string env_or(const char* name, const std::string& fallback) {
-    const char* v = std::getenv(name);
-    return (v && *v) ? std::string(v) : fallback;
-}
-
 inline std::string home_dir() {
     const char* home = std::getenv("HOME");
     if (!home || !*home) {
@@ -51,11 +46,16 @@ inline std::string home_dir() {
     return home;
 }
 
+inline std::string xdg_dir_or_home(const char* xdg_var, const char* home_suffix) {
+    const char* xdg_value = std::getenv(xdg_var);
+    return (xdg_value && *xdg_value) ? std::string(xdg_value) : home_dir() + home_suffix;
+}
+
 inline Paths resolve_paths() {
     Paths p;
     const std::string app = std::string("/") + kAppName + "/";
-    p.store = env_or("XDG_DATA_HOME", home_dir() + "/.local/share") + app + kStoreFileName;
-    const std::string config_dir = env_or("XDG_CONFIG_HOME", home_dir() + "/.config") + app;
+    p.store = xdg_dir_or_home("XDG_DATA_HOME", "/.local/share") + app + kStoreFileName;
+    const std::string config_dir = xdg_dir_or_home("XDG_CONFIG_HOME", "/.config") + app;
     p.token = config_dir + kTokenFileName;
     p.registry = config_dir + kRegistryFileName;
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");

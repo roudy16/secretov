@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
         if (cmd == "tui") return run_tui();
 
         if (cmd == "get") {
-            if (argc < 3) {
+            if (argc != 3) {
                 std::cerr << "usage: secretov get KEY\n";
                 return 2;
             }
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
         }
         if (cmd == "set") return cmd_set(argc - 2, argv + 2);
         if (cmd == "delete") {
-            if (argc < 3) {
+            if (argc != 3) {
                 std::cerr << "usage: secretov delete KEY\n";
                 return 2;
             }

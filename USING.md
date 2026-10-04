@@ -364,6 +364,7 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `no environment: pass -e ENV, set SECRETOV_ENV, or add default_env` | Step 4 skipped | Pass `-e`, or add `default_env` |
 | `environment 'X' not found in <manifest>` | No such env block | Import that env, or fix the `-e` value |
 | `already in store (pass --overwrite to replace)` | Re-importing existing keys | `--overwrite` if replacing is intended |
+| `manifest entry 'X' in env 'E' already exists with a different key or env_var_name` | `import` would store `E/project/X`, but the manifest's `X` reads another key or sets another variable | Fix or remove that entry by hand, then rerun |
 | `missing secrets: ...` | Manifest names keys the store lacks | Import them, or `set` each one |
 | `'X' (env dev) is set in both vars and secrets` | Same variable defined twice | Remove one of the two definitions |
 | `var 'X' (env dev) must be a scalar value` | A nested map/list under `vars:` | Use a plain scalar |

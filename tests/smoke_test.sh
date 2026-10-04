@@ -400,7 +400,17 @@ if "$BIN" get VIA_STDIN >/dev/null 2>&1; then
     cp "$TOKEN.good" "$TOKEN"
     fail "request with wrong token should be rejected"
 fi
+# exec --secret must surface the daemon's error, not call the key missing
+EXEC_ERR="$("$BIN" exec --secret VIA_STDIN=X -- true 2>&1)" && { cp "$TOKEN.good" "$TOKEN"; fail "exec with wrong token succeeded"; }
 cp "$TOKEN.good" "$TOKEN"
+echo "$EXEC_ERR" | grep -q "invalid token" || fail "exec --secret hid the daemon error: $EXEC_ERR"
+
+# get/delete take exactly one KEY
+set +e
+"$BIN" get VIA_STDIN extra >/dev/null 2>&1; GET_EXTRA=$?
+"$BIN" delete VIA_STDIN extra >/dev/null 2>&1; DELETE_EXTRA=$?
+set -e
+[ "$GET_EXTRA" = 2 ] && [ "$DELETE_EXTRA" = 2 ] || fail "extra args to get/delete not a usage error"
 
 # 7. SIGTERM stops daemon and removes socket
 kill -TERM "$DAEMON_PID"
