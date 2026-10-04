@@ -4,6 +4,7 @@
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,10 @@ void test_key_names() {
     assert(key_name_error("dev//KEY"));
     assert(key_name_error("dev/a\tb"));
     assert(key_name_error(std::string("dev/a\x7f", 6)));
+    assert(key_name_error("dev/a\xc2\x85"));  // C1 NEL
+    assert(!key_name_error("dev/é"));
+    assert(!secretov::has_control_char("plain é"));
+    assert(secretov::has_control_char("a\nb"));
 }
 
 void test_folder_prefix() {
@@ -56,6 +61,64 @@ void test_readline_edits() {
     secretov::erase_word_before(text, cursor);
     secretov::erase_to_line_start(text, cursor);
     assert(text == "first\nond" && cursor == 0);
+
+    text = "ac";
+    cursor = 1;
+    secretov::insert_at_cursor(text, cursor, "b");
+    assert(text == "abc" && cursor == 2);
+    cursor = 99;  // out of range: clamped to the end
+    secretov::insert_at_cursor(text, cursor, "de");
+    assert(text == "abcde" && cursor == 5);
+
+    text = "aé";
+    secretov::erase_last_code_point(text);
+    assert(text == "a");
+    secretov::erase_last_code_point(text);
+    assert(text.empty());
+    secretov::erase_last_code_point(text);
+    assert(text.empty());
+}
+
+using secretov::Row;
+
+std::vector<std::string> ids(const std::vector<Row>& rows) {
+    std::vector<std::string> row_ids;
+    for (const Row& row : rows) row_ids.push_back(row.id);
+    return row_ids;
+}
+
+void test_tree_rows() {
+    const std::vector<std::string> keys = {"TOP", "dev/api/KEY", "dev/api/OTHER", "dev/db/PASS", "prod/X"};
+    std::vector<Row> rows;
+    std::vector<std::string> labels;
+
+    secretov::build_rows(keys, "", {}, rows, labels);
+    assert((ids(rows) == std::vector<std::string>{"TOP", "dev/", "dev/api/", "dev/api/KEY", "dev/api/OTHER", "dev/db/",
+                                                  "dev/db/PASS", "prod/", "prod/X"}));
+    assert((labels == std::vector<std::string>{"TOP", "dev/", "api/", "KEY", "OTHER", "db/", "PASS", "prod/", "X"}));
+    assert(rows[1].dir && rows[1].depth == 0 && rows[3].depth == 2 && !rows[3].dir && rows[0].depth == 0);
+
+    secretov::build_rows(keys, "", {"dev/api/"}, rows, labels);
+    assert((ids(rows) == std::vector<std::string>{"TOP", "dev/", "dev/api/", "dev/db/", "dev/db/PASS", "prod/", "prod/X"}));
+    secretov::build_rows(keys, "", {"dev/"}, rows, labels);
+    assert((ids(rows) == std::vector<std::string>{"TOP", "dev/", "prod/", "prod/X"}));
+    assert(labels.size() == rows.size());
+
+    // A filter opens folded folders and keeps only the matching keys' folders.
+    secretov::build_rows(keys, "pass", {"dev/"}, rows, labels);
+    assert((ids(rows) == std::vector<std::string>{"dev/", "dev/db/", "dev/db/PASS"}));
+
+    secretov::build_rows({"a/\nb"}, "", {}, rows, labels);
+    assert(labels.back() == "?b");
+
+    secretov::build_rows(keys, "", {}, rows, labels);
+    // Next sibling first, then the previous one, then enclosing folders, then the row above them.
+    assert((secretov::delete_landing(rows, 3) ==
+            std::vector<std::string>{"dev/api/OTHER", "dev/api/", "dev/", "TOP"}));
+    assert((secretov::delete_landing(rows, 4) == std::vector<std::string>{"dev/api/KEY", "dev/api/", "dev/", "dev/api/KEY"}));
+    // Last child of the last folder: the folder itself, then the row above it.
+    assert((secretov::delete_landing(rows, 8) == std::vector<std::string>{"prod/", "dev/db/PASS"}));
+    assert((secretov::delete_landing(rows, 0) == std::vector<std::string>{"dev/"}));
 }
 
 void test_layout_text() {
@@ -125,6 +188,7 @@ int main() {
     test_layout_text();
     test_filter_and_copy();
     test_wrapping_and_printable();
+    test_tree_rows();
     std::printf("OK\n");
     return 0;
 }

@@ -45,12 +45,17 @@ std::string trim_key_name(std::string_view name) {
     return std::string(name.substr(first, last - first));
 }
 
+bool has_control_char(std::string_view text) {
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        auto byte = static_cast<unsigned char>(text[i]);
+        if (byte < 0x20 || byte == 0x7f || is_c1_at(text, i)) return true;
+    }
+    return false;
+}
+
 std::optional<std::string> key_name_error(std::string_view name) {
     if (name.empty()) return "name required";
-    for (char c : name) {
-        auto byte = static_cast<unsigned char>(c);
-        if (byte < 0x20 || byte == 0x7f) return "name can't contain control characters";
-    }
+    if (has_control_char(name)) return "name can't contain control characters";
     if (name.front() == '/') return "name can't start with '/'";
     if (name.back() == '/') return "name can't end with '/' (add a KEY after the folder)";
     if (name.find("//") != std::string_view::npos) return "name can't have an empty segment ('//')";
@@ -81,6 +86,20 @@ std::string osc52_copy_sequence(std::string_view value) {
                       sodium_base64_VARIANT_ORIGINAL);
     sequence.back() = '\a';  // in place of the NUL
     return sequence;
+}
+
+void insert_at_cursor(std::string& text, int& cursor, std::string_view inserted) {
+    std::size_t position = clamped(text, cursor);
+    text.insert(position, inserted);
+    cursor = static_cast<int>(position + inserted.size());
+}
+
+void erase_last_code_point(std::string& text) {
+    while (!text.empty()) {
+        char removed = text.back();
+        text.pop_back();
+        if (starts_code_point(removed)) return;
+    }
 }
 
 int line_start(const std::string& text, int cursor) {
@@ -242,6 +261,73 @@ std::string fit_hints(const std::vector<std::string>& hints, int width) {
     };
     while (kept.size() > 1 && text_columns(joined()) > width) kept.erase(kept.end() - 2);
     return joined();
+}
+
+// Keys are sorted, so a folder's members are contiguous and its row is
+// emitted the first time the prefix appears.
+void build_rows(const std::vector<std::string>& keys, std::string_view filter, const std::set<std::string>& collapsed,
+                std::vector<Row>& rows, std::vector<std::string>& labels) {
+    rows.clear();
+    labels.clear();
+    auto is_folded = [&](const std::string& folder_id) { return filter.empty() && collapsed.count(folder_id) > 0; };
+    std::vector<std::string> branch;  // folder ids open along the current key
+    for (const std::string& key : keys) {
+        if (!contains_ignore_case(key, filter)) continue;
+        std::vector<std::string> folders;  // "a/", "a/b/", ... for this key
+        for (std::size_t slash = key.find('/'); slash != std::string::npos; slash = key.find('/', slash + 1)) {
+            folders.push_back(key.substr(0, slash + 1));
+        }
+        std::size_t shared = 0;
+        while (shared < folders.size() && shared < branch.size() && branch[shared] == folders[shared]) ++shared;
+        branch.resize(shared);
+        bool hidden = false;
+        for (const std::string& folder : branch) hidden = hidden || is_folded(folder);
+        for (std::size_t depth = shared; depth < folders.size(); ++depth) {
+            branch.push_back(folders[depth]);
+            if (!hidden) {
+                std::size_t name_start = depth == 0 ? 0 : folders[depth - 1].size();
+                rows.push_back({folders[depth], true, static_cast<int>(depth)});
+                labels.push_back(printable(std::string_view(folders[depth]).substr(name_start)));
+            }
+            hidden = hidden || is_folded(folders[depth]);
+        }
+        if (!hidden) {
+            std::size_t name_start = folders.empty() ? 0 : folders.back().size();
+            rows.push_back({key, false, static_cast<int>(folders.size())});
+            labels.push_back(printable(std::string_view(key).substr(name_start)));
+        }
+    }
+}
+
+std::vector<std::string> delete_landing(const std::vector<Row>& rows, int selected) {
+    auto row_at = [&](int index) -> const Row& { return rows[static_cast<std::size_t>(index)]; };
+    std::vector<std::string> candidates;
+    int depth = row_at(selected).depth;
+    int row_count = static_cast<int>(rows.size());
+    for (int i = selected + 1; i < row_count && row_at(i).depth >= depth; ++i) {
+        if (row_at(i).depth == depth) {
+            candidates.push_back(row_at(i).id);
+            break;
+        }
+    }
+    for (int i = selected - 1; i >= 0 && row_at(i).depth >= depth; --i) {
+        if (row_at(i).depth == depth) {
+            candidates.push_back(row_at(i).id);
+            break;
+        }
+    }
+    const std::string& deleted = row_at(selected).id;
+    for (std::string folder = folder_prefix(deleted); !folder.empty();
+         folder = folder_prefix(std::string_view(folder).substr(0, folder.size() - 1))) {
+        candidates.push_back(folder);
+    }
+    for (int i = selected - 1; i >= 0; --i) {
+        if (deleted.compare(0, row_at(i).id.size(), row_at(i).id) != 0) {
+            candidates.push_back(row_at(i).id);
+            break;
+        }
+    }
+    return candidates;
 }
 
 }  // namespace secretov

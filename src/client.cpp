@@ -101,7 +101,7 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
     if (!sent) {
         throw DaemonUnreachable(conn->timed_out() ? "daemon busy: " + no_reply + " (another client may be holding it)"
                                                   : "failed to send request to daemon",
-                                DaemonUnreachable::Stage::NotSent);
+                                DaemonUnreachable::Stage::NotSent, conn->timed_out(), timeout_seconds);
     }
     auto line = conn->read_line(kMaxResponseBytes);
     if (!line) {
@@ -110,7 +110,7 @@ nlohmann::json DaemonClient::send(const nlohmann::json& req) const {
         std::string why = conn->timed_out() ? "daemon busy: request sent but " + no_reply
                                             : "daemon closed the connection without a reply";
         if (!read_only) why += "; it may still be applied (check with list/get)";
-        throw DaemonUnreachable(why, DaemonUnreachable::Stage::Sent);
+        throw DaemonUnreachable(why, DaemonUnreachable::Stage::Sent, conn->timed_out(), timeout_seconds);
     }
     nlohmann::json resp;
     try {
@@ -491,7 +491,7 @@ int cmd_exec(int argc, char** argv) {
                 nlohmann::json resp = client.send(nlohmann::json{{"op", "get"}, {"key", key}});
                 if (!resp.value("ok", false)) {
                     std::string error = resp.value("error", std::string("request failed"));
-                    if (error != "not found") throw std::runtime_error(error);
+                    if (error != kErrNotFound) throw std::runtime_error(error);
                     missing.push_back(key);
                     continue;
                 }

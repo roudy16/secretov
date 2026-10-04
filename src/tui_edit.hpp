@@ -5,6 +5,7 @@
 // into the edited string, as FTXUI's Input keeps them.
 
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,6 +28,15 @@ bool contains_ignore_case(std::string_view text, std::string_view needle);
 // The OSC 52 escape that asks the terminal to put `value` on the clipboard
 // (base64, BEL-terminated). It encodes the secret, so the caller zeroes it.
 std::string osc52_copy_sequence(std::string_view value);
+
+// Whether `text` holds a control character: C0, DEL or C1.
+bool has_control_char(std::string_view text);
+
+// Inserts `inserted` at `cursor` (clamped into `text`) and moves the cursor past it.
+void insert_at_cursor(std::string& text, int& cursor, std::string_view inserted);
+
+// Drops the last UTF-8 code point of `text` (Backspace at its end).
+void erase_last_code_point(std::string& text);
 
 // Readline-style edits on the line holding the cursor.
 void erase_to_line_start(std::string& text, int& cursor);  // Ctrl-U
@@ -71,5 +81,24 @@ std::string printable_value(std::string_view value);
 // `hints` joined by two spaces, dropping hints before the last one (from the
 // back) until the line fits `width`; the last hint is always kept.
 std::string fit_hints(const std::vector<std::string>& hints, int width);
+
+// One visible line of the key tree: a folder ("dev/proj/") or a secret.
+struct Row {
+    std::string id;  // full key, or folder prefix ending in '/'
+    bool dir;
+    int depth;
+};
+
+// The visible tree rows for sorted `keys`: those containing `filter` (any
+// case), under folders not in `collapsed` (ignored while a filter is set).
+// `labels` gets each row's last path segment, printable, parallel to `rows`;
+// both are cleared first.
+void build_rows(const std::vector<std::string>& keys, std::string_view filter, const std::set<std::string>& collapsed,
+                std::vector<Row>& rows, std::vector<std::string>& labels);
+
+// Ids to select after deleting rows[selected], best first: the next sibling,
+// else the previous one, else the enclosing folders innermost first, else the
+// row above all of them (for when every enclosing folder was emptied).
+std::vector<std::string> delete_landing(const std::vector<Row>& rows, int selected);
 
 }  // namespace secretov

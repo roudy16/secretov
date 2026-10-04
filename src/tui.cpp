@@ -88,18 +88,9 @@ void take_value(nlohmann::json& resp, std::string& into) {
     wipe(held);
 }
 
-bool is_busy(const DaemonUnreachable& e) { return std::string_view(e.what()).starts_with("daemon busy"); }
-
 // Why a sent request got no reply, short enough for the status bar.
 std::string no_reply_reason(const DaemonUnreachable& e) {
-    return is_busy(e) ? "no reply in 5 s" : "daemon hung up";
-}
-
-bool has_control_char(const std::string& text) {
-    return std::any_of(text.begin(), text.end(), [](char c) {
-        auto byte = static_cast<unsigned char>(c);
-        return byte < 0x20 || byte == 0x7f;
-    });
+    return e.timed_out ? "no reply in " + std::to_string(e.timeout_seconds) + " s" : "daemon hung up";
 }
 
 // Puts the escape on the controlling terminal itself, past FTXUI's frame output.
@@ -194,13 +185,6 @@ const HelpLine kHelp[] = {
     {"Esc", "cancel"},
     {nullptr, "confirm [y/N]"},
     {"y", "yes; Enter, Esc or any other key: no"},
-};
-
-// One visible line of the key tree: a folder ("dev/proj/") or a secret.
-struct Row {
-    std::string id;  // full key, or folder prefix ending in '/'
-    bool dir;
-    int depth;
 };
 
 // Every color the TUI draws, by role: slate structure, one teal accent, violet
@@ -379,6 +363,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     auto row_at = [&](int i) -> const Row& { return rows[static_cast<std::size_t>(i)]; };
 
+    auto selected_id = [&]() -> std::string { return rows.empty() ? "" : row_at(selected).id; };
+
     // Full key of the selected row; nullopt on a folder or an empty list.
     auto current_key = [&]() -> std::optional<std::string> {
         if (rows.empty() || row_at(selected).dir) return std::nullopt;
@@ -395,7 +381,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     // Runs before every event and every frame, so leaving a row re-masks its
     // value before the next key acts: a quick 'j r' reveals the new row.
     auto sync_selection = [&] {
-        std::string id = rows.empty() ? "" : row_at(selected).id;
+        std::string id = selected_id();
         if (id == selection_id) return;
         selection_id = id;
         remask();
@@ -422,44 +408,11 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         }
     };
 
-    // Rebuild the visible rows from `keys`, `filter` and `collapsed`. Keys are
-    // sorted, so a folder's members are contiguous and its row is emitted the
-    // first time the prefix appears. Returns whether `select_id` was found and
-    // selected; otherwise the selection keeps its index.
+    // Rebuild the visible rows from `keys`, `filter` and `collapsed`. Returns
+    // whether `select_id` was found and selected; otherwise the selection
+    // keeps its index.
     auto rebuild_rows = [&](const std::string& select_id) {
-        rows.clear();
-        labels.clear();
-        std::vector<std::string> branch;  // folder ids open along the current key
-        for (const std::string& key : keys) {
-            if (!contains_ignore_case(key, filter)) continue;
-            std::vector<std::string> folders;  // "a/", "a/b/", ... for this key
-            for (std::size_t slash = key.find('/'); slash != std::string::npos;
-                 slash = key.find('/', slash + 1)) {
-                folders.push_back(key.substr(0, slash + 1));
-            }
-            std::size_t shared = 0;
-            while (shared < folders.size() && shared < branch.size() &&
-                   branch[shared] == folders[shared]) {
-                ++shared;
-            }
-            branch.resize(shared);
-            bool hidden = false;
-            for (const std::string& f : branch) hidden = hidden || is_folded(f);
-            for (std::size_t d = shared; d < folders.size(); ++d) {
-                branch.push_back(folders[d]);
-                if (!hidden) {
-                    std::size_t name_start = d == 0 ? 0 : folders[d - 1].size();
-                    rows.push_back({folders[d], true, static_cast<int>(d)});
-                    labels.push_back(printable(std::string_view(folders[d]).substr(name_start)));
-                }
-                hidden = hidden || is_folded(folders[d]);
-            }
-            if (!hidden) {
-                std::size_t name_start = folders.empty() ? 0 : folders.back().size();
-                rows.push_back({key, false, static_cast<int>(folders.size())});
-                labels.push_back(printable(std::string_view(key).substr(name_start)));
-            }
-        }
+        build_rows(keys, filter, collapsed, rows, labels);
         bool found = !select_id.empty() && select_row(select_id);
         if (selected >= static_cast<int>(rows.size())) selected = static_cast<int>(rows.size()) - 1;
         if (selected < 0) selected = 0;
@@ -476,7 +429,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             daemon_state = DaemonState::Ok;
             return resp;
         } catch (const DaemonUnreachable& e) {
-            daemon_state = is_busy(e) ? DaemonState::Busy : DaemonState::Unreachable;
+            daemon_state = e.timed_out ? DaemonState::Busy : DaemonState::Unreachable;
             // The socket path would push the fix off the status bar; ? shows it.
             if (e.stage == DaemonUnreachable::Stage::NotRunning) {
                 throw DaemonUnreachable("daemon not running: start it (scripts/service start), then R", e.stage);
@@ -505,7 +458,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     // Reports a failed call on `key`; a key deleted elsewhere also reloads the list.
     auto fail = [&](const std::exception& e, const std::string& key) {
-        if (std::string_view(e.what()) == "not found" && !key.empty()) {
+        if (std::string_view(e.what()) == kErrNotFound && !key.empty()) {
             refresh(key);
             complain("'" + key + "' was removed elsewhere; list reloaded");
             return;
@@ -514,7 +467,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     };
 
     auto reload = [&] {
-        if (refresh(rows.empty() ? "" : row_at(selected).id)) {
+        if (refresh(selected_id())) {
             say("reloaded: " + std::to_string(keys.size()) + " key(s)");
         }
     };
@@ -552,7 +505,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     // Re-filters, keeping the selected row if it still matches, else the first match.
     auto apply_filter = [&] {
-        if (rebuild_rows(rows.empty() ? "" : row_at(selected).id)) return;
+        if (rebuild_rows(selected_id())) return;
         auto first_secret = std::find_if(rows.begin(), rows.end(), [](const Row& row) { return !row.dir; });
         if (first_secret != rows.end()) selected = static_cast<int>(first_secret - rows.begin());
     };
@@ -561,7 +514,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         bool was_set = !filter.empty();
         wipe(filter);  // a secret pasted here by mistake must not linger, even backspaced away
         if (!was_set) return;
-        std::string id = rows.empty() ? "" : row_at(selected).id;
+        std::string id = selected_id();
         expand_to(id);
         rebuild_rows(id);
     };
@@ -712,15 +665,19 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         return true;
     };
 
-    auto submit_add = [&] {
+    auto submit_form = [&] {
         if (std::optional<std::string> problem = form_problem()) {
             show_form_problem = true;
             complain(*problem);
             return;
         }
+        if (mode == Mode::Edit) {
+            save_form(current_key().value_or(""), "updated");
+            return;
+        }
         std::string name = trim_key_name(add_name);
         // The CLI may have added or removed this key meanwhile.
-        if (!refresh(rows.empty() ? "" : row_at(selected).id)) return;
+        if (!refresh(selected_id())) return;
         if (key_exists(name)) {
             mode = Mode::ConfirmOverwrite;
             say("'" + name + "' already exists");
@@ -729,20 +686,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         save_form(name, "added");
     };
 
-    auto submit_edit = [&] {
-        if (std::optional<std::string> problem = form_problem()) {
-            show_form_problem = true;
-            complain(*problem);
-            return;
-        }
-        save_form(current_key().value_or(""), "updated");
-    };
-
-    auto insert_into_value = [&](std::string_view text) {
-        value_cursor = std::clamp(value_cursor, 0, static_cast<int>(add_value.size()));
-        add_value.insert(static_cast<std::size_t>(value_cursor), text);
-        value_cursor += static_cast<int>(text.size());
-    };
+    auto insert_into_value = [&](std::string_view text) { insert_at_cursor(add_value, value_cursor, text); };
 
     // Bracketed paste arrives whole here; it only ever lands in a form input
     // or the filter, so a pasted newline can neither submit nor run Normal-mode keys.
@@ -760,9 +704,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             if (has_control_char(paste_buffer)) {
                 complain("paste refused: a name is one line");
             } else {
-                name_cursor = std::clamp(name_cursor, 0, static_cast<int>(add_name.size()));
-                add_name.insert(static_cast<std::size_t>(name_cursor), paste_buffer);
-                name_cursor += static_cast<int>(paste_buffer.size());
+                insert_at_cursor(add_name, name_cursor, paste_buffer);
             }
         } else {
             // Like `set`: a token copied with its line ending must not store it.
@@ -774,44 +716,10 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         wipe(paste_buffer);
     };
 
-    // Where the selection lands after deleting the selected row: the next
-    // sibling, else the previous one, else the nearest enclosing folder left,
-    // else the row above the emptied folders.
-    auto delete_landing = [&] {
-        std::vector<std::string> candidates;
-        int depth = row_at(selected).depth;
-        int row_count = static_cast<int>(rows.size());
-        for (int i = selected + 1; i < row_count && row_at(i).depth >= depth; ++i) {
-            if (row_at(i).depth == depth) {
-                candidates.push_back(row_at(i).id);
-                break;
-            }
-        }
-        for (int i = selected - 1; i >= 0 && row_at(i).depth >= depth; --i) {
-            if (row_at(i).depth == depth) {
-                candidates.push_back(row_at(i).id);
-                break;
-            }
-        }
-        const std::string& deleted = row_at(selected).id;
-        for (std::string folder = folder_prefix(deleted); !folder.empty();
-             folder = folder_prefix(std::string_view(folder).substr(0, folder.size() - 1))) {
-            candidates.push_back(folder);
-        }
-        // Every enclosing folder emptied: the row above them.
-        for (int i = selected - 1; i >= 0; --i) {
-            if (deleted.compare(0, row_at(i).id.size(), row_at(i).id) != 0) {
-                candidates.push_back(row_at(i).id);
-                break;
-            }
-        }
-        return candidates;
-    };
-
     auto do_delete = [&] {
         mode = Mode::Normal;
         std::string key = current_key().value_or("");
-        std::vector<std::string> landing = delete_landing();
+        std::vector<std::string> landing = delete_landing(rows, selected);
         try {
             call("delete", key, std::nullopt);
         } catch (const DaemonUnreachable& e) {
@@ -1308,11 +1216,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
             if (mode == Mode::Add) form_field = 0;
             return;
         }
-        if (mode == Mode::Add) {
-            submit_add();
-        } else if (mode == Mode::Edit) {
-            submit_edit();
-        }
+        if (mode == Mode::Add || mode == Mode::Edit) submit_form();
         ignore_keys_until = Clock::now() + kAfterSubmitQuiet;
     };
 
@@ -1403,11 +1307,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
                 clear_filter();
                 mode = Mode::Normal;
             } else if (event == Event::Backspace) {
-                while (!filter.empty()) {
-                    char removed = filter.back();
-                    filter.pop_back();
-                    if ((static_cast<unsigned char>(removed) & 0xC0) != 0x80) break;  // whole code point gone
-                }
+                erase_last_code_point(filter);
                 apply_filter();
             } else if (event == Event::CtrlU) {
                 wipe(filter);
@@ -1624,13 +1524,13 @@ int run_tui() {
         std::fprintf(stderr, "secretov: %s\n", e.what());
         if (e.stage == DaemonUnreachable::Stage::NotRunning) {
             std::fprintf(stderr, "  %s\n", kStartDaemonHint);
-        } else if (is_busy(e)) {
+        } else if (e.timed_out) {
             std::fprintf(stderr, "  %s\n", kBusyDaemonHint);
         }
         return 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "secretov: %s\n", e.what());
-        if (std::string_view(e.what()) == "invalid token") {
+        if (std::string_view(e.what()) == kErrInvalidToken) {
             std::fprintf(stderr, "  %s differs from the token the daemon loaded at start; restart the daemon\n",
                          paths.token.c_str());
         }

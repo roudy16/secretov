@@ -12,6 +12,10 @@ namespace secretov {
 // Cap on one request line; the daemon drops a peer that sends more without '\n'.
 constexpr std::size_t kMaxRequestBytes = 1 << 20;  // 1 MiB
 
+// Daemon error texts that clients act on rather than just show.
+constexpr char kErrNotFound[] = "not found";
+constexpr char kErrInvalidToken[] = "invalid token";
+
 struct Request {
     std::string token;
     std::string op;

@@ -18,8 +18,11 @@ struct DaemonUnreachable : std::runtime_error {
         NotSent,     // connected, but the request never left
         Sent,        // the request is in the daemon's queue: it may still be applied
     };
-    DaemonUnreachable(const std::string& what, Stage at) : std::runtime_error(what), stage(at) {}
+    DaemonUnreachable(const std::string& what, Stage at, bool timed_out = false, int timeout_seconds = 0)
+        : std::runtime_error(what), stage(at), timed_out(timed_out), timeout_seconds(timeout_seconds) {}
     Stage stage;
+    bool timed_out;       // busy: no reply within timeout_seconds
+    int timeout_seconds;  // the reply timeout this request had
 };
 
 // Talks to the daemon over a fresh connection per request (the daemon serves

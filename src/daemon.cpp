@@ -58,7 +58,7 @@ std::string dispatch(Store& store, const Request& req, std::uint64_t now) {
     if (req.op == "get") {
         if (req.key.empty()) return error_response("missing key");
         auto value = store.get(req.key);
-        if (!value) return error_response("not found");
+        if (!value) return error_response(kErrNotFound);
         return ok_value(*value);
     }
     if (req.op == "set") {
@@ -68,7 +68,7 @@ std::string dispatch(Store& store, const Request& req, std::uint64_t now) {
     }
     if (req.op == "delete") {
         if (req.key.empty()) return error_response("missing key");
-        if (!store.remove(req.key)) return error_response("not found");
+        if (!store.remove(req.key)) return error_response(kErrNotFound);
         return ok_response();
     }
     if (req.op == "list") {
@@ -108,7 +108,7 @@ void serve_connection(Connection& conn, Store& store, const std::string& expecte
         }
         std::string response;
         if (!token_matches(expected_token, req->token)) {
-            response = error_response("invalid token");
+            response = error_response(kErrInvalidToken);
         } else {
             try {
                 response = dispatch(store, *req, static_cast<std::uint64_t>(std::time(nullptr)));
