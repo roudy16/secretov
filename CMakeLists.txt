@@ -102,18 +102,11 @@ target_link_libraries(secretov PRIVATE secretov_core
 install(TARGETS secretov)
 
 enable_testing()
-add_executable(store_test tests/store_test.cpp)
-target_link_libraries(store_test PRIVATE secretov_core)
-add_test(NAME store_test COMMAND store_test)
-add_executable(manifest_test tests/manifest_test.cpp)
-target_link_libraries(manifest_test PRIVATE secretov_core)
-add_test(NAME manifest_test COMMAND manifest_test)
-add_executable(paths_test tests/paths_test.cpp)
-target_link_libraries(paths_test PRIVATE secretov_core)
-add_test(NAME paths_test COMMAND paths_test)
-add_executable(tui_edit_test tests/tui_edit_test.cpp)
-target_link_libraries(tui_edit_test PRIVATE secretov_core)
-add_test(NAME tui_edit_test COMMAND tui_edit_test)
+foreach(unit_test store_test manifest_test paths_test tui_edit_test)
+  add_executable(${unit_test} tests/${unit_test}.cpp)
+  target_link_libraries(${unit_test} PRIVATE secretov_core)
+  add_test(NAME ${unit_test} COMMAND ${unit_test})
+endforeach()
 
 add_test(NAME smoke_test
   COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_test.sh $<TARGET_FILE:secretov>)

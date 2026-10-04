@@ -1,6 +1,7 @@
 #include "paths.hpp"
+#include "protocol.hpp"
 
-// Tests must assert even in Release builds (FTXUI's CMake defaults to Release).
+// Tests must assert even in Release builds (CMakeLists.txt defaults an unset build type to Release).
 #undef NDEBUG
 #include <unistd.h>
 
@@ -84,6 +85,31 @@ void test_resolve_paths_without_home(const std::string& dir) {
     assert(threw);
 }
 
+void test_parse_request() {
+    using secretov::parse_request;
+    assert(!parse_request(""));
+    assert(!parse_request("not json"));
+    assert(!parse_request("[]"));
+    assert(!parse_request("\"str\""));
+    assert(!parse_request(R"({"op":"get"})"));
+    assert(!parse_request(R"({"token":"t"})"));
+    assert(!parse_request(R"({"token":1,"op":"get"})"));
+    assert(!parse_request(R"({"token":"t","op":null})"));
+    assert(!parse_request(R"({"token":"t","op":"get","key":5})"));
+    assert(!parse_request(R"({"token":"t","op":"rotate","old":["x"]})"));
+    assert(!parse_request(R"({"token":"t","op":"passwd","new":{}})"));
+
+    auto minimal = parse_request(R"({"token":"t","op":"list"})");
+    assert(minimal && minimal->token == "t" && minimal->op == "list");
+    assert(minimal->key.empty() && minimal->value.empty());
+    assert(minimal->old_pass.empty() && minimal->new_pass.empty());
+
+    auto full = parse_request(
+        R"({"token":"t","op":"passwd","key":"k","value":"v","old":"o","new":"n","extra":1})");
+    assert(full && full->key == "k" && full->value == "v");
+    assert(full->old_pass == "o" && full->new_pass == "n");
+}
+
 }  // namespace
 
 int main() {
@@ -99,6 +125,7 @@ int main() {
     test_write_file_atomic_relative_path(dir);
     test_write_file_atomic_dir_fsync_failure_is_committed(dir);
     test_resolve_paths_without_home(dir);
+    test_parse_request();
 
     std::filesystem::remove_all(dir);
     std::printf("OK\n");

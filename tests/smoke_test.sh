@@ -31,6 +31,28 @@ trap cleanup EXIT
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
+start_daemon() {
+    printf '%s\n' "$1" | "$BIN" daemon >>"$WORK/daemon.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 100); do
+        [ -S "$SOCK" ] && return 0
+        kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited early: $(cat "$WORK/daemon.log")"
+        sleep 0.1
+    done
+    fail "socket did not appear"
+}
+
+stop_daemon() {
+    kill -TERM "$DAEMON_PID"
+    wait "$DAEMON_PID" 2>/dev/null || true
+    DAEMON_PID=""
+    for _ in $(seq 1 50); do
+        [ -S "$SOCK" ] || return 0
+        sleep 0.1
+    done
+    fail "socket still present after SIGTERM"
+}
+
 # 1. init
 printf '%s\n' "$PASS" | "$BIN" init >/dev/null || fail "init"
 [ -f "$TOKEN" ] || fail "token file not created"
@@ -75,14 +97,7 @@ sys.exit(0 if os.WEXITSTATUS(status) == 0 and b"foreground" in out else "got %r"
 PY
 
 # 2. daemon in background; wait for socket
-printf '%s\n' "$PASS" | "$BIN" daemon >"$WORK/daemon.log" 2>&1 &
-DAEMON_PID=$!
-for _ in $(seq 1 100); do
-    [ -S "$SOCK" ] && break
-    kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited early: $(cat "$WORK/daemon.log")"
-    sleep 0.1
-done
-[ -S "$SOCK" ] || fail "socket did not appear"
+start_daemon "$PASS"
 
 # 2b. a second daemon is refused and leaves the first one's socket alone
 SECOND_ERR="$(printf '%s\n' "$PASS" | timeout 5 "$BIN" daemon 2>&1)" && fail "second daemon should be refused"
@@ -233,23 +248,11 @@ printf '%s\n%s\n' "$PASS" "$NEWPASS" | "$BIN" passwd >/dev/null || fail "passwd"
 SHORT_OUT="$(printf '%s\n%s\n' "$NEWPASS" "short" | "$BIN" passwd 2>&1)" || fail "passwd to short"
 echo "$SHORT_OUT" | grep -q "shorter than 12" || fail "no short-passphrase warning: $SHORT_OUT"
 printf '%s\n%s\n' "short" "$NEWPASS" | "$BIN" passwd >/dev/null 2>&1 || fail "passwd back from short"
-kill -TERM "$DAEMON_PID"
-wait "$DAEMON_PID" 2>/dev/null || true
-for _ in $(seq 1 50); do
-    [ -S "$SOCK" ] || break
-    sleep 0.1
-done
+stop_daemon
 if printf '%s\n' "$PASS" | "$BIN" daemon >/dev/null 2>&1; then
     fail "daemon start with old passphrase should fail after passwd"
 fi
-printf '%s\n' "$NEWPASS" | "$BIN" daemon >>"$WORK/daemon.log" 2>&1 &
-DAEMON_PID=$!
-for _ in $(seq 1 100); do
-    [ -S "$SOCK" ] && break
-    kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited early after passwd: $(cat "$WORK/daemon.log")"
-    sleep 0.1
-done
-[ -S "$SOCK" ] || fail "socket did not reappear after passwd restart"
+start_daemon "$NEWPASS"
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after restart with new passphrase"
 printf '%s\n' "$NEWPASS" | "$BIN" rotate
 [ "$("$BIN" get VIA_STDIN)" = "s3cr3t-value" ] || fail "get after rotate with new passphrase"
@@ -413,13 +416,6 @@ set -e
 [ "$GET_EXTRA" = 2 ] && [ "$DELETE_EXTRA" = 2 ] || fail "extra args to get/delete not a usage error"
 
 # 7. SIGTERM stops daemon and removes socket
-kill -TERM "$DAEMON_PID"
-wait "$DAEMON_PID" 2>/dev/null || true
-DAEMON_PID=""
-for _ in $(seq 1 50); do
-    [ -S "$SOCK" ] || break
-    sleep 0.1
-done
-[ -S "$SOCK" ] && fail "socket still present after SIGTERM"
+stop_daemon
 
 echo "SMOKE OK"

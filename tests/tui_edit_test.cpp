@@ -1,6 +1,6 @@
 #include "tui_edit.hpp"
 
-// Tests must assert even in Release builds (FTXUI's CMake defaults to Release).
+// Tests must assert even in Release builds (CMakeLists.txt defaults an unset build type to Release).
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>

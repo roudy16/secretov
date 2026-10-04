@@ -4,12 +4,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// Tests must assert even in Release builds (FTXUI's CMake defaults to Release).
+// Tests must assert even in Release builds (CMakeLists.txt defaults an unset build type to Release).
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -478,6 +479,7 @@ int main() {
     test_manifest_trust();
     test_denied_env_names();
 
+    std::filesystem::remove_all(g_dir);
     std::printf("OK\n");
     return 0;
 }

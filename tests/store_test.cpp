@@ -1,6 +1,6 @@
 #include "store.hpp"
 
-// Tests must assert even in Release builds (FTXUI's CMake defaults to Release).
+// Tests must assert even in Release builds (CMakeLists.txt defaults an unset build type to Release).
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
@@ -51,12 +51,18 @@ void write_raw(const std::string& path, const std::vector<unsigned char>& bytes)
             static_cast<std::streamsize>(bytes.size()));
 }
 
+bool same_bytes(const std::vector<unsigned char>& before, const std::vector<unsigned char>& after,
+                std::size_t offset, std::size_t length) {
+    return std::memcmp(before.data() + offset, after.data() + offset, length) == 0;
+}
+
 template <typename F>
 bool throws_with(F&& fn, const char* needle) {
     try {
         fn();
     } catch (const std::runtime_error& e) {
-        return std::strstr(e.what(), needle) != nullptr;
+        if (std::strstr(e.what(), needle) != nullptr) return true;
+        std::fprintf(stderr, "unexpected message: %s\n", e.what());
     }
     return false;
 }
@@ -154,27 +160,10 @@ void test_rotate() {
     }
     std::vector<unsigned char> after = read_raw(path);
 
-    const std::size_t salt_off = kSaltOff;
-    const std::size_t wrap_nonce_off = kWrapNonceOff;
-    const std::size_t wrapped_key_off = kWrappedKeyOff;
-    const std::size_t wrapped_key_len = kWrappedKeyLen;
-    const std::size_t payload_nonce_off = kPayloadNonceOff;
-
-    bool salt_unchanged = std::memcmp(before.data() + salt_off, after.data() + salt_off,
-                                      crypto_pwhash_SALTBYTES) == 0;
-    bool wrap_nonce_changed = std::memcmp(before.data() + wrap_nonce_off,
-                                          after.data() + wrap_nonce_off,
-                                          crypto_secretbox_NONCEBYTES) != 0;
-    bool wrapped_key_changed = std::memcmp(before.data() + wrapped_key_off,
-                                           after.data() + wrapped_key_off,
-                                           wrapped_key_len) != 0;
-    bool payload_nonce_changed = std::memcmp(before.data() + payload_nonce_off,
-                                             after.data() + payload_nonce_off,
-                                             crypto_secretbox_NONCEBYTES) != 0;
-    assert(salt_unchanged);
-    assert(wrap_nonce_changed);
-    assert(wrapped_key_changed);
-    assert(payload_nonce_changed);
+    assert(same_bytes(before, after, kSaltOff, crypto_pwhash_SALTBYTES));
+    assert(!same_bytes(before, after, kWrapNonceOff, crypto_secretbox_NONCEBYTES));
+    assert(!same_bytes(before, after, kWrappedKeyOff, kWrappedKeyLen));
+    assert(!same_bytes(before, after, kPayloadNonceOff, crypto_secretbox_NONCEBYTES));
 
     Store s = Store::open(path, kPass);
     assert(s.get("secret").value() == "value");
@@ -399,6 +388,7 @@ int main() {
     test_passwd_upgrades_kdf_params();
     test_failed_rotate_and_passwd_leave_store_unchanged();
 
+    std::filesystem::remove_all(g_dir);
     std::printf("OK\n");
     return 0;
 }

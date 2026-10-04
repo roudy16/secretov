@@ -1,6 +1,6 @@
 #pragma once
 
-// Path resolution and small shared client/daemon helpers (Milestone 3).
+// Path resolution and small shared client/daemon helpers.
 // Header-only: these are thin wrappers over env/filesystem/termios and are
 // used by main, the daemon, and the client.
 

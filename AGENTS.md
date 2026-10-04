@@ -29,13 +29,18 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   `read_manifest_text` (owner/mode check) is the only way a manifest is read.
 - `src/client.{hpp,cpp}` (scope resolution for exec/import/list lives here),
   `src/tui.cpp` (+ `src/tui_edit.{hpp,cpp}`: FTXUI-free helpers — key
-  name validation, readline edits, wrapping/ellipsizing for the layout, filter
-  matching, help-row layout, control-char display, the OSC 52 copy escape), `src/paths.hpp` (all on-disk file names as constants —
-  single source of truth), `src/protocol.hpp`.
-- `tests/store_test.cpp`, `tests/manifest_test.cpp`, `tests/paths_test.cpp`,
-  `tests/tui_edit_test.cpp`
-  (assert-based, no framework), `tests/smoke_test.sh` (full daemon lifecycle
-  + scopes in a scratch env; needs python3 for its pty checks),
+  name validation, readline edits, tree-row building and delete landing,
+  wrapping/ellipsizing for the layout, filter matching, help-row layout,
+  control-char display, the OSC 52 copy escape).
+- `src/paths.hpp` — all on-disk file names as constants (single source of
+  truth), plus shared I/O helpers: atomic write, secret-line reads, `wipe`.
+- `src/protocol.hpp` — request parsing (the daemon's trust boundary) and the
+  daemon error texts clients act on (`kErrNotFound`, `kErrInvalidToken`).
+- `tests/store_test.cpp`, `tests/manifest_test.cpp`, `tests/paths_test.cpp`
+  (also covers `parse_request`), `tests/tui_edit_test.cpp`
+  (assert-based, no framework; one CMake `foreach` builds them),
+  `tests/smoke_test.sh` (full daemon lifecycle + scopes in a scratch env;
+  needs python3 for its pty checks),
   `tests/hardening_test.sh` (readelf: PIE, RELRO, BIND_NOW, non-exec stack).
 - `scripts/service` + `scripts/linux-systemd.sh` — run the daemon as a
   sandboxed systemd user unit bound to the graphical session, passphrase from
