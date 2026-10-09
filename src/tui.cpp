@@ -118,6 +118,7 @@ ProjectMarks load_project_marks() {
         manifest_path = find_manifest_upward(std::filesystem::current_path().string());
         if (!manifest_path) return marks;
         Manifest manifest = load_manifest(*manifest_path);
+        if (manifest.backend.type != BackendType::Local) return marks;  // its paths are not store keys
         for (const auto& [env, entries] : manifest.envs) {
             for (const SecretEntry& entry : entries) {
                 marks.env_vars_by_key[entry.path].push_back(printable(entry.env_var + " (" + env + ")"));
@@ -718,15 +719,13 @@ int run_ui(DaemonClient& daemon, Backend& backend, const ProjectMarks& marks) {
         std::vector<std::string> landing = delete_landing(rows, selected);
         try {
             call([&] { backend.remove(key); });
-        } catch (const BackendError& e) {
-            if (!e.maybe_applied) {
-                fail(e, key);
-            } else {
-                complain(no_reply_reason(e) + ": '" + key + "' may still be deleted; R reloads to check");
-            }
-            return;
         } catch (const std::exception& e) {
-            fail(e, key);
+            auto* backend_error = dynamic_cast<const BackendError*>(&e);
+            if (backend_error && backend_error->maybe_applied) {
+                complain(no_reply_reason(*backend_error) + ": '" + key + "' may still be deleted; R reloads to check");
+            } else {
+                fail(e, key);
+            }
             return;
         }
         say("deleted " + key);

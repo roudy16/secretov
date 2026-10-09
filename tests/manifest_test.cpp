@@ -209,7 +209,7 @@ void test_registry_write_targets_and_trust() {
     // Compat break 3: the registry goes through the manifests' owner/mode check.
     write_private(path, "write_targets: [gcp:acme-secrets]\nprojects: {demo: {root: /tmp}}\n");
     assert(::chmod(path.c_str(), 0646) == 0);
-    assert(throws_with([&] { registry_write_targets(path); }, ("writable by everyone; fix with: chmod o-w '" + path + "'").c_str()));
+    assert(throws_with([&] { registry_write_targets(path); }, ("refusing registry '" + path + "': writable by everyone; fix with: chmod o-w '" + path + "'").c_str()));
     assert(throws_with([&] { registry_project_root(path, "demo"); }, "writable by everyone"));
     assert(::chmod(path.c_str(), 0600) == 0);
     assert(registry_project_root(path, "demo"));
@@ -218,7 +218,7 @@ void test_registry_write_targets_and_trust() {
     assert(::mkdir(open_dir.c_str(), 0700) == 0);
     write_private(open_dir + "/projects.yaml", "write_targets: [gcp:acme-secrets]\n");
     assert(::chmod(open_dir.c_str(), 0757) == 0);
-    assert(throws_with([&] { registry_write_targets(open_dir + "/projects.yaml"); }, ("manifest directory '" + open_dir + "'").c_str()));
+    assert(throws_with([&] { registry_write_targets(open_dir + "/projects.yaml"); }, ("registry directory '" + open_dir + "'").c_str()));
     assert(::chmod(open_dir.c_str(), 0700) == 0);
 }
 
@@ -360,7 +360,7 @@ void test_kinds() {
         assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: kv\n        path: x\n"), "t"); }, "kind kv needs key"));
         assert(throws_with([&] { parse_manifest(header + entry_yaml("        path: x\n        key: k\n"), "t"); }, "needs kind: kv"));
         assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: text\n        path: x\n        key: k\n"), "t"); }, "needs kind: kv"));
-        assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: kv\n        path: x\n        key: \"\"\n"), "t"); }, "has an empty key"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: kv\n        path: x\n        key: \"\"\n"), "t"); }, "secret 's' has an empty key"));
         assert(throws_with([&] { parse_manifest(header + entry_yaml("        path: [x]\n"), "t"); }, "path must be a string"));
     }
 }
@@ -383,7 +383,9 @@ void test_cloud_denied_env_names() {
     for (const char* name : {"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "aws_endpoint_url_secrets_manager", "CLOUDSDK_CONFIG", "CLOUDSDK_CORE_PROJECT",
                              "cloudsdk_api_endpoint_overrides_secretmanager", "AWS_EC2_METADATA_SERVICE_ENDPOINT", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
                              "AWS_WEB_IDENTITY_TOKEN_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_UNIVERSE_DOMAIN", "GCE_METADATA_HOST",
-                             "GCE_METADATA_IP", "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "aws_profile"}) {
+                             "GCE_METADATA_IP", "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "aws_profile", "GCE_METADATA_ROOT", "AWS_DATA_PATH",
+                             "AWS_CSM_HOST", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+                             "HTTPLIB2_CA_CERTS"}) {
         std::string as_var = std::string("name: p\nenv:\n  dev:\n    vars:\n      ") + name + ": x\n";
         assert(throws_with([&] { parse_manifest(as_var, "t"); }, "cannot be set from a manifest"));
         std::string as_secret = std::string("name: p\nenv:\n  dev:\n    secrets:\n      s:\n        env_var_name: ") + name + "\n";

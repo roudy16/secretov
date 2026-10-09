@@ -412,6 +412,22 @@ printf '%s' "gone" | "$BIN" set TMP_DEL -p demo -e dev
 ( cd "$PROJ" && "$BIN" delete TMP_DEL -e dev ) || fail "delete -e"
 if "$BIN" get dev/demo/TMP_DEL >/dev/null 2>&1; then fail "scoped delete left the key"; fi
 if "$BIN" get a b -e dev >/dev/null 2>&1; then fail "get with two keys accepted"; fi
+# a raw key may start with '-' (the TUI can create one; `set` cannot): only exactly -p/-e are flags, `--` ends options
+python3 - "$SOCK" "$(cat "$TOKEN")" <<'PY' || fail "could not store a '-' key"
+import json, socket, sys
+conn = socket.socket(socket.AF_UNIX)
+conn.connect(sys.argv[1])
+conn.sendall(json.dumps({"op": "set", "token": sys.argv[2], "key": "-dash", "value": "dv"}).encode() + b"\n")
+if not json.loads(conn.makefile().readline()).get("ok"):
+    sys.exit(1)
+PY
+[ "$("$BIN" get -dash)" = "dv" ] || fail "get of a '-' key"
+[ "$("$BIN" get -- -dash)" = "dv" ] || fail "get -- of a '-' key"
+"$BIN" delete -dash || fail "delete of a '-' key"
+if "$BIN" get -- -dash >/dev/null 2>&1; then fail "delete of a '-' key left it"; fi
+BAD_USAGE="$("$BIN" get 2>&1)" && fail "get without KEY should fail"
+[ "$BAD_USAGE" = "usage: secretov get KEY [-p NAME] [-e ENV]" ] || fail "get usage text: $BAD_USAGE"
+"$BIN" delete 2>/dev/null && fail "delete without KEY should fail"
 OUT="$(cd "$PROJ" && "$BIN" exec -e dev --secret VIA_STDIN=LOG_LEVEL -- sh -c 'printf %s "$LOG_LEVEL"')"
 [ "$OUT" = "s3cr3t-value" ] || fail "--secret did not override a manifest var: '$OUT'"
 OUT="$(cd "$PROJ" && "$BIN" exec -e dev --secret VIA_STDIN=RAW -- sh -c 'printf %s "$SECRETOV_INJECTED"')"

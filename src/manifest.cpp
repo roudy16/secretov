@@ -86,6 +86,8 @@ bool is_denied_env_name(const std::string& name) {
         // Cloud endpoints and credential loading; AWS_PROFILE picks the account a nested secretov writes to.
         "AWS_EC2_METADATA_SERVICE_ENDPOINT", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_WEB_IDENTITY_TOKEN_FILE",
         "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_UNIVERSE_DOMAIN", "GCE_METADATA_HOST", "GCE_METADATA_IP",
+        "GCE_METADATA_ROOT", "AWS_DATA_PATH", "AWS_CSM_HOST", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "HTTPLIB2_CA_CERTS",
         "AWS_PROFILE", "AWS_DEFAULT_PROFILE"};
     // Credentials under a denied prefix: they hold a secret, not a loader path.
     static const char* const kCredentialNames[] = {"CARGO_REGISTRY_TOKEN", "UV_PUBLISH_TOKEN", "UV_PUBLISH_PASSWORD",
@@ -186,8 +188,8 @@ std::optional<std::string> acl_problem(const std::string& path, int fd) {
 // Group write is allowed when we are the group's only member (a user private
 // group, the umask 0002 convention) and no ACL widens it. fd is the open
 // file, or -1 to query path.
-void require_trusted(const std::string& path, const struct stat& st, bool directory, int fd = -1) {
-    std::string refusing = std::string("refusing ") + (directory ? "manifest directory" : "manifest") + " '" + path + "': ";
+void require_trusted(const std::string& path, const struct stat& st, const char* noun, bool directory, int fd = -1) {
+    std::string refusing = std::string("refusing ") + noun + (directory ? " directory" : "") + " '" + path + "': ";
     uid_t me = ::getuid();
     if (st.st_uid != me && !(directory && st.st_uid == 0)) {
         throw std::runtime_error(refusing + "owned by uid " + std::to_string(st.st_uid) + ", not you (uid " +
@@ -208,14 +210,14 @@ void require_trusted(const std::string& path, const struct stat& st, bool direct
     }
 }
 
-std::string require_trusted_dir(const std::filesystem::path& dir) {
+std::string require_trusted_dir(const std::filesystem::path& dir, const char* noun = "manifest") {
     std::string dir_path = dir.empty() ? "." : dir.string();
     struct stat st{};
     if (::stat(dir_path.c_str(), &st) != 0) {
         throw std::runtime_error("stat '" + dir_path + "': " + std::strerror(errno));
     }
-    if (!S_ISDIR(st.st_mode)) throw std::runtime_error("manifest directory '" + dir_path + "' is not a directory");
-    require_trusted(dir_path, st, true);
+    if (!S_ISDIR(st.st_mode)) throw std::runtime_error(std::string(noun) + " directory '" + dir_path + "' is not a directory");
+    require_trusted(dir_path, st, noun, true);
     return dir_path;
 }
 
@@ -520,11 +522,11 @@ std::string resolve_gcp_path(const std::string& secret_path, const std::string& 
 }
 
 std::optional<std::string> optional_scalar(const YAML::Node& body, const char* key, const std::string& manifest_path,
-                                           const std::string& described) {
+                                           const std::string& described, const std::string& entry_name) {
     if (!body[key]) return std::nullopt;
     if (!body[key].IsScalar()) throw manifest_error(manifest_path, described + " " + key + " must be a string");
     std::string value = body[key].as<std::string>();
-    if (value.empty()) throw manifest_error(manifest_path, described + " has an empty " + key);
+    if (value.empty()) throw manifest_error(manifest_path, "secret '" + entry_name + "' has an empty " + key);
     return value;
 }
 
@@ -545,15 +547,15 @@ std::vector<SecretEntry> parse_env_secrets(YAML::Node secrets, const std::string
         refuse_unknown_keys(body, {"env_var_name", "key", "kind", "path"}, path, described);
         entry.env_var = body["env_var_name"].as<std::string>();
         require_manifest_env_name(entry.env_var, path, described + " env_var_name '" + entry.env_var + "'");
-        if (std::optional<std::string> kind = optional_scalar(body, "kind", path, described)) {
+        if (std::optional<std::string> kind = optional_scalar(body, "kind", path, described, entry.name)) {
             if (*kind == "kv") {
                 entry.kind = EntryKind::Kv;
             } else if (*kind != "text") {
                 throw manifest_error(path, described + " kind must be text or kv");
             }
         }
-        std::optional<std::string> key = optional_scalar(body, "key", path, described);
-        std::optional<std::string> secret_path = optional_scalar(body, "path", path, described);
+        std::optional<std::string> key = optional_scalar(body, "key", path, described, entry.name);
+        std::optional<std::string> secret_path = optional_scalar(body, "path", path, described, entry.name);
         if (backend_type == BackendType::Local) {
             if (secret_path) throw manifest_error(path, described + " path is for cloud backends; a local entry uses key:");
             if (entry.kind == EntryKind::Kv) throw manifest_error(path, described + " kind kv needs a cloud backend; local entries are text");
@@ -731,14 +733,14 @@ std::optional<GroupMembers> other_group_members(gid_t gid) {
     return collect_group_members(gid, me, my_name, groups, accounts);
 }
 
-std::string read_manifest_text(const std::string& path) {
+std::string read_manifest_text(const std::string& path, const char* noun) {
     std::error_code ec;
     std::filesystem::path real = std::filesystem::canonical(path, ec);
-    if (ec) throw std::runtime_error("manifest '" + path + "': " + ec.message());
+    if (ec) throw std::runtime_error(std::string(noun) + " '" + path + "': " + ec.message());
     // Both the directory holding the name and, for a symlink, the one holding
     // the target: write access to either lets someone swap the content.
-    require_trusted_dir(std::filesystem::path(path).parent_path());
-    if (real != std::filesystem::path(path)) require_trusted_dir(real.parent_path());
+    require_trusted_dir(std::filesystem::path(path).parent_path(), noun);
+    if (real != std::filesystem::path(path)) require_trusted_dir(real.parent_path(), noun);
 
     int fd = ::open(real.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) throw std::runtime_error("open '" + path + "': " + std::strerror(errno));
@@ -746,8 +748,8 @@ std::string read_manifest_text(const std::string& path) {
     try {
         struct stat st{};
         if (::fstat(fd, &st) != 0) throw std::runtime_error("stat '" + path + "': " + std::strerror(errno));
-        if (!S_ISREG(st.st_mode)) throw std::runtime_error("manifest '" + path + "' is not a regular file");
-        require_trusted(path, st, false, fd);
+        if (!S_ISREG(st.st_mode)) throw std::runtime_error(std::string(noun) + " '" + path + "' is not a regular file");
+        require_trusted(path, st, noun, false, fd);
         char buf[4096];
         for (;;) {
             ssize_t n = ::read(fd, buf, sizeof(buf));
@@ -791,7 +793,7 @@ namespace {
 // registry holds write_targets, so it needs the manifests' owner/mode check.
 YAML::Node load_registry(const std::string& registry_path) {
     if (::access(registry_path.c_str(), F_OK) != 0) return YAML::Node();
-    std::string text = read_manifest_text(registry_path);
+    std::string text = read_manifest_text(registry_path, "registry");
     try {
         return YAML::Load(text);
     } catch (const YAML::Exception& e) {

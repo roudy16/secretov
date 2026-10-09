@@ -31,8 +31,10 @@ nlohmann::json local_request(const DaemonClient& client, const std::string& op, 
 namespace {
 
 // Moves a JSON string out, so no second copy of the value stays behind in the reply.
+// A reply without one is malformed, never an empty secret.
 std::string take_string(nlohmann::json& holder) {
-    return holder.is_string() ? std::move(holder.get_ref<std::string&>()) : std::string{};
+    if (!holder.is_string()) throw std::runtime_error("daemon reply has no value");
+    return std::move(holder.get_ref<std::string&>());
 }
 
 class LocalBackend : public Backend {

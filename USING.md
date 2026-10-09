@@ -109,6 +109,7 @@ secretov list -p myproj -e dev          # keys in one scope
 secretov set DB_URL -e dev              # replace one secret (prompts, no echo)
 secretov get DB_URL -e dev              # print one value (or the raw full key dev/myproj/DB_URL)
 secretov delete DB_URL -e dev           # remove one secret
+secretov get -- -odd-key                # a raw key may start with '-'; only -p/-e are flags, `--` ends options
 secretov tui                            # browse/edit interactively
 secretov rotate                         # new encryption key (prompts for current passphrase)
 secretov passwd                         # change the passphrase (prompts for current + new)
@@ -340,7 +341,10 @@ one that nobody else can change:
   `CLOUDSDK_CORE_PROJECT`), `AWS_EC2_METADATA_SERVICE_ENDPOINT`,
   `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
   `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_UNIVERSE_DOMAIN`,
-  `GCE_METADATA_HOST`, `GCE_METADATA_IP`, `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`.
+  `GCE_METADATA_HOST`, `GCE_METADATA_IP`, `GCE_METADATA_ROOT`, `AWS_DATA_PATH`,
+  `AWS_CSM_HOST`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`,
+  `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, `HTTPLIB2_CA_CERTS`, `AWS_PROFILE`,
+  `AWS_DEFAULT_PROFILE`.
   The credentials themselves (`AWS_ACCESS_KEY_ID`, ...) are allowed. It is a deny list, so a tool with its own
   loader variable can still slip through. `--secret KEY=VAR` on your own command line is not filtered.
 - **Unknown keys are refused.** A key secretov does not know, at the top
@@ -380,7 +384,8 @@ Three changes can make a manifest or registry that worked before fail to load:
 3. **`projects.yaml` must pass the owner/mode check** (owned by you; not
    world-writable; not group-writable unless your private group; directory
    too). A group-writable `~/.config/secretov` is now refused wherever the
-   registry is read, with the `chmod` to run.
+   registry is read, with the `chmod` to run (the refusal says `refusing
+   registry` or `refusing registry directory` for it).
 
 New in `exec`: `SECRETOV_INJECTED` is set in the child, and all secrets are
 fetched before any variable is exported. `get` and `delete` now take `-p`/`-e`.
@@ -437,7 +442,7 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `manifest '...': unknown key 'X' in ...` | A key secretov does not know (often a typo) | Fix or delete the key |
 | `backend 'aws' not compiled in (rebuild with -DSECRETOV_BACKEND_AWS=ON)` | The manifest names a cloud backend this build lacks (none are built yet) | Use a local manifest; see Manifest rules |
 | `import is local-only for now; ...` | `import` against a manifest with a non-local `backend:` | Add entries by hand |
-| `--secret names raw local-store keys; this manifest uses aws` | `exec --secret` with a cloud manifest | Drop `--secret`, or run it without `-p`/`-e` outside the project |
+| `--secret names raw local-store keys; this manifest uses aws` | `exec --secret` together with `-p`/`-e` that resolve a cloud manifest | Drop `--secret`, or drop `-p`/`-e`: a plain `--secret` reads the local store, even inside a cloud project |
 | `cannot run 'X': No such file or directory` | `exec` program missing from *your* PATH | Install it, or give a path with a `/` |
 | `daemon already running at ...` | A second `secretov daemon` | Use the running one, or stop it first |
 | `cannot prompt from a background process` | A prompt from a `&` job | Run it in the foreground, or pipe the input |

@@ -19,7 +19,9 @@ stays names-only and safe to commit, whichever backend it names.
   deltas).
 - Two personas, no role config: a developer reads (`exec`, `get -p/-e`), an
   administrator also writes (`set`, `delete -p/-e`, TUI edits); the role is
-  whatever provider IAM allows. `get`/`delete -p/-e` are **new flags**.
+  whatever provider IAM allows. `get`/`delete -p/-e` are **new flags**
+  (landed in Phase 1, on local manifests; a raw KEY may start with `-`, so
+  only exactly `-p`/`-e` are flags there and `--` ends the options).
 - Cloud backends are compile-time opt-in. With both off, the build and its
   dependency set are exactly today's.
 
@@ -195,6 +197,10 @@ struct BackendError : std::runtime_error {
     Kind kind;
     bool maybe_applied = false;   // Unreachable after the request was sent
     std::string pending_until;    // PendingDeletion only
+    // Unreachable detail the TUI words its status bar from.
+    bool timed_out = false;       // no reply within timeout_seconds
+    int timeout_seconds = 0;
+    bool not_running = false;     // nothing listens at the daemon socket
 };
 
 struct Fetched {
@@ -229,7 +235,9 @@ Denied first, then PendingDeletion with each date, then NotFound.
   be scoped by ARN prefix). `exec` collects distinct paths, calls `get_many`
   once, then extracts fields. `LocalBackend` keeps today's
   one-`getprefix`-per-prefix grouping (moved out of `cmd_exec`), so the wire
-  protocol does not change.
+  protocol does not change. A prefix with a single wanted key (or a key
+  without a `/`) is fetched with one plain `get` instead, so it never pulls
+  the rest of the prefix's values.
 - **No `list`, `check_set` or capability probes.** Cloud listings come from
   declared entries (`list -p/-e` prints name, kind, path and key); store-wide
   listing stays today's local `DaemonClient` call. `import` stays local and
@@ -282,7 +290,7 @@ today's TUI "may still be saved/deleted" wording for remote timeouts.
   Combined with `-p`/`-e` that resolve a cloud manifest it is refused
   (`--secret names raw local-store keys; this manifest uses aws`).
 - Export order after fetching is today's: `vars:`, manifest secrets, then
-  `--secret`, so `--secret` still overrides a manifest var (client.cpp:479).
+  `--secret`, so `--secret` still overrides a manifest var (`cmd_exec`).
 - TUI: `secretov tui -p NAME` (new) on a cloud manifest shows that project
   across its envs; on a local manifest it is refused (`tui -p is for cloud
   manifests; run 'secretov tui'`). The tree comes from declared entries: `build_rows` gets
@@ -459,6 +467,12 @@ Tokens and keys live in process memory for one invocation, are
     `AWS_WEB_IDENTITY_TOKEN_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`,
     `GOOGLE_CLOUD_UNIVERSE_DOMAIN` (hosts are `<service>.<universe
     domain>`), `GCE_METADATA_HOST`, `GCE_METADATA_IP`.
+  - `GCE_METADATA_ROOT` (legacy alias of `GCE_METADATA_HOST` in google-auth),
+    `AWS_DATA_PATH` (botocore loads endpoint rules from that directory),
+    `AWS_CSM_HOST` (client-side monitoring destination),
+    `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` (file sent as the credential
+    endpoint's token), `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` and
+    `HTTPLIB2_CA_CERTS` (CA files for gRPC and httplib2 clients).
   - `AWS_PROFILE` picks the account a nested secretov's name-path write
     lands in; `AWS_DEFAULT_PROFILE` is denied with it (owner decision, Q8)
     because other AWS tools use it as a fallback. Cost: a manifest cannot
@@ -504,7 +518,8 @@ Phase 1 lands all syntax at once, since unknown-key refusal freezes it.
    block, per-env location, `kind`/`path`/`key`, validation with the region
    table, `write_targets:` parsed and `projects.yaml` through the trust
    check (`local` works, `aws`/`gcp` give "not compiled in"); unknown-key
-   refusal; deny-list additions; declared-entry `list -p/-e` and refusals
+   refusal; deny-list additions; `get`/`delete -p/-e` (local manifests; the
+   cloud paths follow in Phases 2-3); declared-entry `list -p/-e` and refusals
    of `import` and `exec --secret` on non-local manifests (pure front-end
    checks on `backend.type`); DESIGN.md amendments. Behaviour unchanged
    except the three breaks and the new `SECRETOV_INJECTED` variable in
@@ -513,7 +528,8 @@ Phase 1 lands all syntax at once, since unknown-key refusal freezes it.
 2. **AWS read path.** libcurl option and http.cpp policy, SigV4 + KATs,
    credentials, `get_many`, PendingDeletion classification (+
    `DescribeSecret` date), payload decoding and kv extraction → `exec` and
-   `get ENTRY -p/-e` work. Cloud `set`/`delete`/`tui -p` are refused ("not
+   `get ENTRY -p/-e` work on AWS (the flags themselves exist since Phase 1).
+   Cloud `set`/`delete`/`tui -p` are refused ("not
    yet supported"), so no write path exists before pins and the nested-exec
    check. Manual check against a sandbox account with one read-only and
    one admin policy.

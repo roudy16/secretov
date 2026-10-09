@@ -292,17 +292,35 @@ const std::vector<SecretEntry>& entries_for(const Manifest& m, const std::string
 // Parses `NAME [-p NAME] [-e ENV]`; prints the error and the usage and returns nullopt on a bad
 // command line. A second positional would be an argv VALUE, which must never be accepted: it
 // would leak the secret via /proc/<pid>/cmdline.
+// raw_key (get/delete): NAME may start with '-' since any store key is a valid raw name, so
+// only exactly -p/-e are flags and `--` ends the options; a missing NAME prints just the usage.
 std::optional<std::string> parse_entry_args(const char* command, const char* usage, int argc, char** argv,
-                                            ScopeArgs& scope) {
+                                            ScopeArgs& scope, bool raw_key = false) {
     std::optional<std::string> name;
+    bool options_ended = false;
     try {
         for (int i = 0; i < argc; ++i) {
             std::string arg = argv[i];
-            if (take_scope_arg(argc, argv, i, scope)) continue;
-            if (name || arg.empty() || arg[0] == '-') throw std::runtime_error("unexpected argument '" + arg + "'");
+            if (!options_ended) {
+                if (raw_key && arg == "--") {
+                    options_ended = true;
+                    continue;
+                }
+                bool is_flag = !raw_key || arg == "-p" || arg == "-e";
+                if (is_flag && take_scope_arg(argc, argv, i, scope)) continue;
+            }
+            if (name || arg.empty() || (!raw_key && arg[0] == '-')) {
+                throw std::runtime_error("unexpected argument '" + arg + "'");
+            }
             name = arg;
         }
-        if (!name) throw std::runtime_error("missing KEY");
+        if (!name) {
+            if (raw_key) {
+                std::cerr << usage;
+                return std::nullopt;
+            }
+            throw std::runtime_error("missing KEY");
+        }
     } catch (const std::exception& e) {
         std::cerr << "secretov " << command << ": " << e.what() << "\n" << usage;
         return std::nullopt;
@@ -356,7 +374,7 @@ int cmd_init() {
 int cmd_get(int argc, char** argv) {
     ScopeArgs scope;
     std::optional<std::string> name =
-        parse_entry_args("get", "usage: secretov get KEY [-p NAME] [-e ENV]\n", argc, argv, scope);
+        parse_entry_args("get", "usage: secretov get KEY [-p NAME] [-e ENV]\n", argc, argv, scope, true);
     if (!name) return 2;
     Target target = resolve_target(resolve_paths(), scope, *name);
     Fetched fetched = target.backend->get_many({target.path});
@@ -421,7 +439,7 @@ int cmd_list(int argc, char** argv) {
 int cmd_delete(int argc, char** argv) {
     ScopeArgs scope;
     std::optional<std::string> name =
-        parse_entry_args("delete", "usage: secretov delete KEY [-p NAME] [-e ENV]\n", argc, argv, scope);
+        parse_entry_args("delete", "usage: secretov delete KEY [-p NAME] [-e ENV]\n", argc, argv, scope, true);
     if (!name) return 2;
     Target target = resolve_target(resolve_paths(), scope, *name);
     target.backend->remove(target.path);

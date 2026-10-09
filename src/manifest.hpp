@@ -102,8 +102,9 @@ bool ours_alone(const GroupMembers& members);
 // its directory (and a symlink target's directory) is ours or root's, and none
 // is world-writable, or group-writable unless the group is our private group
 // with nobody else in it and the inode has no access ACL. The error names the
-// chmod, setfacl, or group change that fixes it.
-std::string read_manifest_text(const std::string& path);
+// chmod, setfacl, or group change that fixes it. `noun` names the file kind
+// in refusals ("registry" for projects.yaml).
+std::string read_manifest_text(const std::string& path, const char* noun = "manifest");
 // For a manifest about to be created: its directory passes read_manifest_text's
 // directory check, is a directory, and we can write to it.
 void require_creatable_manifest_dir(const std::string& manifest_path);
