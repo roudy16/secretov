@@ -15,10 +15,22 @@
 
 namespace secretov {
 
+enum class BackendType { Local, Aws, Gcp };
+enum class EntryKind { Text, Kv };
+
+struct BackendConfig {
+    BackendType type = BackendType::Local;
+    std::string location;  // aws: region, gcp: project; empty for local
+};
+
 struct SecretEntry {
-    std::string name;     // entry name under secrets:
-    std::string key;      // full store key: env/project/name, or explicit `key:`
-    std::string env_var;  // env_var_name
+    std::string name;      // entry name under secrets:, a label
+    EntryKind kind = EntryKind::Text;
+    std::string path;      // local: full store key (env/project/name, or explicit `key:`);
+                           // aws: secret name or ARN; gcp: secret id or full resource name
+    std::string field;     // kv only: the JSON field (`key:`)
+    std::string location;  // aws region / gcp project the path resolves in; empty for local
+    std::string env_var;   // env_var_name
 };
 
 using KeyValues = std::vector<std::pair<std::string, std::string>>;
@@ -26,6 +38,7 @@ using KeyValues = std::vector<std::pair<std::string, std::string>>;
 struct Manifest {
     std::string path;
     std::string project;
+    BackendConfig backend;
     std::optional<std::string> default_env;
     std::map<std::string, std::vector<SecretEntry>> envs;
     // Plaintext env vars per environment, in file order. These live in the
@@ -41,7 +54,9 @@ std::string scoped_key(const std::string& env, const std::string& project, const
 std::string scope_prefix(const std::string& env, const std::string& project);
 
 // Rejects env names that load code into children (LD_*, BASH_ENV, ...; see
-// manifest.cpp) in both vars and env_var_name.
+// manifest.cpp) in both vars and env_var_name, and unknown keys at every
+// level. Cloud paths and locations are validated here, so a hostile manifest
+// fails before any credential is loaded.
 Manifest parse_manifest(const std::string& text, const std::string& path_for_errors);
 
 // Everyone in group gid other than us, from the passwd and group databases:
@@ -99,9 +114,14 @@ std::optional<std::string> find_manifest_upward(const std::string& start_dir);
 
 // Project root from the registry, ${HOME}/${USER} expanded. nullopt when the
 // registry file or the project entry is absent; throws on a malformed
-// registry or a root that does not exist.
+// registry or a root that does not exist. The registry is trust-bearing and is
+// read through read_manifest_text, so it needs the same owner/mode as a manifest.
 std::optional<std::string> registry_project_root(const std::string& registry_path,
                                                  const std::string& name);
+
+// The registry's `write_targets:` (aws-account:123456789012, gcp:project-id),
+// each validated; empty when the registry or the list is absent.
+std::vector<std::string> registry_write_targets(const std::string& registry_path);
 
 // KEY=VALUE lines; comments, blanks, `export ` prefix, single/double quotes.
 // Values are literal (no ${VAR} expansion); double quotes decode \n \t \r \\ \".
@@ -113,7 +133,7 @@ KeyValues parse_dotenv(const std::string& text, std::ostream& warnings = std::ce
 // env.<env>.secrets, creating missing blocks and matching the file's
 // indentation. Everything else (comments, spacing) is untouched. Entries
 // already present are left alone, but must already have env_var_name VAR and
-// key env/project/NAME. Empty text yields a fresh manifest for
+// path env/project/NAME. Empty text yields a fresh manifest for
 // `project`. Throws if the result does not re-parse with the entries present.
 std::string manifest_with_entries(const std::string& text, const std::string& project,
                                   const std::string& env, const KeyValues& name_to_var);

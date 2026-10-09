@@ -128,7 +128,7 @@ ProjectMarks load_project_marks() {
         Manifest manifest = load_manifest(*manifest_path);
         for (const auto& [env, entries] : manifest.envs) {
             for (const SecretEntry& entry : entries) {
-                marks.env_vars_by_key[entry.key].push_back(printable(entry.env_var + " (" + env + ")"));
+                marks.env_vars_by_key[entry.path].push_back(printable(entry.env_var + " (" + env + ")"));
             }
         }
         marks.project = printable(manifest.project);

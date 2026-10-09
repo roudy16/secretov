@@ -463,7 +463,7 @@ int cmd_exec(int argc, char** argv) {
             Manifest manifest = resolve_manifest(paths, scope);
             std::string env = resolve_env(scope, &manifest);
             for (const SecretEntry& e : entries_for(manifest, env)) {
-                wanted.emplace_back(e.env_var, e.key);
+                wanted.emplace_back(e.env_var, e.path);
             }
             plain = vars_for(manifest, env);
         }

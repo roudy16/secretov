@@ -93,10 +93,13 @@ void test_parse_manifest() {
     assert(m.default_env && *m.default_env == "dev");
     const auto& dev = m.envs.at("dev");
     assert(dev.size() == 2);
-    assert(dev[0].name == "database-url" && dev[0].key == "dev/flows-admin/database-url" &&
+    assert(dev[0].name == "database-url" && dev[0].path == "dev/flows-admin/database-url" &&
            dev[0].env_var == "DATABASE_URL");
-    assert(dev[1].key == "shared/flows-admin/openai-key" && dev[1].env_var == "OPENAI_API_KEY");
+    assert(dev[1].path == "shared/flows-admin/openai-key" && dev[1].env_var == "OPENAI_API_KEY");
     assert(m.envs.at("prod").empty());
+    // Existing entries parse as local text entries with no field or location.
+    assert(m.backend.type == BackendType::Local && m.backend.location.empty());
+    assert(dev[0].kind == EntryKind::Text && dev[0].field.empty() && dev[0].location.empty());
 
     assert(throws_with([] { parse_manifest("env: {}\n", "t"); }, "missing 'name'"));
     assert(throws_with([] { parse_manifest("name: x\nenv:\n  dev:\n    secrets:\n      a: {}\n", "t"); },
@@ -124,13 +127,13 @@ void test_insert_preserves_text() {
     // Idempotent: an existing entry is not duplicated.
     assert(manifest_with_entries(out, "flows-admin", "dev", {{"REDIS_URL", "REDIS_URL"}}) == out);
     Manifest m = parse_manifest(out, "t");
-    assert(m.envs.at("dev").size() == 3 && m.envs.at("dev")[2].key == "dev/flows-admin/REDIS_URL");
+    assert(m.envs.at("dev").size() == 3 && m.envs.at("dev")[2].path == "dev/flows-admin/REDIS_URL");
 }
 
 void test_insert_new_env_block() {
     std::string out = manifest_with_entries(kSample, "flows-admin", "stg", {{"X", "X"}});
     assert(out.find("  stg:\n    secrets:\n      X:\n        env_var_name: X\n") != std::string::npos);
-    assert(parse_manifest(out, "t").envs.at("stg")[0].key == "stg/flows-admin/X");
+    assert(parse_manifest(out, "t").envs.at("stg")[0].path == "stg/flows-admin/X");
 }
 
 void test_insert_rejects_inline_and_mismatch() {
@@ -166,12 +169,14 @@ void test_insert_fresh_and_four_space() {
            "name: p\n\n# tail\nenv:\n  dev:\n    secrets:\n      A:\n        env_var_name: A\n");
 }
 
+void write_private(const std::string& path, const std::string& text) {
+    { std::ofstream f(path); f << text; }
+    assert(::chmod(path.c_str(), 0600) == 0);
+}
+
 void test_registry() {
     std::string path = g_dir + "/projects.yaml";
-    {
-        std::ofstream f(path);
-        f << "projects:\n  demo:\n    root: \"${HOME}\"\n  broken:\n    root: /nonexistent/xyz\n  flat: x\n";
-    }
+    write_private(path, "projects:\n  demo:\n    root: \"${HOME}\"\n  broken:\n    root: /nonexistent/xyz\n  flat: x\n");
     std::optional<std::string> root = registry_project_root(path, "demo");
     assert(root && *root == std::getenv("HOME"));
     assert(!registry_project_root(path, "nope"));
@@ -179,11 +184,236 @@ void test_registry() {
     assert(throws_with([&] { registry_project_root(path, "broken"); }, "project root not found"));
     assert(throws_with([&] { registry_project_root(path, "flat"); }, "project 'flat' has no 'root'"));
     std::string listed = g_dir + "/listed.yaml";
-    { std::ofstream f(listed); f << "projects: [demo]\n"; }
+    write_private(listed, "projects: [demo]\n");
     assert(throws_with([&] { registry_project_root(listed, "demo"); }, "'projects' must be a mapping"));
     std::string scalar = g_dir + "/scalar.yaml";
-    { std::ofstream f(scalar); f << "just text\n"; }
+    write_private(scalar, "just text\n");
     assert(throws_with([&] { registry_project_root(scalar, "demo"); }, ("registry '" + scalar + "': ").c_str()));
+}
+
+void test_registry_write_targets_and_trust() {
+    std::string path = g_dir + "/targets.yaml";
+    assert(registry_write_targets(g_dir + "/absent.yaml").empty());
+    write_private(path, "projects: {}\n");
+    assert(registry_write_targets(path).empty());
+    write_private(path, "write_targets:\n  - aws-account:123456789012\n  - gcp:acme-secrets\nprojects: {}\n");
+    assert((registry_write_targets(path) == std::vector<std::string>{"aws-account:123456789012", "gcp:acme-secrets"}));
+    for (const char* bad : {"aws-account:12345", "aws-account:12345678901x", "gcp:Acme", "gcp:123456789012", "gcp:", "aws:us-east-1",
+                            "arn:aws:secretsmanager:us-east-1:123456789012:secret:x", "[a]"}) {
+        write_private(path, std::string("write_targets: [\"") + bad + "\"]\n");
+        assert(throws_with([&] { registry_write_targets(path); }, "write_targets entry"));
+    }
+    write_private(path, "write_targets: gcp:acme-secrets\n");
+    assert(throws_with([&] { registry_write_targets(path); }, "'write_targets' must be a list"));
+
+    // Compat break 3: the registry goes through the manifests' owner/mode check.
+    write_private(path, "write_targets: [gcp:acme-secrets]\nprojects: {demo: {root: /tmp}}\n");
+    assert(::chmod(path.c_str(), 0646) == 0);
+    assert(throws_with([&] { registry_write_targets(path); }, ("writable by everyone; fix with: chmod o-w '" + path + "'").c_str()));
+    assert(throws_with([&] { registry_project_root(path, "demo"); }, "writable by everyone"));
+    assert(::chmod(path.c_str(), 0600) == 0);
+    assert(registry_project_root(path, "demo"));
+
+    std::string open_dir = g_dir + "/open_config";
+    assert(::mkdir(open_dir.c_str(), 0700) == 0);
+    write_private(open_dir + "/projects.yaml", "write_targets: [gcp:acme-secrets]\n");
+    assert(::chmod(open_dir.c_str(), 0757) == 0);
+    assert(throws_with([&] { registry_write_targets(open_dir + "/projects.yaml"); }, ("manifest directory '" + open_dir + "'").c_str()));
+    assert(::chmod(open_dir.c_str(), 0700) == 0);
+}
+
+const std::string kAwsHeader = "name: p\nbackend:\n  type: aws\n  region: us-east-1\n";
+const std::string kGcpHeader = "name: p\nbackend:\n  type: gcp\n  project: acme-secrets\n";
+
+std::string entry_yaml(const std::string& body) { return "env:\n  dev:\n    secrets:\n      s:\n        env_var_name: S\n" + body; }
+
+void test_backend_block() {
+    Manifest local = parse_manifest("name: p\nbackend:\n  type: local\nenv:\n  dev:\n    secrets:\n      s: {env_var_name: S}\n", "t");
+    assert(local.backend.type == BackendType::Local && local.envs.at("dev")[0].path == "dev/p/s");
+    assert(parse_manifest("name: p\n", "t").backend.type == BackendType::Local);
+
+    Manifest aws = parse_manifest(kAwsHeader + entry_yaml("        path: dev/p/db\n"), "t");
+    assert(aws.backend.type == BackendType::Aws && aws.backend.location == "us-east-1");
+    const SecretEntry& aws_text = aws.envs.at("dev")[0];
+    assert(aws_text.kind == EntryKind::Text && aws_text.path == "dev/p/db" && aws_text.location == "us-east-1" && aws_text.field.empty());
+
+    Manifest gcp = parse_manifest(kGcpHeader + entry_yaml("        path: dev-db\n"), "t");
+    assert(gcp.backend.type == BackendType::Gcp && gcp.backend.location == "acme-secrets");
+    assert(gcp.envs.at("dev")[0].path == "dev-db" && gcp.envs.at("dev")[0].location == "acme-secrets");
+
+    assert(throws_with([] { parse_manifest("name: p\nbackend: aws\n", "t"); }, "'backend' must be a mapping"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {}\n", "t"); }, "backend needs a type"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: azure}\n", "t"); }, "backend type 'azure' is not one of local, aws, gcp"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: aws}\n", "t"); }, "backend type aws needs region"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: gcp}\n", "t"); }, "backend type gcp needs project"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: aws, region: us-east-1, project: acme-secrets}\n", "t"); },
+                       "backend 'project' is not valid with backend type aws"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: gcp, project: acme-secrets, region: us-east-1}\n", "t"); },
+                       "backend 'region' is not valid with backend type gcp"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: local, region: us-east-1}\n", "t"); },
+                       "backend 'region' is not valid with backend type local"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: local, project: acme-secrets}\n", "t"); },
+                       "backend 'project' is not valid with backend type local"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: aws, region: us-east-1, endpoint: http://x}\n", "t"); },
+                       "unknown key 'endpoint' in backend:"));
+    assert(throws_with([] { parse_manifest("name: p\nbackend: {type: aws, region: [us-east-1]}\n", "t"); }, "region must be a string"));
+}
+
+void test_locations() {
+    // AWS region table: unlisted and malformed regions are refused, in backend:, env and ARNs.
+    for (const char* region : {"us-east-9", "cn-north-1", "us-gov-west-1", "US-EAST-1", "us-east-1.evil.com/x", ""}) {
+        std::string header = std::string("name: p\nbackend: {type: aws, region: \"") + region + "\"}\n";
+        assert(throws_with([&] { parse_manifest(header, "t"); }, "is not in this build's region table; upgrade secretov"));
+    }
+    for (const char* region : {"us-east-1", "eu-west-1", "ap-southeast-2", "sa-east-1", "il-central-1"}) {
+        assert(parse_manifest(std::string("name: p\nbackend: {type: aws, region: ") + region + "}\n", "t").backend.location == region);
+    }
+
+    // Per-env location overrides the backend's for name paths.
+    Manifest aws = parse_manifest(kAwsHeader + "env:\n  prod:\n    region: eu-west-1\n    secrets:\n      s:\n        env_var_name: S\n        path: prod/p/db\n"
+                                               "  dev:\n    secrets:\n      s:\n        env_var_name: S\n        path: dev/p/db\n", "t");
+    assert(aws.envs.at("prod")[0].location == "eu-west-1" && aws.envs.at("dev")[0].location == "us-east-1");
+    assert(throws_with([] { parse_manifest(kAwsHeader + "env:\n  prod:\n    region: us-east-9\n", "t"); }, "env 'prod' region 'us-east-9' is not in this build's region table"));
+    assert(throws_with([] { parse_manifest(kAwsHeader + "env:\n  prod:\n    project: acme-secrets\n", "t"); },
+                       "env 'prod' 'project' is not valid with backend type aws"));
+    assert(throws_with([] { parse_manifest("name: p\nenv:\n  prod:\n    region: us-east-1\n", "t"); },
+                       "env 'prod' 'region' is not valid with backend type local"));
+    assert(throws_with([] { parse_manifest("name: p\nenv:\n  prod:\n    project: acme-secrets\n", "t"); },
+                       "env 'prod' 'project' is not valid with backend type local"));
+    assert(throws_with([] { parse_manifest(kGcpHeader + "env:\n  prod:\n    region: us-east-1\n", "t"); },
+                       "env 'prod' 'region' is not valid with backend type gcp"));
+
+    Manifest gcp = parse_manifest(kGcpHeader + "env:\n  prod:\n    project: acme-prod\n    secrets:\n      s:\n        env_var_name: S\n        path: db\n", "t");
+    assert(gcp.envs.at("prod")[0].location == "acme-prod");
+    assert(throws_with([] { parse_manifest(kGcpHeader + "env:\n  prod:\n    project: Acme-Prod\n", "t"); }, "is not a valid GCP project id"));
+
+    // GCP project ids: lowercase id form only.
+    for (const char* project : {"Acme-secrets", "123456789012", "acme", "acme-secrets-", "-acme-secrets", "example.com:proj", "acme_secrets",
+                                "a234567890123456789012345678901"}) {
+        std::string header = std::string("name: p\nbackend: {type: gcp, project: \"") + project + "\"}\n";
+        assert(throws_with([&] { parse_manifest(header, "t"); }, "is not a valid GCP project id"));
+    }
+    assert(parse_manifest("name: p\nbackend: {type: gcp, project: a23456789012345678901234567890}\n", "t").backend.type == BackendType::Gcp);
+}
+
+void test_cloud_paths() {
+    auto aws_path = [](const std::string& path) {
+        return parse_manifest(kAwsHeader + entry_yaml("        path: \"" + path + "\"\n"), "t").envs.at("dev")[0];
+    };
+    assert(aws_path("a/B_c+d=e.f@g-h").location == "us-east-1");
+    assert(aws_path(std::string(512, 'a')).path.size() == 512);
+    for (const std::string& bad : {std::string(513, 'a'), std::string("has space"), std::string("semi;colon"), std::string("q?x"), std::string("a%2Fb"),
+                                   std::string("a#b"), std::string("")}) {
+        assert(throws_with([&] { aws_path(bad); }, bad.empty() ? "has an empty path" : "is not a valid AWS secret name or ARN"));
+    }
+    const std::string kArn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:shared/stripe-AbCdEf";
+    assert(aws_path(kArn).location == "eu-west-1" && aws_path(kArn).path == kArn);
+    for (const char* bad : {"arn:aws-cn:secretsmanager:cn-north-1:123456789012:secret:x", "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:x",
+                            "arn:aws:s3:eu-west-1:123456789012:secret:x", "arn:aws:secretsmanager:eu-west-1:12345678901:secret:x",
+                            "arn:aws:secretsmanager:eu-west-1:123456789012:parameter:x", "arn:aws:secretsmanager:eu-west-1:123456789012:secret:",
+                            "arn:aws:secretsmanager:eu-west-1:123456789012:secret:x:y", "arn:aws:secretsmanager:eu-west-1:123456789012:secret:a b",
+                            "arn:aws:secretsmanager:eu-west-1"}) {
+        assert(throws_with([&] { aws_path(bad); }, "is not a valid ARN"));
+    }
+    assert(throws_with([&] { aws_path("arn:aws:secretsmanager:eu-west-9:123456789012:secret:x"); }, "ARN region 'eu-west-9' is not in this build's region table"));
+
+    auto gcp_path = [](const std::string& path) {
+        return parse_manifest(kGcpHeader + entry_yaml("        path: \"" + path + "\"\n"), "t").envs.at("dev")[0];
+    };
+    assert(gcp_path("dev-db_1").location == "acme-secrets");
+    assert(gcp_path(std::string(255, 'a')).path.size() == 255);
+    assert(gcp_path("projects/acme-shared/secrets/stripe-key").location == "acme-shared");
+    for (const std::string& bad : {std::string(256, 'a'), std::string("has space"), std::string("a/b"), std::string("a.b"), std::string("a?b"), std::string("a%2Fb")}) {
+        assert(throws_with([&] { gcp_path(bad); }, "is not a valid GCP secret id or resource name"));
+    }
+    for (const char* bad : {"projects/acme-shared", "projects/acme-shared/secrets", "projects/acme-shared/secrets/", "projects/acme-shared/secrets/a/versions/1",
+                            "projects/Acme/secrets/x", "projects/123456789012/secrets/x", "projects/example.com:proj/secrets/x",
+                            "projects/acme-shared/topics/x", "projects/acme-shared/secrets/a b"}) {
+        assert(throws_with([&] { gcp_path(bad); }, "is not a valid resource name"));
+    }
+}
+
+void test_kinds() {
+    Manifest aws = parse_manifest(kAwsHeader +
+                                      "env:\n  dev:\n    secrets:\n"
+                                      "      user: {env_var_name: DB_USER, kind: kv, path: dev/p/db, key: username}\n"
+                                      "      pass: {env_var_name: DB_PASSWORD, kind: kv, path: dev/p/db, key: password}\n"
+                                      "      url: {env_var_name: URL, kind: text, path: dev/p/url}\n",
+                                  "t");
+    const auto& entries = aws.envs.at("dev");
+    assert(entries[0].kind == EntryKind::Kv && entries[0].path == "dev/p/db" && entries[0].field == "username");
+    assert(entries[1].field == "password" && entries[2].kind == EntryKind::Text && entries[2].field.empty());
+
+    // kv is a parse error on local, and so is path:.
+    assert(throws_with([] { parse_manifest("name: p\n" + entry_yaml("        kind: kv\n        key: k\n"), "t"); }, "kind kv needs a cloud backend"));
+    assert(throws_with([] { parse_manifest("name: p\n" + entry_yaml("        kind: kv\n"), "t"); }, "kind kv needs a cloud backend"));
+    assert(throws_with([] { parse_manifest("name: p\n" + entry_yaml("        path: x\n"), "t"); }, "path is for cloud backends"));
+    assert(parse_manifest("name: p\n" + entry_yaml("        kind: text\n        key: shared/k\n"), "t").envs.at("dev")[0].path == "shared/k");
+    assert(throws_with([] { parse_manifest("name: p\n" + entry_yaml("        kind: json\n"), "t"); }, "kind must be text or kv"));
+    assert(throws_with([] { parse_manifest("name: p\n" + entry_yaml("        kind: [kv]\n"), "t"); }, "kind must be a string"));
+
+    for (const std::string& header : {kAwsHeader, kGcpHeader}) {
+        // Cloud entries never derive a path.
+        assert(throws_with([&] { parse_manifest(header + entry_yaml(""), "t"); }, "needs an explicit path"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        key: k\n"), "t"); }, "needs an explicit path"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: kv\n        key: k\n"), "t"); }, "needs an explicit path"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: kv\n        path: x\n"), "t"); }, "kind kv needs key"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        path: x\n        key: k\n"), "t"); }, "needs kind: kv"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: text\n        path: x\n        key: k\n"), "t"); }, "needs kind: kv"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        kind: kv\n        path: x\n        key: \"\"\n"), "t"); }, "has an empty key"));
+        assert(throws_with([&] { parse_manifest(header + entry_yaml("        path: [x]\n"), "t"); }, "path must be a string"));
+    }
+}
+
+// Compat break 1: keys no parser reads are refused at every level.
+void test_unknown_keys() {
+    assert(throws_with([] { parse_manifest("name: p\nsecrests: {}\n", "t"); }, "unknown key 'secrests' in .secretov.yaml"));
+    assert(throws_with([] { parse_manifest("name: p\nenv:\n  dev:\n    secrests: {}\n", "t"); }, "unknown key 'secrests' in env 'dev'"));
+    assert(throws_with([] { parse_manifest("name: p\nenv:\n  dev:\n    secrets:\n      s: {env_var_name: S, keyy: k}\n", "t"); },
+                       "unknown key 'keyy' in secret 's' (env dev)"));
+    assert(throws_with([&] { parse_manifest(kAwsHeader + "endpoint: http://x\n", "t"); }, "unknown key 'endpoint' in .secretov.yaml"));
+    assert(throws_with([&] { parse_manifest(kAwsHeader + "env:\n  dev:\n    endpoint: x\n", "t"); }, "unknown key 'endpoint' in env 'dev'"));
+    assert(throws_with([&] { parse_manifest(kAwsHeader + entry_yaml("        path: x\n        endpoint: x\n"), "t"); }, "unknown key 'endpoint' in secret 's'"));
+    // Every documented key still loads.
+    parse_manifest("version: \"1\"\nname: p\ndefault_env: dev\nbackend: {type: local}\nenv:\n  dev:\n    vars: {A: b}\n    secrets: {}\n", "t");
+}
+
+// Compat break 2: newly denied names.
+void test_cloud_denied_env_names() {
+    for (const char* name : {"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "aws_endpoint_url_secrets_manager", "CLOUDSDK_CONFIG", "CLOUDSDK_CORE_PROJECT",
+                             "cloudsdk_api_endpoint_overrides_secretmanager", "AWS_EC2_METADATA_SERVICE_ENDPOINT", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                             "AWS_WEB_IDENTITY_TOKEN_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_UNIVERSE_DOMAIN", "GCE_METADATA_HOST",
+                             "GCE_METADATA_IP", "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "aws_profile"}) {
+        std::string as_var = std::string("name: p\nenv:\n  dev:\n    vars:\n      ") + name + ": x\n";
+        assert(throws_with([&] { parse_manifest(as_var, "t"); }, "cannot be set from a manifest"));
+        std::string as_secret = std::string("name: p\nenv:\n  dev:\n    secrets:\n      s:\n        env_var_name: ") + name + "\n";
+        assert(throws_with([&] { parse_manifest(as_secret, "t"); }, "cannot be set from a manifest"));
+    }
+    // The design leaves these allowed: ignored by secretov, or holding a secret rather than a loader path.
+    Manifest allowed = parse_manifest(
+        "name: p\nenv:\n  dev:\n    vars:\n      AWS_REGION: a\n      AWS_DEFAULT_REGION: b\n      GOOGLE_CLOUD_QUOTA_PROJECT: c\n"
+        "      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: d\n      AWS_ACCESS_KEY_ID: e\n      AWS_SECRET_ACCESS_KEY: f\n      AWS_SESSION_TOKEN: g\n"
+        "      AWS_ENDPOINT: h\n      GOOGLE_API_KEY: i\n",
+        "t");
+    assert(allowed.vars.at("dev").size() == 9);
+}
+
+void test_insert_into_local_backend_manifest() {
+    const std::string text =
+        "name: p\n"
+        "backend:\n"
+        "  type: local\n"
+        "env:\n"
+        "  dev:\n"
+        "    secrets:\n"
+        "      a:\n"
+        "        kind: text\n"
+        "        key: shared/a\n"
+        "        env_var_name: A\n";
+    std::string out = manifest_with_entries(text, "p", "dev", {{"B", "B"}});
+    assert(out == text + "      B:\n        env_var_name: B\n");
+    Manifest m = parse_manifest(out, "t");
+    assert(m.envs.at("dev").size() == 2 && m.envs.at("dev")[0].path == "shared/a" && m.envs.at("dev")[1].path == "dev/p/B");
 }
 
 void test_find_manifest_upward() {
@@ -474,10 +704,18 @@ int main() {
     test_vars();
     test_insert_preserves_vars_block();
     test_registry();
+    test_registry_write_targets_and_trust();
+    test_backend_block();
+    test_locations();
+    test_cloud_paths();
+    test_kinds();
+    test_unknown_keys();
+    test_insert_into_local_backend_manifest();
     test_find_manifest_upward();
     test_collect_group_members();
     test_manifest_trust();
     test_denied_env_names();
+    test_cloud_denied_env_names();
 
     std::filesystem::remove_all(g_dir);
     std::printf("OK\n");

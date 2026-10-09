@@ -58,7 +58,9 @@ bool is_denied_env_name(const std::string& name) {
     // (SECURITY.md #21); an allow list would break ordinary app config.
     static const char* const kDeniedPrefixes[] = {
         "LD_",  "DYLD_",  "SECRETOV_", "GIT_",   "XDG_",    "NPM_CONFIG_", "BUNDLE_",  "GEM_",
-        "LUA_", "PIP_",   "UV_",       "CARGO_", "RUSTUP_", "RUSTC_",      "DOTNET_",  "CORECLR_"};
+        "LUA_", "PIP_",   "UV_",       "CARGO_", "RUSTUP_", "RUSTC_",      "DOTNET_",  "CORECLR_",
+        // Endpoint, proxy, CA or file valued; every gcloud property is a CLOUDSDK_* variable.
+        "AWS_ENDPOINT_URL", "CLOUDSDK_"};
     static const char* const kDeniedNames[] = {
         "PATH",          "HOME",         "BASH_ENV",          "ENV",        "IFS",
         "PROMPT_COMMAND", "PS1",         "PS4",               "ZDOTDIR",    "PAGER",
@@ -80,7 +82,11 @@ bool is_denied_env_name(const std::string& name) {
         "GONOSUMCHECK",  "GOINSECURE",
         // CA overrides and key logs let a manifest read the child's secret-bearing requests.
         "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",    "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-        "SSLKEYLOGFILE", "NODE_TLS_REJECT_UNAUTHORIZED", "AWS_CA_BUNDLE", "PYTHONHTTPSVERIFY"};
+        "SSLKEYLOGFILE", "NODE_TLS_REJECT_UNAUTHORIZED", "AWS_CA_BUNDLE", "PYTHONHTTPSVERIFY",
+        // Cloud endpoints and credential loading; AWS_PROFILE picks the account a nested secretov writes to.
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_UNIVERSE_DOMAIN", "GCE_METADATA_HOST", "GCE_METADATA_IP",
+        "AWS_PROFILE", "AWS_DEFAULT_PROFILE"};
     // Credentials under a denied prefix: they hold a secret, not a loader path.
     static const char* const kCredentialNames[] = {"CARGO_REGISTRY_TOKEN", "UV_PUBLISH_TOKEN", "UV_PUBLISH_PASSWORD",
                                                    "UV_PUBLISH_USERNAME"};
@@ -352,8 +358,179 @@ std::string scope_prefix(const std::string& env, const std::string& project) {
 
 namespace {
 
+bool is_ascii_alnum(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+bool is_lower_or_digit(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z'); }
+
+// Alphanumerics plus `extra`, 1..max characters.
+bool is_name(std::string_view s, std::string_view extra, std::size_t max) {
+    return !s.empty() && s.size() <= max &&
+           std::all_of(s.begin(), s.end(), [&](char c) { return is_ascii_alnum(c) || extra.find(c) != std::string_view::npos; });
+}
+
+bool is_aws_secret_name(std::string_view s) { return is_name(s, "/_+=.@-", 512); }
+
+bool is_gcp_secret_id(std::string_view s) { return is_name(s, "_-", 255); }
+
+// Lowercase id form only: project numbers and domain-scoped ids are refused so a pin compares one form.
+bool is_gcp_project(std::string_view s) {
+    return s.size() >= 6 && s.size() <= 30 && s.front() >= 'a' && s.front() <= 'z' && is_lower_or_digit(s.back()) &&
+           std::all_of(s.begin(), s.end(), [](char c) { return is_lower_or_digit(c) || c == '-'; });
+}
+
+bool is_aws_account(std::string_view s) {
+    return s.size() == 12 && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// ponytail: the `aws` partition's regions as of this build; a newer region is refused with an upgrade hint.
+bool is_known_aws_region(const std::string& region) {
+    static const char* const kRegions[] = {
+        "us-east-1",      "us-east-2",      "us-west-1",      "us-west-2",      "af-south-1",     "ap-east-1",
+        "ap-east-2",      "ap-south-1",     "ap-south-2",     "ap-southeast-1", "ap-southeast-2", "ap-southeast-3",
+        "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7", "ap-northeast-1", "ap-northeast-2",
+        "ap-northeast-3", "ca-central-1",   "ca-west-1",      "eu-central-1",   "eu-central-2",   "eu-west-1",
+        "eu-west-2",      "eu-west-3",      "eu-north-1",     "eu-south-1",     "eu-south-2",     "il-central-1",
+        "me-south-1",     "me-central-1",   "mx-central-1",   "sa-east-1"};
+    return std::find(std::begin(kRegions), std::end(kRegions), region) != std::end(kRegions);
+}
+
+std::vector<std::string> split_on(const std::string& s, char separator) {
+    std::vector<std::string> parts;
+    std::size_t begin = 0;
+    for (std::size_t at; (at = s.find(separator, begin)) != std::string::npos; begin = at + 1) {
+        parts.push_back(s.substr(begin, at - begin));
+    }
+    parts.push_back(s.substr(begin));
+    return parts;
+}
+
+void require_aws_region(const std::string& region, const std::string& manifest_path, const std::string& what) {
+    if (!is_known_aws_region(region)) {
+        throw manifest_error(manifest_path, what + " region '" + region + "' is not in this build's region table; upgrade secretov");
+    }
+}
+
+void require_gcp_project(const std::string& project, const std::string& manifest_path, const std::string& what) {
+    if (!is_gcp_project(project)) {
+        throw manifest_error(manifest_path, what + " project '" + project + "' is not a valid GCP project id (lowercase id, 6-30 characters)");
+    }
+}
+
+const char* backend_type_name(BackendType type) {
+    switch (type) {
+        case BackendType::Local: return "local";
+        case BackendType::Aws: return "aws";
+        case BackendType::Gcp: return "gcp";
+    }
+    return "";
+}
+
+void refuse_unknown_keys(const YAML::Node& map, std::initializer_list<std::string_view> allowed, const std::string& path,
+                         const std::string& where) {
+    for (const auto& pair : map) {
+        std::string key = pair.first.as<std::string>();
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+            throw manifest_error(path, "unknown key '" + key + "' in " + where);
+        }
+    }
+}
+
+// The `region:` (aws) or `project:` (gcp) in a backend or env mapping. The
+// other key, or either on a local manifest, is refused. nullopt when absent.
+std::optional<std::string> parse_location(const YAML::Node& node, BackendType type, const std::string& path,
+                                          const std::string& where) {
+    const std::string_view own_key = type == BackendType::Aws ? "region" : type == BackendType::Gcp ? "project" : "";
+    for (const char* key : {"region", "project"}) {
+        if (node[key] && key != own_key) {
+            throw manifest_error(path, where + " '" + key + "' is not valid with backend type " + backend_type_name(type));
+        }
+    }
+    if (own_key.empty() || !node[std::string(own_key)]) return std::nullopt;
+    YAML::Node value_node = node[std::string(own_key)];
+    if (!value_node.IsScalar()) throw manifest_error(path, where + " " + std::string(own_key) + " must be a string");
+    std::string value = value_node.as<std::string>();
+    if (type == BackendType::Aws) {
+        require_aws_region(value, path, where);
+    } else {
+        require_gcp_project(value, path, where);
+    }
+    return value;
+}
+
+BackendConfig parse_backend(const YAML::Node& node, const std::string& path) {
+    BackendConfig backend;
+    if (!node) return backend;
+    if (!node.IsMap()) throw manifest_error(path, "'backend' must be a mapping");
+    refuse_unknown_keys(node, {"type", "region", "project"}, path, "backend:");
+    if (!node["type"] || !node["type"].IsScalar()) throw manifest_error(path, "backend needs a type: local, aws or gcp");
+    std::string type_name = node["type"].as<std::string>();
+    if (type_name == "local") {
+        backend.type = BackendType::Local;
+    } else if (type_name == "aws") {
+        backend.type = BackendType::Aws;
+    } else if (type_name == "gcp") {
+        backend.type = BackendType::Gcp;
+    } else {
+        throw manifest_error(path, "backend type '" + type_name + "' is not one of local, aws, gcp");
+    }
+    std::optional<std::string> location = parse_location(node, backend.type, path, "backend");
+    if (backend.type != BackendType::Local) {
+        if (!location) {
+            throw manifest_error(path, std::string("backend type ") + backend_type_name(backend.type) + " needs " +
+                                           (backend.type == BackendType::Aws ? "region" : "project"));
+        }
+        backend.location = *location;
+    }
+    return backend;
+}
+
+// Returns the location the path resolves in: the region of an ARN, else the env's.
+std::string resolve_aws_path(const std::string& secret_path, const std::string& env_location, const std::string& manifest_path,
+                             const std::string& described) {
+    if (secret_path.compare(0, 4, "arn:") != 0) {
+        if (!is_aws_secret_name(secret_path)) {
+            throw manifest_error(manifest_path, described + " path is not a valid AWS secret name or ARN");
+        }
+        return env_location;
+    }
+    std::vector<std::string> parts = split_on(secret_path, ':');
+    if (parts.size() != 7 || parts[1] != "aws" || parts[2] != "secretsmanager" || !is_aws_account(parts[4]) ||
+        parts[5] != "secret" || !is_aws_secret_name(parts[6])) {
+        throw manifest_error(manifest_path,
+                             described + " path is not a valid ARN (arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME; partition aws only)");
+    }
+    require_aws_region(parts[3], manifest_path, described + " ARN");
+    return parts[3];
+}
+
+// Returns the location the path resolves in: the project of a resource name, else the env's.
+std::string resolve_gcp_path(const std::string& secret_path, const std::string& env_location, const std::string& manifest_path,
+                             const std::string& described) {
+    if (secret_path.compare(0, 9, "projects/") != 0) {
+        if (!is_gcp_secret_id(secret_path)) {
+            throw manifest_error(manifest_path, described + " path is not a valid GCP secret id or resource name");
+        }
+        return env_location;
+    }
+    std::vector<std::string> parts = split_on(secret_path, '/');
+    if (parts.size() != 4 || parts[2] != "secrets" || !is_gcp_project(parts[1]) || !is_gcp_secret_id(parts[3])) {
+        throw manifest_error(manifest_path, described + " path is not a valid resource name (projects/PROJECT/secrets/ID)");
+    }
+    return parts[1];
+}
+
+std::optional<std::string> optional_scalar(const YAML::Node& body, const char* key, const std::string& manifest_path,
+                                           const std::string& described) {
+    if (!body[key]) return std::nullopt;
+    if (!body[key].IsScalar()) throw manifest_error(manifest_path, described + " " + key + " must be a string");
+    std::string value = body[key].as<std::string>();
+    if (value.empty()) throw manifest_error(manifest_path, described + " has an empty " + key);
+    return value;
+}
+
 std::vector<SecretEntry> parse_env_secrets(YAML::Node secrets, const std::string& path, const std::string& env,
-                                           const std::string& project) {
+                                           const std::string& project, BackendType backend_type,
+                                           const std::string& env_location) {
     std::vector<SecretEntry> entries;
     if (!secrets || secrets.IsNull()) return entries;
     if (!secrets.IsMap()) throw manifest_error(path, "env '" + env + "' secrets must be a mapping");
@@ -365,14 +542,32 @@ std::vector<SecretEntry> parse_env_secrets(YAML::Node secrets, const std::string
         if (!body.IsMap() || !body["env_var_name"] || !body["env_var_name"].IsScalar()) {
             throw manifest_error(path, described + " missing env_var_name");
         }
+        refuse_unknown_keys(body, {"env_var_name", "key", "kind", "path"}, path, described);
         entry.env_var = body["env_var_name"].as<std::string>();
         require_manifest_env_name(entry.env_var, path, described + " env_var_name '" + entry.env_var + "'");
-        if (body["key"]) {
-            if (!body["key"].IsScalar()) throw manifest_error(path, described + " key must be a string");
-            entry.key = body["key"].as<std::string>();
-            if (entry.key.empty()) throw manifest_error(path, "secret '" + entry.name + "' has an empty key");
+        if (std::optional<std::string> kind = optional_scalar(body, "kind", path, described)) {
+            if (*kind == "kv") {
+                entry.kind = EntryKind::Kv;
+            } else if (*kind != "text") {
+                throw manifest_error(path, described + " kind must be text or kv");
+            }
+        }
+        std::optional<std::string> key = optional_scalar(body, "key", path, described);
+        std::optional<std::string> secret_path = optional_scalar(body, "path", path, described);
+        if (backend_type == BackendType::Local) {
+            if (secret_path) throw manifest_error(path, described + " path is for cloud backends; a local entry uses key:");
+            if (entry.kind == EntryKind::Kv) throw manifest_error(path, described + " kind kv needs a cloud backend; local entries are text");
+            entry.path = key ? *key : scoped_key(env, project, entry.name);
         } else {
-            entry.key = scoped_key(env, project, entry.name);
+            if (!secret_path) throw manifest_error(path, described + " needs an explicit path");
+            if (entry.kind == EntryKind::Text && key) throw manifest_error(path, described + " key names a JSON field and needs kind: kv");
+            if (entry.kind == EntryKind::Kv) {
+                if (!key) throw manifest_error(path, described + " kind kv needs key");
+                entry.field = *key;
+            }
+            entry.path = *secret_path;
+            entry.location = backend_type == BackendType::Aws ? resolve_aws_path(entry.path, env_location, path, described)
+                                                              : resolve_gcp_path(entry.path, env_location, path, described);
         }
         entries.push_back(std::move(entry));
     }
@@ -404,6 +599,7 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
     try {
         YAML::Node doc = YAML::Load(text);
         if (!doc.IsMap()) throw std::runtime_error("manifest '" + path + "' is not a mapping");
+        refuse_unknown_keys(doc, {"version", "name", "backend", "default_env", "env"}, path, kManifestFileName);
         if (!doc["name"] || !doc["name"].IsScalar()) {
             throw std::runtime_error("manifest '" + path + "' missing 'name' field");
         }
@@ -412,6 +608,7 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
         m.path = path;
         m.project = doc["name"].as<std::string>();
         require_segment(m.project, "project");
+        m.backend = parse_backend(doc["backend"], path);
         if (doc["default_env"]) {
             if (!doc["default_env"].IsScalar()) throw manifest_error(path, "default_env must be a string");
             m.default_env = doc["default_env"].as<std::string>();
@@ -428,7 +625,10 @@ Manifest parse_manifest(const std::string& text, const std::string& path) {
             YAML::Node env_node = env_pair.second;
             if (env_node && !env_node.IsNull()) {
                 if (!env_node.IsMap()) throw manifest_error(path, "env '" + env + "' must be a mapping");
-                entries = parse_env_secrets(env_node["secrets"], path, env, m.project);
+                refuse_unknown_keys(env_node, {"vars", "secrets", "region", "project"}, path, "env '" + env + "'");
+                std::string env_location =
+                    parse_location(env_node, m.backend.type, path, "env '" + env + "'").value_or(m.backend.location);
+                entries = parse_env_secrets(env_node["secrets"], path, env, m.project, m.backend.type, env_location);
                 plain = parse_env_vars(env_node["vars"], path, env);
                 // A variable defined twice has no sane precedence; refuse it
                 // here so every command that loads the manifest fails alike.
@@ -585,12 +785,27 @@ std::optional<std::string> find_manifest_upward(const std::string& start_dir) {
     }
 }
 
+namespace {
+
+// Null node when the file is absent. Read through read_manifest_text: the
+// registry holds write_targets, so it needs the manifests' owner/mode check.
+YAML::Node load_registry(const std::string& registry_path) {
+    if (::access(registry_path.c_str(), F_OK) != 0) return YAML::Node();
+    std::string text = read_manifest_text(registry_path);
+    try {
+        return YAML::Load(text);
+    } catch (const YAML::Exception& e) {
+        throw std::runtime_error("registry '" + registry_path + "': " + e.what());
+    }
+}
+
+}  // namespace
+
 std::optional<std::string> registry_project_root(const std::string& registry_path,
                                                  const std::string& name) {
-    if (::access(registry_path.c_str(), F_OK) != 0) return std::nullopt;
+    YAML::Node doc = load_registry(registry_path);
     std::string root_spec;
     try {
-        YAML::Node doc = YAML::LoadFile(registry_path);
         YAML::Node projects = doc["projects"];
         if (!projects || projects.IsNull()) return std::nullopt;
         // A non-const lookup would quietly turn a sequence into a map.
@@ -609,6 +824,29 @@ std::optional<std::string> registry_project_root(const std::string& registry_pat
         throw std::runtime_error("project root not found: " + root);
     }
     return root;
+}
+
+std::vector<std::string> registry_write_targets(const std::string& registry_path) {
+    YAML::Node doc = load_registry(registry_path);
+    std::vector<std::string> targets;
+    try {
+        YAML::Node listed = doc["write_targets"];
+        if (!listed || listed.IsNull()) return targets;
+        if (!listed.IsSequence()) throw std::runtime_error("registry '" + registry_path + "': 'write_targets' must be a list");
+        for (const YAML::Node& item : listed) {
+            std::string target = item.IsScalar() ? item.as<std::string>() : "";
+            bool aws_account = target.compare(0, 12, "aws-account:") == 0 && is_aws_account(target.substr(12));
+            bool gcp_project = target.compare(0, 4, "gcp:") == 0 && is_gcp_project(target.substr(4));
+            if (!aws_account && !gcp_project) {
+                throw std::runtime_error("registry '" + registry_path + "': write_targets entry '" + target +
+                                         "' must be aws-account:<12-digit account> or gcp:<project id>");
+            }
+            targets.push_back(std::move(target));
+        }
+    } catch (const YAML::Exception& e) {
+        throw std::runtime_error("registry '" + registry_path + "': " + e.what());
+    }
+    return targets;
 }
 
 KeyValues parse_dotenv(const std::string& text, std::ostream& warnings) {
@@ -760,7 +998,7 @@ std::string manifest_with_entries(const std::string& text, const std::string& pr
             throw std::runtime_error("manifest edit failed: entry '" + name +
                                      "' not present after insertion; add it by hand");
         }
-        if (entry->env_var != var || entry->key != scoped_key(env, project, name)) {
+        if (entry->env_var != var || entry->path != scoped_key(env, project, name)) {
             throw std::runtime_error("manifest entry '" + name + "' in env '" + env +
                                      "' already exists with a different key or env_var_name; fix it by hand");
         }
