@@ -27,6 +27,11 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   registry, dotenv parsing, and the comment-preserving text insertion that
   `import` uses to update manifests (re-parsed and verified before writing).
   `read_manifest_text` (owner/mode check) is the only way a manifest is read.
+- `src/backend.{hpp,cpp}` — the `Backend` seam between the front end and where
+  secrets live (`LocalBackend` wraps `DaemonClient`; typed `BackendError`;
+  `open_backend` refuses aws/gcp as "not compiled in"). exec, get, set, delete
+  and the TUI's get/set/delete go through it; store-wide `list` and `import`
+  stay on `DaemonClient`. Design: docs/backends-design.md.
 - `src/client.{hpp,cpp}` (scope resolution for exec/import/list lives here),
   `src/tui.cpp` (+ `src/tui_edit.{hpp,cpp}`: FTXUI-free helpers — key
   name validation, readline edits, tree-row building and delete landing,
@@ -36,8 +41,8 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
   truth), plus shared I/O helpers: atomic write, secret-line reads, `wipe`.
 - `src/protocol.hpp` — request parsing (the daemon's trust boundary) and the
   daemon error texts clients act on (`kErrNotFound`, `kErrInvalidToken`).
-- `tests/store_test.cpp`, `tests/manifest_test.cpp`, `tests/paths_test.cpp`
-  (also covers `parse_request`), `tests/tui_edit_test.cpp`
+- `tests/store_test.cpp`, `tests/manifest_test.cpp`, `tests/backend_test.cpp`,
+  `tests/paths_test.cpp` (also covers `parse_request`), `tests/tui_edit_test.cpp`
   (assert-based, no framework; one CMake `foreach` builds them),
   `tests/smoke_test.sh` (full daemon lifecycle + scopes in a scratch env;
   needs python3 for its pty checks),

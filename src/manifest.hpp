@@ -23,6 +23,8 @@ struct BackendConfig {
     std::string location;  // aws: region, gcp: project; empty for local
 };
 
+const char* backend_type_name(BackendType type);  // "local", "aws", "gcp"
+
 struct SecretEntry {
     std::string name;      // entry name under secrets:, a label
     EntryKind kind = EntryKind::Text;

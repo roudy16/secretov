@@ -356,6 +356,15 @@ std::string scope_prefix(const std::string& env, const std::string& project) {
     return env + "/" + project + "/";
 }
 
+const char* backend_type_name(BackendType type) {
+    switch (type) {
+        case BackendType::Local: return "local";
+        case BackendType::Aws: return "aws";
+        case BackendType::Gcp: return "gcp";
+    }
+    return "";
+}
+
 namespace {
 
 bool is_ascii_alnum(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
@@ -414,15 +423,6 @@ void require_gcp_project(const std::string& project, const std::string& manifest
     if (!is_gcp_project(project)) {
         throw manifest_error(manifest_path, what + " project '" + project + "' is not a valid GCP project id (lowercase id, 6-30 characters)");
     }
-}
-
-const char* backend_type_name(BackendType type) {
-    switch (type) {
-        case BackendType::Local: return "local";
-        case BackendType::Aws: return "aws";
-        case BackendType::Gcp: return "gcp";
-    }
-    return "";
 }
 
 void refuse_unknown_keys(const YAML::Node& map, std::initializer_list<std::string_view> allowed, const std::string& path,

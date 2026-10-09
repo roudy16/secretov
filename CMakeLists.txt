@@ -102,7 +102,7 @@ target_link_libraries(secretov PRIVATE secretov_core
 install(TARGETS secretov)
 
 enable_testing()
-foreach(unit_test store_test manifest_test paths_test tui_edit_test)
+foreach(unit_test store_test manifest_test paths_test tui_edit_test backend_test)
   add_executable(${unit_test} tests/${unit_test}.cpp)
   target_link_libraries(${unit_test} PRIVATE secretov_core)
   add_test(NAME ${unit_test} COMMAND ${unit_test})

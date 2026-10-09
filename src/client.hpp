@@ -64,10 +64,10 @@ private:
 
 // Each returns a process exit code. Paths are resolved from the environment.
 int cmd_init();
-int cmd_get(const std::string& key);
+int cmd_get(int argc, char** argv);     // KEY [-p NAME] [-e ENV]
 int cmd_set(int argc, char** argv);     // KEY [-p NAME] [-e ENV]; value read from stdin
 int cmd_list(int argc, char** argv);    // [-p NAME] [-e ENV]
-int cmd_delete(const std::string& key);
+int cmd_delete(int argc, char** argv);  // KEY [-p NAME] [-e ENV]
 int cmd_rotate();
 int cmd_passwd();  // reads current + new passphrase from tty/stdin
 int cmd_exec(int argc, char** argv);    // argv/argc positioned at args after "exec"

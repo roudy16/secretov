@@ -30,6 +30,8 @@ inline constexpr const char* kRegistryFileName = "projects.yaml";
 inline constexpr const char* kSocketFileName = "secretov.sock";
 inline constexpr const char* kManifestFileName = ".secretov.yaml";
 inline constexpr const char* kEnvOverrideVar = "SECRETOV_ENV";
+// Set by exec in its child: comma-separated names exec injected.
+inline constexpr const char* kInjectedVar = "SECRETOV_INJECTED";
 
 struct Paths {
     std::string store;

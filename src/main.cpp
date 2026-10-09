@@ -17,11 +17,12 @@ void print_usage(std::ostream& out) {
         << "commands:\n"
         << "  init                       create the store and mint an API token\n"
         << "  daemon                     run the secrets daemon (foreground)\n"
-        << "  get KEY                    print a secret's value\n"
+        << "  get KEY [-p NAME] [-e ENV] print a secret's value (-p/-e scope the key)\n"
         << "  set KEY [-p NAME] [-e ENV] set a secret, creating or replacing it\n"
         << "                             (value read from stdin; -p/-e scope the key)\n"
         << "  list [-p NAME] [-e ENV]    list secret names (optionally one env/project scope)\n"
-        << "  delete KEY                 remove a secret\n"
+        << "  delete KEY [-p NAME] [-e ENV]\n"
+        << "                             remove a secret (-p/-e scope the key)\n"
         << "  rotate                     re-encrypt the store with a fresh key\n"
         << "                             (prompts for the current passphrase)\n"
         << "  passwd                     change the store passphrase\n"
@@ -66,21 +67,9 @@ int main(int argc, char** argv) {
         if (cmd == "passwd") return cmd_passwd();
         if (cmd == "tui") return run_tui();
 
-        if (cmd == "get") {
-            if (argc != 3) {
-                std::cerr << "usage: secretov get KEY\n";
-                return 2;
-            }
-            return cmd_get(argv[2]);
-        }
+        if (cmd == "get") return cmd_get(argc - 2, argv + 2);
         if (cmd == "set") return cmd_set(argc - 2, argv + 2);
-        if (cmd == "delete") {
-            if (argc != 3) {
-                std::cerr << "usage: secretov delete KEY\n";
-                return 2;
-            }
-            return cmd_delete(argv[2]);
-        }
+        if (cmd == "delete") return cmd_delete(argc - 2, argv + 2);
         if (cmd == "exec") {
             return cmd_exec(argc - 2, argv + 2);
         }

@@ -7,14 +7,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "backend.hpp"
 #include "manifest.hpp"
 #include "paths.hpp"
 #include "protocol.hpp"
@@ -191,11 +194,6 @@ void export_env_var(const std::string& name, const std::string& value) {
     }
 }
 
-std::map<std::string, std::string> fetch_prefix(const DaemonClient& client, const std::string& prefix) {
-    nlohmann::json resp = client.request("getprefix", prefix);
-    return resp.value("values", std::map<std::string, std::string>{});
-}
-
 std::string cwd() {
     std::error_code ec;
     std::filesystem::path p = std::filesystem::current_path(ec);
@@ -258,6 +256,8 @@ std::string resolve_env(const ScopeArgs& scope, const Manifest* manifest) {
 struct ResolvedScope {
     std::string env;
     std::string project;
+    std::optional<Manifest> manifest;
+    BackendConfig backend() const { return manifest ? manifest->backend : BackendConfig{}; }
 };
 
 // (env, project) for a scope flag pair. -p names the project outright and the
@@ -269,7 +269,8 @@ ResolvedScope resolve_scope(const Paths& paths, const ScopeArgs& scope) {
         manifest = resolve_manifest(paths, scope);
     }
     std::string project = scope.project ? *scope.project : manifest->project;
-    return {resolve_env(scope, manifest ? &*manifest : nullptr), project};
+    std::string env = resolve_env(scope, manifest ? &*manifest : nullptr);
+    return {std::move(env), std::move(project), std::move(manifest)};
 }
 
 // Plaintext vars for an env; empty when it declares none. Unlike entries_for
@@ -286,6 +287,41 @@ const std::vector<SecretEntry>& entries_for(const Manifest& m, const std::string
         throw std::runtime_error("environment '" + env + "' not found in " + m.path);
     }
     return it->second;
+}
+
+// Parses `NAME [-p NAME] [-e ENV]`; prints the error and the usage and returns nullopt on a bad
+// command line. A second positional would be an argv VALUE, which must never be accepted: it
+// would leak the secret via /proc/<pid>/cmdline.
+std::optional<std::string> parse_entry_args(const char* command, const char* usage, int argc, char** argv,
+                                            ScopeArgs& scope) {
+    std::optional<std::string> name;
+    try {
+        for (int i = 0; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (take_scope_arg(argc, argv, i, scope)) continue;
+            if (name || arg.empty() || arg[0] == '-') throw std::runtime_error("unexpected argument '" + arg + "'");
+            name = arg;
+        }
+        if (!name) throw std::runtime_error("missing KEY");
+    } catch (const std::exception& e) {
+        std::cerr << "secretov " << command << ": " << e.what() << "\n" << usage;
+        return std::nullopt;
+    }
+    return name;
+}
+
+// Where a get/set/delete NAME lives: the raw store key, or with -p/-e the scoped key
+// on the backend the manifest names.
+struct Target {
+    std::unique_ptr<Backend> backend;
+    std::string path;
+};
+
+Target resolve_target(const Paths& paths, const ScopeArgs& scope, const std::string& name) {
+    if (!scope.project && !scope.env) return {open_backend(BackendConfig{}, paths), name};
+    ResolvedScope resolved = resolve_scope(paths, scope);
+    std::string path = scoped_key(resolved.env, resolved.project, name);
+    return {open_backend(resolved.backend(), paths), std::move(path)};
 }
 
 }  // namespace
@@ -317,45 +353,30 @@ int cmd_init() {
     return 0;
 }
 
-int cmd_get(const std::string& key) {
-    nlohmann::json resp = DaemonClient(resolve_paths()).request("get", key);
-    std::cout << resp.value("value", std::string{}) << "\n";
+int cmd_get(int argc, char** argv) {
+    ScopeArgs scope;
+    std::optional<std::string> name =
+        parse_entry_args("get", "usage: secretov get KEY [-p NAME] [-e ENV]\n", argc, argv, scope);
+    if (!name) return 2;
+    Target target = resolve_target(resolve_paths(), scope, *name);
+    Fetched fetched = target.backend->get_many({target.path});
+    if (!fetched.failures.empty()) throw fetched.failures.begin()->second;
+    std::string& value = fetched.values.at(target.path);
+    std::cout << value << "\n";
+    wipe(value);
     return 0;
 }
 
 int cmd_set(int argc, char** argv) {
-    static const char* kUsage =
-        "usage: secretov set KEY [-p NAME] [-e ENV]   (value read from stdin)\n";
-    Paths paths = resolve_paths();
     ScopeArgs scope;
-    std::string name;
-    bool name_given = false;
-    try {
-        for (int i = 0; i < argc; ++i) {
-            std::string arg = argv[i];
-            if (take_scope_arg(argc, argv, i, scope)) continue;
-            // A second positional would be an argv VALUE, which must never be
-            // accepted: it would leak the secret via /proc/<pid>/cmdline.
-            if (name_given || arg.empty() || arg[0] == '-') {
-                throw std::runtime_error("unexpected argument '" + arg + "'");
-            }
-            name = arg;
-            name_given = true;
-        }
-        if (!name_given) throw std::runtime_error("missing KEY");
-    } catch (const std::exception& e) {
-        std::cerr << "secretov set: " << e.what() << "\n" << kUsage;
-        return 2;
-    }
-    std::string key = name;
-    if (scope.project || scope.env) {
-        ResolvedScope resolved = resolve_scope(paths, scope);
-        key = scoped_key(resolved.env, resolved.project, name);
-    }
+    std::optional<std::string> name = parse_entry_args(
+        "set", "usage: secretov set KEY [-p NAME] [-e ENV]   (value read from stdin)\n", argc, argv, scope);
+    if (!name) return 2;
+    Target target = resolve_target(resolve_paths(), scope, *name);
     // A tty gets a no-echo single-line prompt; a pipe is read whole (multi-line values).
     std::string value;
     if (::isatty(STDIN_FILENO)) {
-        value = read_secret_line("Value for " + key + ": ");
+        value = read_secret_line("Value for " + target.path + ": ");
         // A stray Enter would otherwise silently overwrite the key with "".
         if (value.empty()) {
             throw std::runtime_error(
@@ -364,7 +385,7 @@ int cmd_set(int argc, char** argv) {
     } else {
         value = read_stdin_value();
     }
-    DaemonClient(paths).request("set", key, value);
+    target.backend->set(target.path, value);
     return 0;
 }
 
@@ -380,6 +401,14 @@ int cmd_list(int argc, char** argv) {
     std::string prefix;
     if (scope.project || scope.env) {
         ResolvedScope resolved = resolve_scope(paths, scope);
+        if (resolved.manifest && resolved.manifest->backend.type != BackendType::Local) {
+            // A cloud backend has no store to list: show what the manifest declares.
+            for (const SecretEntry& e : entries_for(*resolved.manifest, resolved.env)) {
+                std::cout << e.name << "\t" << (e.kind == EntryKind::Kv ? "kv" : "text") << "\t" << e.path << "\t"
+                          << e.field << "\n";
+            }
+            return 0;
+        }
         prefix = scope_prefix(resolved.env, resolved.project);
     }
     nlohmann::json resp = DaemonClient(paths).request("list");
@@ -389,8 +418,13 @@ int cmd_list(int argc, char** argv) {
     return 0;
 }
 
-int cmd_delete(const std::string& key) {
-    DaemonClient(resolve_paths()).request("delete", key);
+int cmd_delete(int argc, char** argv) {
+    ScopeArgs scope;
+    std::optional<std::string> name =
+        parse_entry_args("delete", "usage: secretov delete KEY [-p NAME] [-e ENV]\n", argc, argv, scope);
+    if (!name) return 2;
+    Target target = resolve_target(resolve_paths(), scope, *name);
+    target.backend->remove(target.path);
     return 0;
 }
 
@@ -457,15 +491,21 @@ int cmd_exec(int argc, char** argv) {
     try {
         // Raw-only invocations (--secret with no -p/-e) skip the manifest so
         // one-off keys work anywhere, including inside a project directory.
-        std::vector<std::pair<std::string, std::string>> wanted;  // (envvar, key)
+        BackendConfig backend_config;
+        std::vector<std::pair<std::string, std::string>> wanted;  // (envvar, path)
         KeyValues plain;                                          // (envvar, literal value)
         if (scope.project || scope.env || raw.empty()) {
             Manifest manifest = resolve_manifest(paths, scope);
+            if (!raw.empty() && manifest.backend.type != BackendType::Local) {
+                throw std::runtime_error(std::string("--secret names raw local-store keys; this manifest uses ") +
+                                         backend_type_name(manifest.backend.type));
+            }
             std::string env = resolve_env(scope, &manifest);
             for (const SecretEntry& e : entries_for(manifest, env)) {
                 wanted.emplace_back(e.env_var, e.path);
             }
             plain = vars_for(manifest, env);
+            backend_config = manifest.backend;
         }
         for (const auto& [key, envvar] : raw) wanted.emplace_back(envvar, key);
 
@@ -473,45 +513,41 @@ int cmd_exec(int argc, char** argv) {
             // Manifest vars are plaintext in a committed file, so printing them
             // leaks nothing; secrets still show only their key.
             for (const auto& [envvar, value] : plain) std::cout << envvar << " = " << value << "\n";
-            for (const auto& [envvar, key] : wanted) std::cout << envvar << " <- " << key << "\n";
+            for (const auto& [envvar, path] : wanted) std::cout << envvar << " <- " << path << "\n";
             return 0;
         }
-        // Plaintext first, so an explicit --secret on the command line wins
-        // over a manifest var of the same name.
-        for (const auto& [envvar, value] : plain) export_env_var(envvar, value);
 
-        // One getprefix per env/project/ group; keys without a '/' are fetched singly.
-        DaemonClient client(paths);
-        std::map<std::string, std::map<std::string, std::string>> by_prefix;
+        // Fetch everything before touching our environment: nothing from a
+        // manifest or a fetched value is applied to this process until every
+        // request has been sent.
+        std::unique_ptr<Backend> backend = open_backend(backend_config, paths);
+        std::vector<std::string> paths_wanted;
+        for (const auto& [envvar, path] : wanted) paths_wanted.push_back(path);
+        Fetched fetched = backend->get_many(paths_wanted);
         std::vector<std::string> missing;
-        for (const auto& [envvar, key] : wanted) {
-            std::size_t slash = key.find_last_of('/');
-            std::string value;
-            if (slash == std::string::npos) {
-                nlohmann::json resp = client.send(nlohmann::json{{"op", "get"}, {"key", key}});
-                if (!resp.value("ok", false)) {
-                    std::string error = resp.value("error", std::string("request failed"));
-                    if (error != kErrNotFound) throw std::runtime_error(error);
-                    missing.push_back(key);
-                    continue;
-                }
-                value = resp.value("value", std::string{});
-            } else {
-                std::string prefix = key.substr(0, slash + 1);
-                auto group = by_prefix.find(prefix);
-                if (group == by_prefix.end()) {
-                    group = by_prefix.emplace(prefix, fetch_prefix(client, prefix)).first;
-                }
-                auto hit = group->second.find(key);
-                if (hit == group->second.end()) {
-                    missing.push_back(key);
-                    continue;
-                }
-                value = hit->second;
-            }
-            export_env_var(envvar, value);
+        for (const auto& [envvar, path] : wanted) {
+            auto failure = fetched.failures.find(path);
+            if (failure == fetched.failures.end()) continue;
+            if (failure->second.kind != BackendError::Kind::NotFound) throw failure->second;
+            missing.push_back(path);
         }
         if (!missing.empty()) throw std::runtime_error("missing secrets: " + join(missing, ", "));
+
+        // Plaintext first, then manifest secrets, then --secret, so an explicit
+        // --secret on the command line wins over a manifest var of the same name.
+        std::vector<std::string> injected;
+        auto inject = [&](const std::string& envvar, const std::string& value) {
+            export_env_var(envvar, value);
+            if (std::find(injected.begin(), injected.end(), envvar) == injected.end()) injected.push_back(envvar);
+        };
+        for (const auto& [envvar, value] : plain) inject(envvar, value);
+        for (const auto& [envvar, path] : wanted) inject(envvar, fetched.values.at(path));
+        for (auto& [path, value] : fetched.values) wipe(value);
+        // Tells a secretov run inside the child which variables came from a manifest.
+        if (!injected.empty()) {
+            const char* inherited = std::getenv(kInjectedVar);
+            export_env_var(kInjectedVar, (inherited && *inherited ? std::string(inherited) + "," : "") + join(injected, ","));
+        }
     } catch (const std::exception& e) {
         std::cerr << "secretov exec: " << e.what() << "\n";
         return 1;
@@ -583,6 +619,11 @@ int cmd_import(int argc, char** argv) {
                 throw std::runtime_error("manifest " + manifest_path + " names project '" + manifest->project +
                                          "', not '" + project + "'");
             }
+            if (manifest->backend.type != BackendType::Local) {
+                throw std::runtime_error(
+                    "import is local-only for now; add entries to .secretov.yaml by hand, then 'secretov set ENTRY "
+                    "-p NAME -e ENV'");
+            }
             project = manifest->project;
             write_path = std::filesystem::canonical(manifest_path).string();
         }
@@ -592,7 +633,8 @@ int cmd_import(int argc, char** argv) {
         if (pairs.empty()) throw std::runtime_error("nothing to import from " + file);
 
         DaemonClient client(paths);
-        std::map<std::string, std::string> existing = fetch_prefix(client, scope_prefix(env, project));
+        std::map<std::string, std::string> existing =
+            client.request("getprefix", scope_prefix(env, project)).value("values", std::map<std::string, std::string>{});
         std::vector<std::string> collisions;
         KeyValues name_to_var;
         for (const auto& [var, value] : pairs) {

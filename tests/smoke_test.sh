@@ -403,6 +403,67 @@ ln -s missing "$GW/.secretov.yaml"
 if ( cd "$GW" && "$BIN" import -p gw -e dev >/dev/null 2>&1 ); then fail "import replaced a dangling manifest link"; fi
 [ -L "$GW/.secretov.yaml" ] || fail "dangling manifest link was replaced"
 
+# 5h. get/delete take -p/-e and resolve the key as set does; exec exports vars,
+# then manifest secrets, then --secret (so --secret overrides a var) and marks
+# what it injected in SECRETOV_INJECTED, appending to an inherited value.
+[ "$(cd "$PROJ" && "$BIN" get DB_URL -e dev)" = "from-registry" ] || fail "get -e"
+[ "$(cd / && "$BIN" get DB_URL -p demo -e dev)" = "from-registry" ] || fail "get -p -e"
+printf '%s' "gone" | "$BIN" set TMP_DEL -p demo -e dev
+( cd "$PROJ" && "$BIN" delete TMP_DEL -e dev ) || fail "delete -e"
+if "$BIN" get dev/demo/TMP_DEL >/dev/null 2>&1; then fail "scoped delete left the key"; fi
+if "$BIN" get a b -e dev >/dev/null 2>&1; then fail "get with two keys accepted"; fi
+OUT="$(cd "$PROJ" && "$BIN" exec -e dev --secret VIA_STDIN=LOG_LEVEL -- sh -c 'printf %s "$LOG_LEVEL"')"
+[ "$OUT" = "s3cr3t-value" ] || fail "--secret did not override a manifest var: '$OUT'"
+OUT="$(cd "$PROJ" && "$BIN" exec -e dev --secret VIA_STDIN=RAW -- sh -c 'printf %s "$SECRETOV_INJECTED"')"
+case "$OUT" in LOG_LEVEL,PORT,*,RAW) ;; *) fail "SECRETOV_INJECTED got '$OUT'" ;; esac
+case ",$OUT," in *,DB_URL,*) ;; *) fail "SECRETOV_INJECTED lacks a manifest secret: '$OUT'" ;; esac
+OUT="$(SECRETOV_INJECTED=PRE "$BIN" exec --secret VIA_STDIN=X -- sh -c 'printf %s "$SECRETOV_INJECTED"')"
+[ "$OUT" = "PRE,X" ] || fail "SECRETOV_INJECTED not appended to the inherited value: '$OUT'"
+
+# 5i. a manifest naming a cloud backend: the declared entries list, but nothing
+# reaches the (not compiled in) backend, import is refused, and --secret (raw
+# local-store keys) cannot mix with it.
+CLOUD="$WORK/cloud"
+mkdir -p "$CLOUD"
+cat > "$CLOUD/.secretov.yaml" <<'YAML'
+name: cloudy
+backend:
+  type: aws
+  region: us-east-1
+default_env: dev
+env:
+  dev:
+    secrets:
+      db-url:
+        path: dev/cloudy/db-url
+        env_var_name: DB_URL
+      db-pass:
+        kind: kv
+        path: dev/cloudy/db
+        key: password
+        env_var_name: DB_PASS
+YAML
+cp "$CLOUD/.secretov.yaml" "$CLOUD/.secretov.yaml.orig"
+printf 'X=1\n' > "$CLOUD/.env"
+LISTED="$(cd "$CLOUD" && "$BIN" list -e dev)" || fail "cloud list -e"
+[ "$LISTED" = "$(printf 'db-url\ttext\tdev/cloudy/db-url\t\ndb-pass\tkv\tdev/cloudy/db\tpassword')" ] || fail "cloud list got '$LISTED'"
+( cd "$CLOUD" && "$BIN" list ) | grep -qx VIA_STDIN || fail "store-wide list changed inside a cloud project"
+DRY="$(cd "$CLOUD" && "$BIN" exec --dry-run)"
+echo "$DRY" | grep -q "DB_URL <- dev/cloudy/db-url" || fail "cloud dry-run: $DRY"
+for cmd in "exec -- true" "get db-url -e dev" "delete db-url -e dev" "set db-url -e dev"; do
+    ERR="$(cd "$CLOUD" && "$BIN" $cmd </dev/null 2>&1)" && fail "cloud '$cmd' succeeded"
+    echo "$ERR" | grep -q "backend 'aws' not compiled in" || fail "cloud '$cmd' message: $ERR"
+done
+ERR="$(cd "$CLOUD" && "$BIN" exec --secret VIA_STDIN=X -e dev -- true 2>&1)" && fail "exec --secret with a cloud manifest succeeded"
+echo "$ERR" | grep -q "raw local-store keys; this manifest uses aws" || fail "cloud --secret message: $ERR"
+ERR="$(cd "$CLOUD" && "$BIN" import -e dev 2>&1)" && fail "import into a cloud manifest succeeded"
+echo "$ERR" | grep -q "import is local-only for now" || fail "cloud import message: $ERR"
+if "$BIN" get dev/cloudy/X >/dev/null 2>&1; then fail "refused cloud import stored a secret"; fi
+cmp -s "$CLOUD/.secretov.yaml" "$CLOUD/.secretov.yaml.orig" || fail "refused cloud import edited the manifest"
+# without -p/-e, --secret keeps reading the local store, even inside a cloud project
+OUT="$(cd "$CLOUD" && "$BIN" exec --secret VIA_STDIN=RAW -- sh -c 'printf %s "$RAW"')"
+[ "$OUT" = "s3cr3t-value" ] || fail "raw exec inside a cloud project got '$OUT'"
+
 # 6. wrong token is rejected (corrupt the client's token file copy, then restore)
 cp "$TOKEN" "$TOKEN.good"
 printf 'deadbeefdeadbeef' > "$TOKEN"

@@ -137,9 +137,13 @@ saves it to history in plaintext.
 `get` prints to your terminal, so the value stays in scrollback; prefer `exec`,
 or pipe `get` straight into what needs it, or clear scrollback afterwards.
 
-`set` creates or replaces; there is no separate update command. `get` and
-`delete` still take a raw full key (`env/project/KEY`) — only `set`, `list`,
-`exec`, and `import` accept `-p`/`-e`.
+`set` creates or replaces; there is no separate update command. `get`, `set`
+and `delete` take either a raw full key (`env/project/KEY`) or, with `-p`/`-e`,
+a bare `KEY` resolved to `env/project/KEY` (`secretov get DB_URL -e dev`).
+
+`exec` exports the manifest's `vars:`, then its secrets, then any `--secret`
+keys, and sets `SECRETOV_INJECTED` in the child to the comma-separated names it
+exported (appended to an inherited value). Manifests cannot set `SECRETOV_*`.
 
 ### The TUI
 

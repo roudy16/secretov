@@ -32,6 +32,7 @@
 #include <ftxui/screen/terminal.hpp>
 #include <nlohmann/json.hpp>
 
+#include "backend.hpp"
 #include "client.hpp"
 #include "manifest.hpp"
 #include "paths.hpp"
@@ -79,17 +80,8 @@ const char* const kBusyDaemonHint =
     "another client holds its socket: 'ss -xp | grep secretov.sock' shows the peer inode last; "
     "'ss -xp | grep <that inode>' names the holder; stop it";
 
-// Copies a daemon reply's value into `into` and wipes the reply's own copy.
-void take_value(nlohmann::json& resp, std::string& into) {
-    auto found = resp.find("value");
-    if (found == resp.end() || !found->is_string()) throw std::runtime_error("daemon reply has no value");
-    std::string& held = found->get_ref<std::string&>();
-    into.assign(held);
-    wipe(held);
-}
-
 // Why a sent request got no reply, short enough for the status bar.
-std::string no_reply_reason(const DaemonUnreachable& e) {
+std::string no_reply_reason(const BackendError& e) {
     return e.timed_out ? "no reply in " + std::to_string(e.timeout_seconds) + " s" : "daemon hung up";
 }
 
@@ -306,7 +298,7 @@ int framed_title_columns(const std::string& title, const std::vector<TitleTag>& 
     return columns;
 }
 
-int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
+int run_ui(DaemonClient& daemon, Backend& backend, const ProjectMarks& marks) {
     using namespace ftxui;
 
     std::vector<std::string> keys;    // every key, sorted
@@ -421,29 +413,37 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     // the latest attempt.
     // ponytail: calls block the UI thread, bounded by DaemonClient's 5 s reply
     // timeout; move them to a worker thread if a busy daemon makes that bite.
-    auto call = [&](const std::string& op, const std::string& key, std::optional<std::string_view> value) -> json {
+    auto call = [&](auto&& operation) -> decltype(auto) {
+        daemon_state = DaemonState::Ok;  // an error reply means it answered
         try {
-            json resp = daemon.request(op, key, value);
-            daemon_state = DaemonState::Ok;
-            return resp;
-        } catch (const DaemonUnreachable& e) {
+            return operation();
+        } catch (const BackendError& e) {
+            if (e.kind != BackendError::Kind::Unreachable) throw;
             daemon_state = e.timed_out ? DaemonState::Busy : DaemonState::Unreachable;
             // The socket path would push the fix off the status bar; ? shows it.
-            if (e.stage == DaemonUnreachable::Stage::NotRunning) {
-                throw DaemonUnreachable("daemon not running: start it (scripts/service start), then R", e.stage);
+            if (e.not_running) {
+                BackendError not_running(e.kind, "daemon not running: start it (scripts/service start), then R");
+                not_running.not_running = true;
+                throw not_running;
             }
             throw;
-        } catch (...) {
-            daemon_state = DaemonState::Ok;  // it answered, with an error
-            throw;
         }
+    };
+
+    // One key's value into `into`, the fetched copy zeroed.
+    auto fetch_value = [&](const std::string& key, std::string& into) {
+        Fetched fetched = call([&] { return backend.get_many({key}); });
+        if (!fetched.failures.empty()) throw fetched.failures.begin()->second;
+        std::string& held = fetched.values.at(key);
+        into.assign(held);
+        wipe(held);
     };
 
     // On failure the last-known tree stays, marked stale when the daemon was unreachable.
     auto refresh = [&](const std::string& select_id) {
         remask();
         try {
-            json resp = call("list", "", std::nullopt);
+            json resp = call([&] { return local_request(daemon, "list"); });
             keys = resp.value("keys", std::vector<std::string>{});
         } catch (const std::exception& e) {
             complain(e.what());
@@ -456,7 +456,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
 
     // Reports a failed call on `key`; a key deleted elsewhere also reloads the list.
     auto fail = [&](const std::exception& e, const std::string& key) {
-        if (std::string_view(e.what()) == kErrNotFound && !key.empty()) {
+        auto* backend_error = dynamic_cast<const BackendError*>(&e);
+        if (backend_error && backend_error->kind == BackendError::Kind::NotFound && !key.empty()) {
             refresh(key);
             complain("'" + key + "' was removed elsewhere; list reloaded");
             return;
@@ -522,9 +523,8 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         if (!key) return;
         remask();
         try {
-            json resp = call("get", *key, std::nullopt);
             revealed.emplace();
-            take_value(resp, *revealed);
+            fetch_value(*key, *revealed);
             revealed_at = Clock::now();
             keep_value_in_view = true;
         } catch (const std::exception& e) {
@@ -549,8 +549,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         std::string value;
         std::string sequence;
         try {
-            json resp = call("get", *key, std::nullopt);
-            take_value(resp, value);
+            fetch_value(*key, value);
             sequence = osc52_copy_sequence(value);
             write_to_terminal(sequence);
             say("copied (clipboard managers may keep it): " + *key);
@@ -605,8 +604,7 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         close_form();
         add_value.reserve(kSecretReserve);
         try {
-            json resp = call("get", *key, std::nullopt);
-            take_value(resp, add_value);
+            fetch_value(*key, add_value);
         } catch (const std::exception& e) {
             wipe(add_value);
             fail(e, *key);
@@ -644,10 +642,10 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
     // (and dropping a filter it doesn't match); the form stays open on failure.
     auto save_form = [&](const std::string& key, const std::string& verb) {
         try {
-            call("set", key, add_value);
-        } catch (const DaemonUnreachable& e) {
+            call([&] { backend.set(key, add_value); });
+        } catch (const BackendError& e) {
             // A set is idempotent, so the form stays open for a retry either way.
-            complain(e.stage == DaemonUnreachable::Stage::Sent
+            complain(e.maybe_applied
                          ? no_reply_reason(e) + ": '" + key + "' may still be saved; Enter retries, Esc cancels"
                          : e.what());
             return false;
@@ -719,11 +717,13 @@ int run_ui(DaemonClient& daemon, const ProjectMarks& marks) {
         std::string key = current_key().value_or("");
         std::vector<std::string> landing = delete_landing(rows, selected);
         try {
-            call("delete", key, std::nullopt);
-        } catch (const DaemonUnreachable& e) {
-            complain(e.stage == DaemonUnreachable::Stage::Sent
-                         ? no_reply_reason(e) + ": '" + key + "' may still be deleted; R reloads to check"
-                         : e.what());
+            call([&] { backend.remove(key); });
+        } catch (const BackendError& e) {
+            if (!e.maybe_applied) {
+                fail(e, key);
+            } else {
+                complain(no_reply_reason(e) + ": '" + key + "' may still be deleted; R reloads to check");
+            }
             return;
         } catch (const std::exception& e) {
             fail(e, key);
@@ -1518,7 +1518,8 @@ int run_tui() {
     try {
         DaemonClient daemon(paths);
         daemon.request("list");  // fail fast if unreachable/unauthorized, before the screen goes fullscreen
-        return run_ui(daemon, load_project_marks());
+        std::unique_ptr<Backend> backend = open_backend(BackendConfig{}, paths);
+        return run_ui(daemon, *backend, load_project_marks());
     } catch (const DaemonUnreachable& e) {
         std::fprintf(stderr, "secretov: %s\n", e.what());
         if (e.stage == DaemonUnreachable::Stage::NotRunning) {
