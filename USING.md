@@ -107,7 +107,8 @@ secretov exec -e dev -- npm run dev     # inject this env's secrets, then run
 secretov exec -e dev --dry-run          # VAR <- key mapping, no values
 secretov list -p myproj -e dev          # keys in one scope
 secretov set DB_URL -e dev              # replace one secret (prompts, no echo)
-secretov get dev/myproj/DB_URL          # print one value (raw full key)
+secretov get DB_URL -e dev              # print one value (or the raw full key dev/myproj/DB_URL)
+secretov delete DB_URL -e dev           # remove one secret
 secretov tui                            # browse/edit interactively
 secretov rotate                         # new encryption key (prompts for current passphrase)
 secretov passwd                         # change the passphrase (prompts for current + new)
@@ -144,6 +145,8 @@ a bare `KEY` resolved to `env/project/KEY` (`secretov get DB_URL -e dev`).
 `exec` exports the manifest's `vars:`, then its secrets, then any `--secret`
 keys, and sets `SECRETOV_INJECTED` in the child to the comma-separated names it
 exported (appended to an inherited value). Manifests cannot set `SECRETOV_*`.
+`exec` fetches every secret before it exports anything, so a missing secret
+leaves the child unstarted and nothing exported. `--dry-run` sets nothing.
 
 ### The TUI
 
@@ -286,9 +289,11 @@ one that nobody else can change:
   unless the owning group is your private group (your primary group, named
   after you), you are its only member (counting accounts whose primary
   group it is and any other group sharing its gid), and the file or
-  directory has no ACL (`ls -l` shows a `+`). Otherwise every command that reads it (`exec`, `list`,
-  `set -p/-e`, `import`, `--dry-run`, including `-p` registry lookups)
-  refuses with the fix, e.g.
+  directory has no ACL (`ls -l` shows a `+`). The registry
+  `~/.config/secretov/projects.yaml` gets the same check, wherever it is read.
+  Otherwise every command that reads it (`exec`, `list`,
+  `get`/`set`/`delete -p/-e`, `import`, `--dry-run`, including `-p` registry
+  lookups) refuses with the fix, e.g.
   `refusing manifest directory '/path': writable by group 'roudy', which also includes devuser (its primary group); fix with: chmod g-w '/path', or make 'roudy' yours alone: sudo userdel devuser or sudo usermod -g <another group> devuser (and end any of their processes still running)`.
   An `import` that would create or change the manifest checks the same way,
   and that the directory exists and is writable, before storing anything; a
@@ -328,10 +333,57 @@ one that nobody else can change:
   `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE`,
   `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY`,
   or `SSLKEYLOGFILE`, which would let it intercept or read the child's
-  requests or fetch code from an index the manifest picks. It is a deny list, so a tool with its own
+  requests or fetch code from an index the manifest picks. Cloud-provider
+  names are denied too, since they redirect endpoints or credential loading,
+  or pick the account a nested secretov would write to: any `AWS_ENDPOINT_URL*`
+  or `CLOUDSDK_*` (this over-denies harmless gcloud settings such as
+  `CLOUDSDK_CORE_PROJECT`), `AWS_EC2_METADATA_SERVICE_ENDPOINT`,
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_UNIVERSE_DOMAIN`,
+  `GCE_METADATA_HOST`, `GCE_METADATA_IP`, `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`.
+  The credentials themselves (`AWS_ACCESS_KEY_ID`, ...) are allowed. It is a deny list, so a tool with its own
   loader variable can still slip through. `--secret KEY=VAR` on your own command line is not filtered.
+- **Unknown keys are refused.** A key secretov does not know, at the top
+  level, in `backend:`, in an env (known: `vars`, `secrets`, `region`,
+  `project`) or in a secret entry (known: `env_var_name`, `key`, `kind`,
+  `path`), fails the load: `manifest '...': unknown key 'secrests' in
+  .secretov.yaml`. A typo no longer silently does nothing.
+- **Backends.** `backend: {type: local|aws|gcp, region|project: ...}` is
+  parsed and validated (cloud entries need an explicit `path:`; `kind: kv`
+  needs `key:` naming a JSON field and a cloud backend), but only the local
+  store is built in. With `type: aws` or `gcp`, `list -p/-e` prints the
+  declared entries (name, kind, path, field), `exec --dry-run` prints the
+  mapping, and `exec`, `get`, `set` and `delete` fail with `backend 'aws' not
+  compiled in (rebuild with -DSECRETOV_BACKEND_AWS=ON)` (gcp likewise). `import` is
+  refused (`import is local-only for now; ...`), and `exec --secret` combined
+  with `-p`/`-e` on such a manifest is refused (`--secret names raw
+  local-store keys; this manifest uses aws`); a bare `--secret` still reads the
+  local store. A manifest with no `backend:` is `type: local`, as before. Cloud
+  usage is not documented yet; commit such a manifest only once your binaries
+  all parse `backend:` (an older one ignores it and reads the local store).
 - **Program lookup.** `exec` finds the command on *your* `PATH` (a manifest
   cannot set `PATH`).
+
+## Upgrading from before the backend seam
+
+Three changes can make a manifest or registry that worked before fail to load:
+
+1. **Unknown keys are refused.** A stray or misspelled key used to be
+   ignored; now `manifest '...': unknown key 'X' in .secretov.yaml` (or `in
+   env 'dev'`, `in secret 'NAME' (env dev)`, `in backend:`). Fix the spelling
+   or delete the key.
+2. **More names are denied** under `vars:` and `env_var_name`
+   (`GOOGLE_APPLICATION_CREDENTIALS`, any `CLOUDSDK_*`, `AWS_PROFILE`,
+   `AWS_ENDPOINT_URL*`, ...; list in Manifest rules). Remove the entry from the
+   manifest and set the variable in your own shell or on the command line
+   (`--secret KEY=VAR` is not filtered).
+3. **`projects.yaml` must pass the owner/mode check** (owned by you; not
+   world-writable; not group-writable unless your private group; directory
+   too). A group-writable `~/.config/secretov` is now refused wherever the
+   registry is read, with the `chmod` to run.
+
+New in `exec`: `SECRETOV_INJECTED` is set in the child, and all secrets are
+fetched before any variable is exported. `get` and `delete` now take `-p`/`-e`.
 
 ## Key naming
 
@@ -382,6 +434,10 @@ Add a second environment by importing again: `secretov import .env.prod -e prod`
 | `refusing manifest[ directory] '...': group-writable, and its ACL cannot be read` | The ACL query failed | Run the `chmod g-w` it prints |
 | `refusing manifest[ directory] '...': owned by uid N, not you` | Someone else's manifest or dir | Remove it, or chown it to yourself |
 | `... cannot be set from a manifest` | A denied name under `vars:` or `env_var_name` | Rename it, or pass it on your own command line |
+| `manifest '...': unknown key 'X' in ...` | A key secretov does not know (often a typo) | Fix or delete the key |
+| `backend 'aws' not compiled in (rebuild with -DSECRETOV_BACKEND_AWS=ON)` | The manifest names a cloud backend this build lacks (none are built yet) | Use a local manifest; see Manifest rules |
+| `import is local-only for now; ...` | `import` against a manifest with a non-local `backend:` | Add entries by hand |
+| `--secret names raw local-store keys; this manifest uses aws` | `exec --secret` with a cloud manifest | Drop `--secret`, or run it without `-p`/`-e` outside the project |
 | `cannot run 'X': No such file or directory` | `exec` program missing from *your* PATH | Install it, or give a path with a `/` |
 | `daemon already running at ...` | A second `secretov daemon` | Use the running one, or stop it first |
 | `cannot prompt from a background process` | A prompt from a `&` job | Run it in the foreground, or pipe the input |

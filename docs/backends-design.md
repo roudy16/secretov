@@ -1,8 +1,8 @@
 # secretov — pluggable backends
 
-Status: approved design, 2026-10-09; not yet built. It amends DESIGN.md as
-listed under "Security deltas"; the amendments land in DESIGN.md with
-Phase 1. Owner rulings are in the Decisions log at the end.
+Status: approved design, 2026-10-09; Phase 1 (seam) built, Phases 2-5 not.
+It amends DESIGN.md as listed under "Security deltas"; the Phase 1 amendments
+are in DESIGN.md (Backends). Owner rulings are in the Decisions log at the end.
 
 ## Goal and non-goals
 

@@ -26,7 +26,10 @@ must stay zero-warning under `-Wall -Wextra` before any work is done.
 - `src/manifest.{hpp,cpp}` — `.secretov.yaml` manifests, `projects.yaml`
   registry, dotenv parsing, and the comment-preserving text insertion that
   `import` uses to update manifests (re-parsed and verified before writing).
-  `read_manifest_text` (owner/mode check) is the only way a manifest is read.
+  `read_manifest_text` (owner/mode check) is the only way a manifest or the
+  registry is read. Also parses the `backend:` block, `kind`/`path`/`key`
+  (validated at parse time), refuses unknown keys, holds the env-name deny
+  list, and reads the registry's `write_targets:`.
 - `src/backend.{hpp,cpp}` — the `Backend` seam between the front end and where
   secrets live (`LocalBackend` wraps `DaemonClient`; typed `BackendError`;
   `open_backend` refuses aws/gcp as "not compiled in"). exec, get, set, delete
